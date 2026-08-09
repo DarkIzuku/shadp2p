@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -207,14 +208,16 @@ static std::string HttpStatusLabel(int sc);
 //     "api.something.dev":                    "http://localhost:8080",
 //     "discovery.something.com:5300":         "http://localhost:8080",
 //     "https://api.example.com:443":          "http://localhost:8081",
+//     "http://game.example.com:18671/summon": "http://localhost:31315",
 //     "*":                                    "http://localhost:8080"
 //   }
 //
 // Keys are tried in order of specificity, most-specific first:
-//   1. "scheme://host:port" - matches that exact endpoint
-//   2. "host:port"          - matches host+port on any scheme
-//   3. "host"               - matches host on any scheme/port (most common)
-//   4. "*"                  - catch-all fallback
+//   1. "scheme://host:port/path" - matches that endpoint and path prefix
+//   2. "scheme://host:port"      - matches that exact endpoint
+//   3. "host:port"               - matches host+port on any scheme
+//   4. "host"                    - matches host on any scheme/port (most common)
+//   5. "*"                       - catch-all fallback
 //
 // Replacement value is a URL with scheme + host + optional port. When port is
 // omitted the default for the scheme is used (80 for http, 443 for https).
@@ -229,7 +232,8 @@ struct HostOverrideTarget {
 std::unordered_map<std::string, HostOverrideTarget> ParseHostOverridesJson(
     const std::string& json_text);
 
-bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& is_secure);
+bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& is_secure,
+                       std::string_view path = {});
 
 // Populate a response object with the shape a transport-level failure produces:
 // no status line, no headers, no body. Used by the no-internet path.
@@ -350,12 +354,14 @@ static const HostOverrideState& GetHostOverrideState() {
     return s;
 }
 
-bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& is_secure) {
+bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& is_secure,
+                       std::string_view path) {
     const auto& state = GetHostOverrideState();
     if (state.entries.empty()) {
         return false;
     }
     // Look up most-specific match first. Keys can be:
+    //   "scheme://host:port/path" - matches that endpoint and path prefix
     //   "scheme://host:port"  - matches that exact endpoint
     //   "host:port"           - matches host+port on any scheme
     //   "host"                - matches host on any scheme/port
@@ -363,7 +369,44 @@ bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& 
     const std::string full_key = scheme + "://" + host + ":" + std::to_string(port);
     const std::string host_port_key = host + ":" + std::to_string(port);
 
-    auto it = state.entries.find(full_key);
+    auto find_path_prefix = [&](const std::string& endpoint) {
+        auto best = state.entries.end();
+        std::size_t best_prefix_size = 0;
+        if (path.empty()) {
+            return best;
+        }
+        for (auto candidate = state.entries.begin(); candidate != state.entries.end();
+             ++candidate) {
+            const std::string& key = candidate->first;
+            if (key.size() <= endpoint.size() || !key.starts_with(endpoint) ||
+                key[endpoint.size()] != '/') {
+                continue;
+            }
+            const std::string_view prefix{key.data() + endpoint.size(),
+                                          key.size() - endpoint.size()};
+            if (!path.starts_with(prefix)) {
+                continue;
+            }
+            const bool boundary_match = path.size() == prefix.size() || prefix.ends_with('/') ||
+                                        path[prefix.size()] == '/';
+            if (boundary_match && prefix.size() > best_prefix_size) {
+                best = candidate;
+                best_prefix_size = prefix.size();
+            }
+        }
+        return best;
+    };
+
+    auto it = find_path_prefix(full_key);
+    if (it == state.entries.end()) {
+        it = find_path_prefix(host_port_key);
+    }
+    if (it == state.entries.end()) {
+        it = find_path_prefix(host);
+    }
+    if (it == state.entries.end()) {
+        it = state.entries.find(full_key);
+    }
     if (it == state.entries.end()) {
         it = state.entries.find(host_port_key);
     }
@@ -627,6 +670,60 @@ bool IsFollowableRedirect(int status, s32 method) {
         return false;
     }
     return true;
+}
+
+bool ShouldCaptureBloodborneSummon(const SendRequestPlan& plan) {
+    const char* enabled = std::getenv("SHADPS4_CAPTURE_BLOODBORNE_SUMMON");
+    return enabled != nullptr && enabled[0] != '\0' && std::string_view{enabled} != "0" &&
+           plan.path.find("/summon_messenger/") != std::string::npos;
+}
+
+void CaptureBloodborneSummon(const SendRequestPlan& plan, const HttpResponse& response,
+                             s32 request_error) {
+    if (!ShouldCaptureBloodborneSummon(plan)) {
+        return;
+    }
+
+    static std::atomic<u64> next_capture_id{1};
+    const u64 capture_id = next_capture_id.fetch_add(1, std::memory_order_relaxed);
+    const auto capture_dir =
+        Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) / "bloodborne-summon";
+    std::error_code error;
+    std::filesystem::create_directories(capture_dir, error);
+    if (error) {
+        LOG_ERROR(Lib_Http, "Could not create Bloodborne summon capture directory {}: {}",
+                  Common::FS::PathToUTF8String(capture_dir), error.message());
+        return;
+    }
+
+    const std::string stem = "summon-" + std::to_string(capture_id);
+    const auto request_path = capture_dir / (stem + "-request.bin");
+    const auto response_path = capture_dir / (stem + "-response.bin");
+    const auto metadata_path = capture_dir / (stem + ".txt");
+
+    std::ofstream request_file(request_path, std::ios::binary);
+    std::ofstream response_file(response_path, std::ios::binary);
+    std::ofstream metadata_file(metadata_path);
+    if (!request_file || !response_file || !metadata_file) {
+        LOG_ERROR(Lib_Http, "Could not open Bloodborne summon capture files under {}",
+                  Common::FS::PathToUTF8String(capture_dir));
+        return;
+    }
+
+    request_file.write(reinterpret_cast<const char*>(plan.body.data()),
+                       static_cast<std::streamsize>(plan.body.size()));
+    response_file.write(reinterpret_cast<const char*>(response.body.data()),
+                        static_cast<std::streamsize>(response.body.size()));
+    metadata_file << "method=" << HttpMethodName(plan.method) << '\n'
+                  << "url=" << plan.scheme << "://" << plan.host << ':' << plan.port << plan.path
+                  << '\n'
+                  << "request_bytes=" << plan.body.size() << '\n'
+                  << "status=" << response.status_code << '\n'
+                  << "response_bytes=" << response.body.size() << '\n'
+                  << "request_error=" << request_error << '\n';
+
+    LOG_INFO(Lib_Http, "Captured Bloodborne summon exchange {} under {}", capture_id,
+             Common::FS::PathToUTF8String(capture_dir));
 }
 
 // 303 changes the new method to GET unless original was HEAD
@@ -1247,7 +1344,8 @@ int PS4_SYSV_ABI sceHttpCreateConnectionWithURL(int tmplId, const char* url, boo
     scheme_str = is_secure ? "https" : "http";
     u16 port = parsed.port;
     std::string host_str = parsed.hostname;
-    ApplyHostOverride(scheme_str, host_str, port, is_secure);
+    ApplyHostOverride(scheme_str, host_str, port, is_secure,
+                      parsed.path ? std::string_view{parsed.path} : std::string_view{"/"});
 
     std::lock_guard<std::mutex> lock(g_state.m_mutex);
     if (!g_state.inited) {
@@ -1579,6 +1677,8 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
         } else {
             worker_errno = RunRealHttpRequest(plan, local_res, success_event_bits);
         }
+
+        CaptureBloodborneSummon(plan, local_res, worker_errno);
 
         std::lock_guard<std::mutex> lock(g_state.m_mutex);
         if (g_state.shutting_down.load() || req_ptr->deleted ||
