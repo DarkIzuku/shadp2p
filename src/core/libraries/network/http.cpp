@@ -387,8 +387,8 @@ bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& 
             if (!path.starts_with(prefix)) {
                 continue;
             }
-            const bool boundary_match = path.size() == prefix.size() || prefix.ends_with('/') ||
-                                        path[prefix.size()] == '/';
+            const bool boundary_match =
+                path.size() == prefix.size() || prefix.ends_with('/') || path[prefix.size()] == '/';
             if (boundary_match && prefix.size() > best_prefix_size) {
                 best = candidate;
                 best_prefix_size = prefix.size();
@@ -686,8 +686,7 @@ bool IsBloodborneSummonCreatePath(std::string_view path) {
 }
 
 bool ShouldCaptureBloodborneSummon(const SendRequestPlan& plan) {
-    return EnvFlagEnabled("SHADPS4_CAPTURE_BLOODBORNE_SUMMON") &&
-           IsBloodborneSummonPath(plan.path);
+    return EnvFlagEnabled("SHADPS4_CAPTURE_BLOODBORNE_SUMMON") && IsBloodborneSummonPath(plan.path);
 }
 
 void CaptureBloodborneSummon(const SendRequestPlan& plan, const HttpResponse& response,
@@ -782,9 +781,8 @@ bool ApplyBloodborneSeamlessRoute(SendRequestPlan& plan) {
     RewriteHostHeader(plan);
     plan.headers.emplace_back("X-ShadPS4-Bloodborne-Seamless", "1");
 
-    LOG_INFO(Lib_Http, "Bloodborne seamless route active: {}://{}:{}{} -> {}://{}:{}{}",
-             old_scheme, old_host, old_port, plan.path, plan.scheme, plan.host, plan.port,
-             plan.path);
+    LOG_INFO(Lib_Http, "Bloodborne seamless route active: {}://{}:{}{} -> {}://{}:{}{}", old_scheme,
+             old_host, old_port, plan.path, plan.scheme, plan.host, plan.port, plan.path);
     return true;
 }
 
