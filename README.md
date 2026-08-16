@@ -3,12 +3,12 @@ SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# Bloodborne traditional co-op for shadPS4
+# Bloodborne co-op for shadPS4
 
 This fork connects shadPS4 to a private shadNet server so Bloodborne players can
-use the game's normal online co-op flow. The host rings the Beckoning Bell and a
-guest rings the Small Resonant Bell. Bloodborne's normal area, boss, level, and
-session restrictions still apply.
+use either the game's traditional online co-op flow or the experimental seamless
+mode. The host rings the Beckoning Bell and a guest rings the Small Resonant Bell
+in both modes.
 
 This README is written for players. The person running the server should also
 follow the [shadNet server guide](https://github.com/Wozzardman/shadnet-p2p).
@@ -16,6 +16,74 @@ follow the [shadNet server guide](https://github.com/Wozzardman/shadnet-p2p).
 > [!IMPORTANT]
 > Use the matching releases of this shadPS4 fork and the shadNet fork. The
 > upstream public builds do not contain all of this project's P2P changes.
+
+## Choose a co-op mode
+
+All players and the shadNet server must use the same mode. Completely close the
+launchers, shadPS4 processes, and server before changing modes.
+
+### Traditional co-op
+
+Traditional mode keeps Bloodborne's normal area, boss, level, bell, death, and
+session restrictions. Start QtLauncher or BBLauncher normally. Do not set
+`SHADPS4_BLOODBORNE_SEAMLESS_COOP`, and have the server owner set
+`BloodborneSeamlessCoop=false` in `shadnet.cfg`.
+
+If the variable was set in the current terminal, remove it before starting the
+launcher:
+
+```bash
+unset SHADPS4_BLOODBORNE_SEAMLESS_COOP
+```
+
+In Windows PowerShell, close the terminal that enabled seamless mode or run:
+
+```powershell
+Remove-Item Env:SHADPS4_BLOODBORNE_SEAMLESS_COOP -ErrorAction Ignore
+```
+
+### Experimental seamless co-op
+
+Seamless mode bypasses the known bell availability checks and lets shadNet match
+players in different maps. For a cross-map summon, the guest is moved to the
+host's map before Bloodborne completes its normal room join. The server owner
+must enable seamless mode as described in the shadNet README, and every player
+must start their launcher with this environment variable:
+
+```text
+SHADPS4_BLOODBORNE_SEAMLESS_COOP=1
+```
+
+On Linux, start the launcher from a terminal. Replace the path with the actual
+QtLauncher or BBLauncher executable:
+
+```bash
+SHADPS4_BLOODBORNE_SEAMLESS_COOP=1 /path/to/QtLauncher.AppImage
+```
+
+On Windows, open PowerShell in the launcher folder and run:
+
+```powershell
+$env:SHADPS4_BLOODBORNE_SEAMLESS_COOP = "1"
+./QtLauncher.exe
+```
+
+Substitute the BBLauncher executable when using BBLauncher. On macOS, run the
+executable inside the application bundle so it inherits the variable:
+
+```bash
+SHADPS4_BLOODBORNE_SEAMLESS_COOP=1 /Applications/QtLauncher.app/Contents/MacOS/QtLauncher
+```
+
+Keep that terminal open while playing. Starting the launcher normally from a
+desktop icon will not inherit a variable set only in another terminal. The
+reverse-engineering trace and capture variables are optional diagnostics and
+are not required for seamless mode.
+
+Seamless mode is still experimental. Bell use and cross-map guest placement are
+working, but lantern travel after a co-op session has already formed is not yet
+complete because Bloodborne can still suppress the lantern interaction prompt.
+Back up saves before testing it.
 
 ## What every player needs
 
@@ -277,7 +345,7 @@ A working server returns:
 Start Bloodborne and choose online play. The shadNet server console should show
 your NP ID authenticating rather than `Login failed`.
 
-## 6. Play traditional co-op
+## 6. Play co-op
 
 1. Set the same matchmaking password in Bloodborne on all players. This is
    strongly recommended for testing with a specific friend.
@@ -286,13 +354,16 @@ your NP ID authenticating rather than `Login failed`.
 4. The guest rings the **Small Resonant Bell**.
 5. Wait for Bloodborne to match and connect the peers.
 
-The Sinister Resonant Bell follows the game's normal invasion rules. A greyed
-bell or crossed-out bell icon means Bloodborne itself considers the current
-state or area ineligible. Traditional mode intentionally keeps those rules.
+In traditional mode, a greyed bell or crossed-out bell icon means Bloodborne
+considers the current state or area ineligible. The Sinister Resonant Bell also
+keeps the game's normal invasion rules.
 
-Do not set `SHADPS4_BLOODBORNE_SEAMLESS_COOP=1` for this setup. Seamless co-op
-and the reverse-engineering trace flags are experimental developer features,
-not requirements for normal co-op.
+In seamless mode, the host and guest may begin on different maps. Ring the
+host's Beckoning Bell first, then the guest's Small Resonant Bell. Leave both
+bells active while the server prepares the guest's destination and completes
+the normal matchmaking flow. If the host travels before discovery, wait for the
+host to finish loading before the guest rings. Established-session lantern
+travel is not yet supported.
 
 ## Troubleshooting
 
