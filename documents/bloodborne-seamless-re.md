@@ -1396,3 +1396,95 @@ resolve the downstream host lantern prompt gate, then exercise lantern travel
 while the session is established and verify disconnect, death, and
 manual-silence recovery. Those are lifecycle and breadth tests; the core
 cross-map summon path is now live validated.
+
+## `ss.info` status-message diagnostics
+
+The CUSA03173 01.09 executable has exactly one executable immediate reference
+that selects localized message 4402. The sibling selections of 4401 and 4403
+are in the same handler. The recovered decision is:
+
+```text
+if (api_type == 38) {                         // ss.info
+    FrpgNetMan* net = saved_frpg_net_man;
+    if (net->field_3E8 != 0) {
+        SsInfoConfig* config = net->field_18;
+        if (config == nullptr) {
+            message_id = 4403;
+        } else if (config->ss != 0) {
+            message_id = 4401;
+        } else {
+            message_id = 4402;
+        }
+        ShowNetworkMessage(net, message_id);
+    } else {
+        // Separate response/status and retry handling. Four failed retries
+        // converge on 4403; other branches do not select 4402.
+    }
+    net->field_3E8 = 0;
+}
+```
+
+The exact 4402 block is at offline label `0x01E88ACD`. It is reached only when
+the saved API type is 38, `FrpgNetMan+0x3E8` is nonzero,
+`FrpgNetMan+0x18` is non-null, and the signed 32-bit `ss` at
+`[FrpgNetMan+0x18]+8` is zero. This is demonstrated by the instructions, not
+inferred from the English message. It also proves that selecting 4402 does not
+itself require response kind `0x100108`.
+
+The statically demonstrated direct stores to this particular field are:
+
+- `0x01E7DA3D`: initialize `FrpgNetMan+0x3E8` to zero;
+- `0x01E894DA`: clear it after the status-message decision;
+- `0x01E898C4`: set it to one on the recovered maintenance branch.
+
+This list does not exclude a write through an alias or a different runtime
+object. The trace therefore observes the first 64 executions of all three
+stores and records the object address, old value, value about to be written,
+request/API/response context, and caller. The message-selection observers also
+sample the field and config object, so an unobserved alias change can be
+distinguished from the three direct stores.
+
+The parser entry is the offline label `0x01EB6860`; its single recovered caller
+is the `ss.info` completion callback at `0x01E89CA1`. The parser returns its
+validity result in `AL`: zero is failure and one is success. Its common return
+site copies `R14B` to `AL`. On the successful path, the callback retains the
+new `0x9C0`-byte configuration object and resets the retry counter. On failure,
+the next branch destroys that object and clears `FrpgNetMan+0x18`. The new
+observers are placed at the common parser return and immediately after the
+callback's parser call. They record the result, parsed `ss`, selected
+`gameurl` index, language index, populated API-string count, configuration
+fields used by the callback, and the ensuing success/failure transition.
+
+The two maintenance observers now additionally emit their first 32 raw hits,
+even when neither `RCX` nor `R14D` is `0x100108`. After 32 executions they
+return to maintenance-only filtering. This establishes whether either point is
+part of the `ss.info` transaction without producing an unbounded log.
+
+### Address-coordinate result
+
+The local SELF header reports executable blocked-segment physical offset
+`0x28EB0`. The embedded ELF program header reports `p_offset=0x4000`,
+`p_vaddr=0`, and an executable size of `0x50DA034`. Therefore `0x280` is not
+the ELF `p_offset`. The signature is already displaced by `-0x280` in the
+first snapshot after `PrePatchInstructions` and remains at the same address
+after the static red-zone pass, `MemoryPatcher`, and immediately before trace
+installation. Those stages do not create the displacement.
+
+The two old offline labels and the runtime locator results prove a constant
+coordinate bias:
+
+```text
+runtime offset = old offline label - 0x280
+```
+
+What is demonstrated is that the old labels used a base 0x280 bytes earlier
+than the base represented by `g_eboot_address` in the running image. The loader
+source contains no `p_offset=0x280` rule and `Elf::LoadSegment` seeks through
+the SELF blocked-segment mapping. Consequently it would be incorrect to blame
+instruction patching or to describe 0x280 as an ELF file offset. The locator
+now records both `image_base` and `executable_base`, plus their signed delta,
+in every stage. That runtime field is the direct check for whether the remaining
+bias is introduced by the executable segment base supplied by the loaded game
+or by the earlier offline import convention. Hooks never depend on the old
+labels: every new observer is selected only from one unique signature match
+with independently validated surrounding instructions.

@@ -86,6 +86,10 @@ enum class TraceKind : u8 {
     ChairRespawnNotification,
     WorldStateValidation,
     MaintenanceSource,
+    HttpMessageSelection,
+    FrpgMaintenanceFlagWrite,
+    SsInfoParserExit,
+    SsInfoCallbackAfterParser,
 };
 
 struct TraceSite {
@@ -197,6 +201,8 @@ constexpr auto ResponderResumeRetryDelay = std::chrono::seconds{15};
 constexpr u32 MaintenanceResKind = 0x00100108;
 constexpr u64 MaintenanceDispatchOffset = 0x01E894E1;
 constexpr u64 MaintenanceExtractedOffset = 0x01E7F9F2;
+constexpr u64 FrpgMaintenanceFlagOffset = 0x3E8;
+constexpr u64 FrpgConfigOffset = 0x18;
 constexpr auto BloodborneApiNames = std::to_array<std::string_view>({
     "api_Login",
     "api_ServerTimeGet",
@@ -269,6 +275,109 @@ constexpr NativeCallSignature MaintenanceDispatchPostContext{
     0x01E894E8,
     {0x0F, 0x84, 0x88, 0x03, 0x00, 0x00},
     2,
+};
+
+constexpr bool IsRuntimeLocatedKind(TraceKind kind) {
+    return kind == TraceKind::MaintenanceSource || kind == TraceKind::HttpMessageSelection ||
+           kind == TraceKind::FrpgMaintenanceFlagWrite || kind == TraceKind::SsInfoParserExit ||
+           kind == TraceKind::SsInfoCallbackAfterParser;
+}
+
+constexpr NativeCallSignature Message4402PreContext{
+    "Http.Message.Select.4402.Pre",
+    0,
+    {0x83, 0x78, 0x08, 0x00, 0x0F, 0x85, 0xD4, 0x09, 0x00, 0x00},
+    10,
+};
+constexpr NativeCallSignature Message4402PostContext{
+    "Http.Message.Select.4402.Post",
+    0,
+    {0xE9, 0xF3, 0x09, 0x00, 0x00},
+    5,
+};
+constexpr NativeCallSignature Message4401PreContext{
+    "Http.Message.Select.4401.Pre",
+    0,
+    {0x83, 0x78, 0x08, 0x00, 0x74, 0x34},
+    6,
+};
+constexpr NativeCallSignature Message4401PostContext{
+    "Http.Message.Select.4401.Post",
+    0,
+    {0xEB, 0x22},
+    2,
+};
+constexpr NativeCallSignature Message4403PreContext{
+    "Http.Message.Select.4403.Pre",
+    0,
+    {0x83, 0xF8, 0x04, 0x72, 0x10},
+    5,
+};
+constexpr NativeCallSignature Message4403PostContext{
+    "Http.Message.Select.4403.Post",
+    0,
+    {0x48, 0x89, 0xFB},
+    3,
+};
+constexpr NativeCallSignature FlagInitializePreContext{
+    "FrpgNetMan.MaintenanceFlag.Initialize.Pre",
+    0,
+    {0x4D, 0x8D, 0xA7, 0xF0, 0x03, 0x00, 0x00},
+    7,
+};
+constexpr NativeCallSignature FlagInitializePostContext{
+    "FrpgNetMan.MaintenanceFlag.Initialize.Post",
+    0,
+    {0x49, 0xC7, 0x87, 0xE0, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    11,
+};
+constexpr NativeCallSignature FlagClearPreContext{
+    "FrpgNetMan.MaintenanceFlag.Clear.Pre",
+    0,
+    {0x48, 0x89, 0x7C, 0x24, 0x78},
+    5,
+};
+constexpr NativeCallSignature FlagClearPostContext{
+    "FrpgNetMan.MaintenanceFlag.Clear.Post",
+    0,
+    {0x41, 0x81, 0xFE, 0x08, 0x01, 0x10, 0x00},
+    7,
+};
+constexpr NativeCallSignature FlagSetPreContext{
+    "FrpgNetMan.MaintenanceFlag.Set.Pre",
+    0,
+    {0x48, 0x8B, 0x44, 0x24, 0x78},
+    5,
+};
+constexpr NativeCallSignature FlagSetPostContext{
+    "FrpgNetMan.MaintenanceFlag.Set.Post",
+    0,
+    {0xEB, 0x16},
+    2,
+};
+constexpr NativeCallSignature ParserReturnPreContext{
+    "SsInfo.Parser.Return.Pre",
+    0,
+    {0x48, 0x8B, 0x01, 0x48, 0x3B, 0x45, 0xD0, 0x75},
+    8,
+};
+constexpr NativeCallSignature ParserReturnPostContext{
+    "SsInfo.Parser.Return.Post",
+    0,
+    {0x5B, 0x41, 0x5C, 0x41, 0x5D, 0x41, 0x5E, 0x41, 0x5F, 0x5D, 0xC3},
+    11,
+};
+constexpr NativeCallSignature ParserCallbackPreContext{
+    "SsInfo.Callback.AfterParser.Pre",
+    0,
+    {0xE8, 0xBA, 0xCB, 0x02, 0x00},
+    5,
+};
+constexpr NativeCallSignature ParserCallbackPostContext{
+    "SsInfo.Callback.AfterParser.Post",
+    0,
+    {0x41, 0xC7, 0x87, 0xE4, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    11,
 };
 
 constexpr auto CrossMapNativeCalls = std::to_array<NativeCallSignature>({
@@ -819,12 +928,54 @@ constexpr auto Sites = std::to_array<TraceSite>({
      TraceKind::MaintenanceSource,
      {0x41, 0x81, 0xFE, 0x08, 0x01, 0x10, 0x00},
      7},
+
+    {"Http.Message.Select.4402",
+     0x01E88ACD,
+     TraceKind::HttpMessageSelection,
+     {0xBE, 0x32, 0x11, 0x00, 0x00},
+     5},
+    {"Http.Message.Select.4401",
+     0x01E894A1,
+     TraceKind::HttpMessageSelection,
+     {0xBE, 0x31, 0x11, 0x00, 0x00},
+     5},
+    {"Http.Message.Select.4403",
+     0x01E894C5,
+     TraceKind::HttpMessageSelection,
+     {0xBE, 0x33, 0x11, 0x00, 0x00},
+     5},
+    {"FrpgNetMan.MaintenanceFlag.Initialize",
+     0x01E7DA3D,
+     TraceKind::FrpgMaintenanceFlagWrite,
+     {0x41, 0xC6, 0x87, 0xE8, 0x03, 0x00, 0x00, 0x00},
+     8},
+    {"FrpgNetMan.MaintenanceFlag.Clear",
+     0x01E894DA,
+     TraceKind::FrpgMaintenanceFlagWrite,
+     {0xC6, 0x87, 0xE8, 0x03, 0x00, 0x00, 0x00},
+     7},
+    {"FrpgNetMan.MaintenanceFlag.Set",
+     0x01E898C4,
+     TraceKind::FrpgMaintenanceFlagWrite,
+     {0xC6, 0x80, 0xE8, 0x03, 0x00, 0x00, 0x01},
+     7},
+    {"SsInfo.Parser.Return",
+     0x01EB6E07,
+     TraceKind::SsInfoParserExit,
+     {0x44, 0x88, 0xF0, 0x48, 0x81, 0xC4, 0x68, 0x07, 0x00, 0x00},
+     10},
+    {"SsInfo.Callback.AfterParser",
+     0x01E89CA6,
+     TraceKind::SsInfoCallbackAfterParser,
+     {0x84, 0xC0, 0x0F, 0x84, 0xBB, 0x00, 0x00, 0x00},
+     8},
 });
 
 auto RuntimeSites = Sites;
 std::array<std::atomic<u64>, Sites.size()> site_hits{};
 std::atomic<u64> event_sequence{};
 std::atomic<s32> observed_sos_area{-1};
+std::atomic<u64> frpg_maintenance_flag_write_sequence{};
 std::mutex capture_mutex;
 std::ofstream capture_file;
 std::filesystem::path capture_path;
@@ -874,9 +1025,11 @@ struct ReverseEngineeringImageStage {
     std::string stage;
     uintptr_t image_base{};
     u64 image_size{};
+    uintptr_t executable_base{};
+    s64 executable_base_delta{};
     u64 executable_offset{};
     u64 executable_size{};
-    std::array<MaintenanceLocatorResult, 2> locators;
+    std::vector<MaintenanceLocatorResult> locators;
 };
 
 std::mutex image_stage_mutex;
@@ -1058,25 +1211,47 @@ bool MatchesRuntimeBytes(uintptr_t stage_image_base, u64 stage_image_size, u64 o
     return std::ranges::equal(actual, expected);
 }
 
-bool IsMaintenanceContextValid(const TraceSite& site, uintptr_t stage_image_base,
-                               u64 stage_image_size, u64 candidate_offset) {
+bool IsRuntimeContextValid(const TraceSite& site, uintptr_t stage_image_base, u64 stage_image_size,
+                           u64 candidate_offset) {
+    const auto before = [&](u64 distance, const NativeCallSignature& signature) {
+        return candidate_offset >= distance &&
+               MatchesRuntimeBytes(stage_image_base, stage_image_size, candidate_offset - distance,
+                                   signature);
+    };
+    const auto after = [&](const NativeCallSignature& signature) {
+        return MatchesRuntimeBytes(stage_image_base, stage_image_size,
+                                   candidate_offset + site.prologue_size, signature);
+    };
     if (site.name == "Http.ResKind.Extracted") {
-        return candidate_offset >= 15 &&
-               MatchesRuntimeBytes(stage_image_base, stage_image_size, candidate_offset - 15,
-                                   MaintenanceExtractedRequestContext) &&
-               MatchesRuntimeBytes(stage_image_base, stage_image_size, candidate_offset - 8,
-                                   MaintenanceExtractedContext) &&
-               MatchesRuntimeBytes(stage_image_base, stage_image_size,
-                                   candidate_offset + site.prologue_size,
-                                   MaintenanceExtractedPostContext);
+        return before(15, MaintenanceExtractedRequestContext) &&
+               before(8, MaintenanceExtractedContext) && after(MaintenanceExtractedPostContext);
     }
     if (site.name == "Http.Maintenance.Dispatch") {
-        return candidate_offset >= 7 &&
-               MatchesRuntimeBytes(stage_image_base, stage_image_size, candidate_offset - 7,
-                                   MaintenanceDispatchContext) &&
-               MatchesRuntimeBytes(stage_image_base, stage_image_size,
-                                   candidate_offset + site.prologue_size,
-                                   MaintenanceDispatchPostContext);
+        return before(7, MaintenanceDispatchContext) && after(MaintenanceDispatchPostContext);
+    }
+    if (site.name == "Http.Message.Select.4402") {
+        return before(10, Message4402PreContext) && after(Message4402PostContext);
+    }
+    if (site.name == "Http.Message.Select.4401") {
+        return before(6, Message4401PreContext) && after(Message4401PostContext);
+    }
+    if (site.name == "Http.Message.Select.4403") {
+        return before(5, Message4403PreContext) && after(Message4403PostContext);
+    }
+    if (site.name == "FrpgNetMan.MaintenanceFlag.Initialize") {
+        return before(7, FlagInitializePreContext) && after(FlagInitializePostContext);
+    }
+    if (site.name == "FrpgNetMan.MaintenanceFlag.Clear") {
+        return before(5, FlagClearPreContext) && after(FlagClearPostContext);
+    }
+    if (site.name == "FrpgNetMan.MaintenanceFlag.Set") {
+        return before(5, FlagSetPreContext) && after(FlagSetPostContext);
+    }
+    if (site.name == "SsInfo.Parser.Return") {
+        return before(8, ParserReturnPreContext) && after(ParserReturnPostContext);
+    }
+    if (site.name == "SsInfo.Callback.AfterParser") {
+        return before(5, ParserCallbackPreContext) && after(ParserCallbackPostContext);
     }
     return false;
 }
@@ -1132,8 +1307,8 @@ MaintenanceLocatorResult LocateMaintenanceSite(const TraceSite& site, uintptr_t 
                 std::min<u64>(DiagnosticRadius, stage_image_size - candidate_after_start));
             result.matches.push_back({
                 .offset = candidate_offset,
-                .context_valid = IsMaintenanceContextValid(site, stage_image_base, stage_image_size,
-                                                           candidate_offset),
+                .context_valid = IsRuntimeContextValid(site, stage_image_base, stage_image_size,
+                                                       candidate_offset),
                 .bytes = ReadDiagnosticBytes(stage_image_base, stage_image_size, candidate_offset,
                                              pattern.size()),
                 .before =
@@ -1163,17 +1338,21 @@ ReverseEngineeringImageStage CaptureImageStage(std::string_view stage, uintptr_t
         .stage = std::string{stage},
         .image_base = stage_image_base,
         .image_size = stage_image_size,
+        .executable_base = executable_base,
+        .executable_base_delta = executable_base >= stage_image_base
+                                     ? static_cast<s64>(executable_base - stage_image_base)
+                                     : -static_cast<s64>(stage_image_base - executable_base),
         .executable_offset =
             executable_base >= stage_image_base ? executable_base - stage_image_base : 0,
         .executable_size = executable_size,
-        .locators =
-            {
-                LocateMaintenanceSite(Sites[Sites.size() - 2], stage_image_base, stage_image_size,
-                                      executable_base, executable_size),
-                LocateMaintenanceSite(Sites[Sites.size() - 1], stage_image_base, stage_image_size,
-                                      executable_base, executable_size),
-            },
     };
+
+    for (const auto& site : Sites) {
+        if (IsRuntimeLocatedKind(site.kind)) {
+            result.locators.push_back(LocateMaintenanceSite(
+                site, stage_image_base, stage_image_size, executable_base, executable_size));
+        }
+    }
 
     for (const auto& locator : result.locators) {
         std::ostringstream selected_out;
@@ -1184,8 +1363,10 @@ ReverseEngineeringImageStage CaptureImageStage(std::string_view stage, uintptr_t
         }
         LOG_INFO(Debug,
                  "[BLOODBORNE RE LOCATOR] stage={} site={} static_offset={:#x} "
+                 "image_base={:#x} executable_base={:#x} executable_base_delta={} "
                  "runtime_matches={} selected_offset={} bytes={}",
-                 result.stage, locator.site, locator.static_offset, locator.matches.size(),
+                 result.stage, locator.site, locator.static_offset, result.image_base,
+                 result.executable_base, result.executable_base_delta, locator.matches.size(),
                  selected_out.str(), locator.static_runtime_bytes);
         for (const auto& match : locator.matches) {
             LOG_INFO(Debug,
@@ -1230,13 +1411,16 @@ struct MaintenanceSourceRecord {
     u32 request_id{};
     u32 api_index{};
     u32 res_kind{};
+    u32 stack_res_kind{};
     u32 r14d{};
+    u64 rcx{};
+    bool is_maintenance{};
     u64 return_address{};
     u64 caller_offset{};
 };
 
-std::optional<MaintenanceSourceRecord> ReadMaintenanceSource(
-    const TraceSite& site, const GuestRegisterSnapshot& registers) {
+MaintenanceSourceRecord ReadMaintenanceSource(const TraceSite& site,
+                                              const GuestRegisterSnapshot& registers) {
     const bool extracted_site = site.name == "Http.ResKind.Extracted";
     MaintenanceSourceRecord record{
         .request_id = ReadValue<u32>(registers.rsp, 0xD58),
@@ -1245,14 +1429,14 @@ std::optional<MaintenanceSourceRecord> ReadMaintenanceSource(
         // Reading ECX observes the exact value without changing the guest stack or registers.
         .res_kind =
             extracted_site ? static_cast<u32>(registers.rcx) : ReadValue<u32>(registers.rsp, 0xD60),
+        .stack_res_kind = ReadValue<u32>(registers.rsp, 0xD60),
         .r14d = static_cast<u32>(registers.r14),
+        .rcx = registers.rcx,
         .return_address = ReadValue<u64>(registers.rbp, sizeof(u64)),
     };
 
-    if ((site.name == "Http.Maintenance.Dispatch" && record.r14d != MaintenanceResKind) ||
-        (extracted_site && record.res_kind != MaintenanceResKind)) {
-        return std::nullopt;
-    }
+    record.is_maintenance =
+        extracted_site ? record.res_kind == MaintenanceResKind : record.r14d == MaintenanceResKind;
     if (record.return_address >= image_base &&
         record.return_address - image_base < MemoryPatcher::g_eboot_image_size) {
         record.caller_offset = record.return_address - image_base;
@@ -3152,9 +3336,20 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         ApplyHealingFountainHostAvailability(*registers);
     }
     std::optional<MaintenanceSourceRecord> maintenance_source;
+    u64 early_hit{};
     if (site.kind == TraceKind::MaintenanceSource) {
         maintenance_source = ReadMaintenanceSource(site, *registers);
-        if (!maintenance_source.has_value()) {
+        early_hit = site_hits[tag].fetch_add(1, std::memory_order_relaxed) + 1;
+        if (!maintenance_source->is_maintenance && early_hit > 32) {
+            return;
+        }
+    }
+    u64 flag_write_sequence{};
+    if (site.kind == TraceKind::FrpgMaintenanceFlagWrite) {
+        early_hit = site_hits[tag].fetch_add(1, std::memory_order_relaxed) + 1;
+        flag_write_sequence =
+            frpg_maintenance_flag_write_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (flag_write_sequence > 64) {
             return;
         }
     }
@@ -3202,7 +3397,8 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         }
     }
 
-    const u64 hit = site_hits[tag].fetch_add(1, std::memory_order_relaxed) + 1;
+    const u64 hit =
+        early_hit != 0 ? early_hit : site_hits[tag].fetch_add(1, std::memory_order_relaxed) + 1;
     const u64 dense_capture_limit =
         site.kind == TraceKind::ActionFlags || site.kind == TraceKind::GoodsParamLookup ? 2048 : 64;
     if (site.kind != TraceKind::MaintenanceSource && hit > dense_capture_limit && hit % 300 != 0) {
@@ -3225,6 +3421,8 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         WriteHex(capture_file, registers->rax);
         capture_file << ",\"rdi\":";
         WriteHex(capture_file, registers->rdi);
+        capture_file << ",\"rbx\":";
+        WriteHex(capture_file, registers->rbx);
         capture_file << ",\"rsi\":";
         WriteHex(capture_file, registers->rsi);
         capture_file << ",\"rdx\":";
@@ -3235,8 +3433,16 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         WriteHex(capture_file, registers->r8);
         capture_file << ",\"r9\":";
         WriteHex(capture_file, registers->r9);
+        capture_file << ",\"r14\":";
+        WriteHex(capture_file, registers->r14);
+        capture_file << ",\"r15\":";
+        WriteHex(capture_file, registers->r15);
         capture_file << ",\"rsp\":";
         WriteHex(capture_file, registers->rsp);
+        capture_file << ",\"rbp\":";
+        WriteHex(capture_file, registers->rbp);
+        capture_file << ",\"rflags\":";
+        WriteHex(capture_file, registers->rflags);
         capture_file << '}';
 
         switch (site.kind) {
@@ -3661,6 +3867,184 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         case TraceKind::WorldStateValidation:
             WriteWorldStateValidation(capture_file, site, *registers);
             break;
+        case TraceKind::HttpMessageSelection: {
+            u32 message_id{};
+            if (site.name == "Http.Message.Select.4401") {
+                message_id = 4401;
+            } else if (site.name == "Http.Message.Select.4402") {
+                message_id = 4402;
+            } else if (site.name == "Http.Message.Select.4403") {
+                message_id = 4403;
+            }
+            const u64 frpg_net_man = registers->rdi;
+            const u64 config = ReadValue<u64>(frpg_net_man, FrpgConfigOffset);
+            const s32 ss = config >= 0x10000 ? ReadValue<s32>(config, 0x08) : 999;
+            const u64 return_address = ReadValue<u64>(registers->rbp, sizeof(u64));
+            const u64 caller_offset =
+                return_address >= image_base &&
+                        return_address - image_base < MemoryPatcher::g_eboot_image_size
+                    ? return_address - image_base
+                    : 0;
+            capture_file << ",\"http_message_selection\":{";
+            capture_file << "\"message_id\":" << message_id;
+            capture_file << ",\"ss\":" << ss;
+            capture_file << ",\"decision_value_esi\":"
+                         << static_cast<s32>(static_cast<u32>(registers->rsi));
+            capture_file << ",\"frpg_net_man\":";
+            WriteHex(capture_file, frpg_net_man);
+            capture_file << ",\"maintenance_flag\":"
+                         << static_cast<u32>(
+                                ReadValue<u8>(frpg_net_man, FrpgMaintenanceFlagOffset));
+            capture_file << ",\"config\":";
+            WriteHex(capture_file, config);
+            capture_file << ",\"config_exists\":" << (config >= 0x10000 ? "true" : "false");
+            capture_file << ",\"config_ss_is_zero\":" << (ss == 0 ? "true" : "false");
+            capture_file << ",\"api_type\":" << ReadValue<u32>(registers->rsp, 0xD5C);
+            capture_file << ",\"request_id\":";
+            WriteHex(capture_file, ReadValue<u32>(registers->rsp, 0xD58));
+            capture_file << ",\"res_kind\":";
+            WriteHex(capture_file, ReadValue<u32>(registers->rsp, 0xD60));
+            capture_file << ",\"response_flag_bit32\":"
+                         << ((ReadValue<u64>(registers->rsp, 0xD60) >> 32) & 1);
+            capture_file << ",\"retry_count\":" << ReadValue<u32>(frpg_net_man, 0x3E4);
+            capture_file << ",\"timeout_bits\":";
+            WriteHex(capture_file, ReadValue<u32>(frpg_net_man, 0xD0));
+            capture_file << ",\"return_address\":";
+            WriteHex(capture_file, return_address);
+            capture_file << ",\"caller_offset\":";
+            WriteHex(capture_file, caller_offset);
+            capture_file << '}';
+            LOG_INFO(Debug,
+                     "[BLOODBORNE MESSAGE SELECT] message_id={} ss={} frpg_net_man={:#x} "
+                     "maintenance_flag={} config={:#x} api_type={} res_kind={:#x} "
+                     "return_address={:#x} caller_offset={:#x}",
+                     message_id, ss, frpg_net_man,
+                     ReadValue<u8>(frpg_net_man, FrpgMaintenanceFlagOffset), config,
+                     ReadValue<u32>(registers->rsp, 0xD5C), ReadValue<u32>(registers->rsp, 0xD60),
+                     return_address, caller_offset);
+            break;
+        }
+        case TraceKind::FrpgMaintenanceFlagWrite: {
+            const bool is_set = site.name == "FrpgNetMan.MaintenanceFlag.Set";
+            const u64 frpg_net_man = site.name == "FrpgNetMan.MaintenanceFlag.Initialize"
+                                         ? registers->r15
+                                     : is_set ? registers->rax
+                                              : registers->rdi;
+            const u8 old_value = ReadValue<u8>(frpg_net_man, FrpgMaintenanceFlagOffset);
+            const u8 new_value = is_set ? 1 : 0;
+            const u64 return_address = ReadValue<u64>(registers->rbp, sizeof(u64));
+            const u64 caller_offset =
+                return_address >= image_base &&
+                        return_address - image_base < MemoryPatcher::g_eboot_image_size
+                    ? return_address - image_base
+                    : 0;
+            capture_file << ",\"frpg_maintenance_flag_write\":{";
+            capture_file << "\"sequence\":" << flag_write_sequence;
+            capture_file << ",\"frpg_net_man\":";
+            WriteHex(capture_file, frpg_net_man);
+            capture_file << ",\"old_value\":" << static_cast<u32>(old_value);
+            capture_file << ",\"new_value\":" << static_cast<u32>(new_value);
+            capture_file << ",\"changed\":" << (old_value != new_value ? "true" : "false");
+            capture_file << ",\"request_id\":";
+            WriteHex(capture_file, ReadValue<u32>(registers->rsp, 0xD58));
+            const u32 api_index = ReadValue<u32>(registers->rsp, 0xD5C);
+            capture_file << ",\"api_index\":" << api_index;
+            capture_file << ",\"api_name\":\"" << GetBloodborneApiName(api_index) << '"';
+            capture_file << ",\"res_kind\":";
+            WriteHex(capture_file, ReadValue<u32>(registers->rsp, 0xD60));
+            capture_file << ",\"r14d\":";
+            WriteHex(capture_file, static_cast<u32>(registers->r14));
+            capture_file << ",\"return_address\":";
+            WriteHex(capture_file, return_address);
+            capture_file << ",\"caller_offset\":";
+            WriteHex(capture_file, caller_offset);
+            capture_file << '}';
+            LOG_INFO(Debug,
+                     "[BLOODBORNE FRPG FLAG WRITE] sequence={} site={} frpg_net_man={:#x} "
+                     "old_value={} new_value={} api_index={} res_kind={:#x} caller_offset={:#x}",
+                     flag_write_sequence, site.name, frpg_net_man, old_value, new_value, api_index,
+                     ReadValue<u32>(registers->rsp, 0xD60), caller_offset);
+            break;
+        }
+        case TraceKind::SsInfoParserExit: {
+            const u64 config = ReadValue<u64>(registers->rbp - 0x3E0, 0);
+            const u64 gameurl_index_pointer = ReadValue<u64>(registers->rbp - 0x3D8, 0);
+            const u64 language_index_pointer = ReadValue<u64>(registers->rbp - 0x3F0, 0);
+            const u32 gameurl_index = ReadValue<u32>(gameurl_index_pointer, 0);
+            const u32 language_index = ReadValue<u32>(language_index_pointer, 0);
+            u32 api_found_count{};
+            for (u32 api_index = 0; api_index < 37; ++api_index) {
+                if (ReadValue<u64>(config, 0x60 + api_index * 0x38) != 0) {
+                    ++api_found_count;
+                }
+            }
+            const u64 return_address = ReadValue<u64>(registers->rbp, sizeof(u64));
+            capture_file << ",\"ss_info_parser_return\":{";
+            capture_file << "\"return_value\":" << static_cast<u32>(registers->r14 & 0xFF);
+            capture_file << ",\"ss\":" << ReadValue<s32>(config, 0x08);
+            capture_file << ",\"gameurl_index\":" << gameurl_index;
+            capture_file << ",\"language_index\":" << language_index;
+            capture_file << ",\"api_found_count\":" << api_found_count;
+            capture_file << ",\"config\":";
+            WriteHex(capture_file, config);
+            capture_file << ",\"config_898\":";
+            WriteHex(capture_file, ReadValue<u32>(config, 0x898));
+            capture_file << ",\"config_89c\":";
+            WriteHex(capture_file, ReadValue<u32>(config, 0x89C));
+            capture_file << ",\"config_92c\":";
+            WriteHex(capture_file, ReadValue<u32>(config, 0x92C));
+            capture_file << ",\"return_address\":";
+            WriteHex(capture_file, return_address);
+            capture_file << ",\"caller_offset\":";
+            WriteHex(capture_file, return_address >= image_base ? return_address - image_base : 0);
+            capture_file << '}';
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SS.INFO PARSER] return_value={} ss={} gameurl_index={} "
+                     "language_index={} api_found_count={} config={:#x}",
+                     static_cast<u32>(registers->r14 & 0xFF), ReadValue<s32>(config, 0x08),
+                     gameurl_index, language_index, api_found_count, config);
+            break;
+        }
+        case TraceKind::SsInfoCallbackAfterParser: {
+            const u64 frpg_net_man = registers->r15;
+            const u64 config = ReadValue<u64>(frpg_net_man, FrpgConfigOffset);
+            const bool parser_success = static_cast<u8>(registers->rax) != 0;
+            const u64 return_address = ReadValue<u64>(registers->rbp, sizeof(u64));
+            capture_file << ",\"ss_info_callback_after_parser\":{";
+            capture_file << "\"parser_return_value\":"
+                         << static_cast<u32>(static_cast<u8>(registers->rax));
+            capture_file << ",\"transition\":\""
+                         << (parser_success ? "success_config_retained"
+                                            : "failure_will_destroy_config")
+                         << '"';
+            capture_file << ",\"frpg_net_man\":";
+            WriteHex(capture_file, frpg_net_man);
+            capture_file << ",\"maintenance_flag\":"
+                         << static_cast<u32>(
+                                ReadValue<u8>(frpg_net_man, FrpgMaintenanceFlagOffset));
+            capture_file << ",\"config\":";
+            WriteHex(capture_file, config);
+            capture_file << ",\"ss\":" << ReadValue<s32>(config, 0x08);
+            capture_file << ",\"gameurl_index\":" << ReadValue<u32>(registers->rbp - 0x4CC, 0);
+            capture_file << ",\"language_index\":" << ReadValue<u32>(registers->rbp - 0x4D0, 0);
+            capture_file << ",\"response_status\":";
+            WriteHex(capture_file, ReadValue<u32>(registers->rsi, 0x08));
+            capture_file << ",\"response_flags\":";
+            WriteHex(capture_file, ReadValue<u32>(registers->rsi, 0x0C));
+            capture_file << ",\"return_address\":";
+            WriteHex(capture_file, return_address);
+            capture_file << ",\"caller_offset\":";
+            WriteHex(capture_file, return_address >= image_base ? return_address - image_base : 0);
+            capture_file << '}';
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SS.INFO CALLBACK] parser_return_value={} transition={} "
+                     "frpg_net_man={:#x} maintenance_flag={} config={:#x} ss={} gameurl_index={}",
+                     static_cast<u32>(static_cast<u8>(registers->rax)),
+                     parser_success ? "success_config_retained" : "failure_will_destroy_config",
+                     frpg_net_man, ReadValue<u8>(frpg_net_man, FrpgMaintenanceFlagOffset), config,
+                     ReadValue<s32>(config, 0x08), ReadValue<u32>(registers->rbp - 0x4CC, 0));
+            break;
+        }
         case TraceKind::MaintenanceSource: {
             const auto& record = *maintenance_source;
             capture_file << ",\"maintenance_source\":{";
@@ -3670,8 +4054,13 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             capture_file << ",\"api_name\":\"" << GetBloodborneApiName(record.api_index) << '"';
             capture_file << ",\"res_kind\":";
             WriteHex(capture_file, record.res_kind);
+            capture_file << ",\"stack_res_kind\":";
+            WriteHex(capture_file, record.stack_res_kind);
+            capture_file << ",\"rcx\":";
+            WriteHex(capture_file, record.rcx);
             capture_file << ",\"r14d\":";
             WriteHex(capture_file, record.r14d);
+            capture_file << ",\"is_maintenance\":" << (record.is_maintenance ? "true" : "false");
             capture_file << ",\"rsp\":";
             WriteHex(capture_file, registers->rsp);
             capture_file << ",\"rbp\":";
@@ -3705,13 +4094,25 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
 
         if (site.kind == TraceKind::MaintenanceSource) {
             const auto& record = *maintenance_source;
-            LOG_INFO(Debug,
-                     "[BLOODBORNE MAINTENANCE SOURCE] site={} request_id={:#x} api_index={} "
-                     "api_name={} res_kind={:#x} r14d={:#x} rsp={:#x} rbp={:#x} "
-                     "return_address={:#x} caller_offset={:#x}",
-                     site.name, record.request_id, record.api_index,
-                     GetBloodborneApiName(record.api_index), record.res_kind, record.r14d,
-                     registers->rsp, registers->rbp, record.return_address, record.caller_offset);
+            if (record.is_maintenance) {
+                LOG_INFO(Debug,
+                         "[BLOODBORNE MAINTENANCE SOURCE] site={} request_id={:#x} api_index={} "
+                         "api_name={} res_kind={:#x} stack_res_kind={:#x} rcx={:#x} r14d={:#x} "
+                         "rsp={:#x} rbp={:#x} return_address={:#x} caller_offset={:#x}",
+                         site.name, record.request_id, record.api_index,
+                         GetBloodborneApiName(record.api_index), record.res_kind,
+                         record.stack_res_kind, record.rcx, record.r14d, registers->rsp,
+                         registers->rbp, record.return_address, record.caller_offset);
+            } else {
+                LOG_INFO(Debug,
+                         "[BLOODBORNE MAINTENANCE RAW] site={} raw_hit={} request_id={:#x} "
+                         "api_index={} api_name={} res_kind={:#x} stack_res_kind={:#x} rcx={:#x} "
+                         "r14d={:#x} return_address={:#x} caller_offset={:#x}",
+                         site.name, hit, record.request_id, record.api_index,
+                         GetBloodborneApiName(record.api_index), record.res_kind,
+                         record.stack_res_kind, record.rcx, record.r14d, record.return_address,
+                         record.caller_offset);
+            }
         } else if (hit <= 8 || hit % 300 == 0) {
             LOG_INFO(Debug,
                      "Bloodborne RE entry {} hit={} rdi={:#x} rsi={:#x} rdx={:#x} capture={}",
@@ -3726,9 +4127,9 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
 bool VerifySites() {
     const auto image_size = MemoryPatcher::g_eboot_image_size;
     for (const auto& site : Sites) {
-        // The two maintenance observers are experimental and are validated independently during
-        // installation. A mismatch at one must not suppress the other observer.
-        if (site.kind == TraceKind::MaintenanceSource) {
+        // Runtime-located observers are experimental and are validated independently during
+        // installation. A mismatch at one must not suppress any other observer.
+        if (IsRuntimeLocatedKind(site.kind)) {
             continue;
         }
         if ((summon_build_host_placement_hook_installed && site.offset == SummonBuildEntryOffset) ||
@@ -3765,11 +4166,13 @@ std::vector<ReverseEngineeringImageStage> CopyImageStages() {
 void WriteImageStageDiagnostics(std::ostream& out,
                                 std::span<const ReverseEngineeringImageStage> stages) {
     for (const auto& stage : stages) {
-        out << "{\"type\":\"maintenance_locator\",\"stage\":\"" << stage.stage
-            << "\",\"image_base\":";
+        out << "{\"type\":\"runtime_locator\",\"stage\":\"" << stage.stage << "\",\"image_base\":";
         WriteHex(out, stage.image_base);
         out << ",\"eboot_image_size\":";
         WriteHex(out, stage.image_size);
+        out << ",\"executable_base\":";
+        WriteHex(out, stage.executable_base);
+        out << ",\"executable_base_delta\":" << stage.executable_base_delta;
         out << ",\"executable_offset\":";
         WriteHex(out, stage.executable_offset);
         out << ",\"executable_size\":";
@@ -4522,7 +4925,8 @@ void InstallReverseEngineeringTrace() {
     }
 
     RuntimeSites = Sites;
-    std::array<bool, Sites.size()> maintenance_site_valid{};
+    std::array<bool, Sites.size()> runtime_site_valid{};
+    size_t verified_runtime_site_count = 0;
     size_t verified_maintenance_site_count = 0;
     const ReverseEngineeringImageStage* final_stage{};
     for (auto stage = stages.rbegin(); stage != stages.rend(); ++stage) {
@@ -4533,10 +4937,10 @@ void InstallReverseEngineeringTrace() {
     }
     if (final_stage == nullptr) {
         LOG_ERROR(Debug, "Bloodborne RE runtime locator has no final executable-stage snapshot; "
-                         "maintenance observers skipped");
+                         "runtime-located observers skipped");
     } else {
         for (size_t index = 0; index < Sites.size(); ++index) {
-            if (Sites[index].kind != TraceKind::MaintenanceSource) {
+            if (!IsRuntimeLocatedKind(Sites[index].kind)) {
                 continue;
             }
             const auto locator = std::ranges::find_if(final_stage->locators,
@@ -4547,14 +4951,15 @@ void InstallReverseEngineeringTrace() {
                 const size_t match_count =
                     locator != final_stage->locators.end() ? locator->matches.size() : 0;
                 LOG_ERROR(Debug,
-                          "Bloodborne RE maintenance observer {} skipped: runtime_matches={} "
+                          "Bloodborne RE runtime observer {} skipped: runtime_matches={} "
                           "and no unique semantically valid candidate",
                           Sites[index].name, match_count);
                 continue;
             }
             RuntimeSites[index].offset = *locator->selected_offset;
-            maintenance_site_valid[index] = true;
-            ++verified_maintenance_site_count;
+            runtime_site_valid[index] = true;
+            ++verified_runtime_site_count;
+            verified_maintenance_site_count += Sites[index].kind == TraceKind::MaintenanceSource;
             LOG_INFO(Debug,
                      "[BLOODBORNE RE LOCATOR] site={} static_offset={:#x} runtime_matches={} "
                      "selected_offset={:#x} bytes={}",
@@ -4562,9 +4967,9 @@ void InstallReverseEngineeringTrace() {
                      RuntimeSites[index].offset, locator->pattern);
         }
     }
-    if (verified_maintenance_site_count == 0) {
+    if (verified_runtime_site_count == 0) {
         LOG_ERROR(Debug,
-                  "Bloodborne RE trace was not installed: no maintenance observer passed the "
+                  "Bloodborne RE trace was not installed: no runtime observer passed the "
                   "runtime locator; diagnostics={}",
                   Common::FS::PathToUTF8String(capture_path));
         return;
@@ -4572,18 +4977,19 @@ void InstallReverseEngineeringTrace() {
 
     const bool auxiliary_sites_valid = VerifySites();
     if (!auxiliary_sites_valid) {
-        LOG_WARNING(Debug, "Bloodborne RE auxiliary trace sites failed validation; maintenance "
+        LOG_WARNING(Debug, "Bloodborne RE auxiliary trace sites failed validation; runtime "
                            "observers will still be installed independently");
     }
 
     size_t hook_count = 0;
+    size_t runtime_hook_count = 0;
     size_t maintenance_hook_count = 0;
     for (size_t index = 0; index < Sites.size(); ++index) {
         const auto& site = RuntimeSites[index];
-        if (site.kind == TraceKind::MaintenanceSource && !maintenance_site_valid[index]) {
+        if (IsRuntimeLocatedKind(site.kind) && !runtime_site_valid[index]) {
             continue;
         }
-        if (site.kind != TraceKind::MaintenanceSource && !auxiliary_sites_valid) {
+        if (!IsRuntimeLocatedKind(site.kind) && !auxiliary_sites_valid) {
             continue;
         }
         if ((summon_build_host_placement_hook_installed && site.offset == SummonBuildEntryOffset) ||
@@ -4604,21 +5010,23 @@ void InstallReverseEngineeringTrace() {
             continue;
         }
         ++hook_count;
+        runtime_hook_count += IsRuntimeLocatedKind(site.kind) ? 1 : 0;
         maintenance_hook_count += site.kind == TraceKind::MaintenanceSource ? 1 : 0;
     }
 
-    installed = maintenance_hook_count != 0;
+    installed = runtime_hook_count != 0;
     if (!installed) {
         LOG_ERROR(Debug,
-                  "Bloodborne RE trace installed {}/{} hooks but no maintenance observer; "
+                  "Bloodborne RE trace installed {}/{} hooks but no runtime observer; "
                   "capture={}",
                   hook_count, Sites.size(), Common::FS::PathToUTF8String(capture_path));
         return;
     }
     LOG_INFO(Debug,
              "Bloodborne RE trace installed {}/{} hooks including {}/{} independently verified "
-             "maintenance observers; capture={}",
-             hook_count, Sites.size(), maintenance_hook_count, verified_maintenance_site_count,
+             "runtime observers and {}/{} maintenance observers; capture={}",
+             hook_count, Sites.size(), runtime_hook_count, verified_runtime_site_count,
+             maintenance_hook_count, verified_maintenance_site_count,
              Common::FS::PathToUTF8String(capture_path));
 }
 
