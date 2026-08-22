@@ -1507,3 +1507,101 @@ bias is introduced by the executable segment base supplied by the loaded game
 or by the earlier offline import convention. Hooks never depend on the old
 labels: every new observer is selected only from one unique signature match
 with independently validated surrounding instructions.
+
+### `ss.info` parser step trace
+
+The parser's static entry is `0x01EB6860`; with the demonstrated image-coordinate
+bias its expected runtime offset is `0x01EB65E0`. Its only physical normal return
+is static `0x01EB6E1B` / runtime `0x01EB6B9B`. The read-only return observer runs
+earlier at static `0x01EB6E07` / runtime `0x01EB6B87`, before `mov al,r14b`
+destroys neither the result nor the 0x768-byte parser frame.
+
+The recovered arguments at entry are the HTTP body `std::string` in `RSI`, a
+pointer to the selected numeric group in `RDX`, a pointer to the language index
+in `RCX`, and the destination config in `R8`. The dedicated `ss.info` callback
+accumulates each positive HTTP read in its string at `[RBP-0x68]`: the safe
+observers immediately before and after its append are offline `0x01E89C15` and
+`0x01E89C23`. They record the raw chunk address and length, plus the accumulator
+address, data pointer, length, capacity, and terminating-NUL state.
+
+At parser entry the trace records the exact data pointer and length that the
+parser receives, string capacity, terminating-NUL state, first and last 128
+bytes in hex and JSON-escaped ASCII, and a 64-bit FNV-1a hash over the complete
+buffer. It also records the request ID, API type, raw group index, language
+index, return address, and normalized caller offset. This is intentionally a
+simple read-only hash rather than an injected guest SHA-256 implementation.
+
+The mandatory prefix path is recovered as follows:
+
+- Static `0x01EB6905` compares four bytes with `3C 73 73 3E` (`<ss>`). The
+  observer at `0x01EB694F` records the resulting open-tag offset or `npos`.
+- The close-tag search uses the literal `</ss>` at `0x04938AE9`. A successful
+  search reaches the observer at `0x01EB69FC`, which records its body-relative
+  offset.
+- The substring between those tags is passed to the base-10 numeric conversion
+  at `0x01EB6BC6`. The observer at `0x01EB6BCB` records the exact substring,
+  returned integer, end pointer, substring length, and whether the conversion
+  consumed the entire substring. Only a full consumption stores the value in
+  `config+8`; the rejecting branch is `0x01EB6C13`.
+
+The numeric group has no hidden one-based transformation in the API path. The
+helper at static `0x01ECB610` copies `EDX` directly to `R13D`, then passes that
+same value in `EDX` to both format calls at `0x01ECB6A1` and `0x01ECB70B`. The
+format literals at `0x04938372` and `0x0493837F` are `<gameurl%u>` and
+`</gameurl%u>`. Therefore the demonstrated mapping is:
+
+```text
+internal group index 2 -> <gameurl2> ... </gameurl2>
+```
+
+There is no `+1` in this route. Earlier uses of the same input likewise format
+`<msg%u>` and `<BetaTestWebUrl%u>` without changing it. Calling this internal
+value a `gameurl_index` in older logs did not imply one-based numbering.
+
+The helper validates one API at a time. It requires the gameurl open and close
+positions and that both the named API open and close positions exist no later
+than the gameurl close. Its exact rejecting comparisons are static
+`0x01ECB7FD`, `0x01ECB802`, `0x01ECB808`, `0x01ECB80E`, `0x01ECB814`, and
+`0x01ECB81E`; all converge on a false return at `0x01ECB840`. The helper entry
+is `0x01ECB610`; its safe argument observer is static `0x01ECB624`, after the
+frame is established but before the arguments are stored. The return observer
+is `0x01ECB87C`. They record the API index/name,
+formatted gameurl tag, all four positions, value length, success, and the first
+specific reason: `gameurl_open_missing`, `gameurl_close_missing`,
+`api_open_missing`, `api_close_missing`, or `api_value_invalid`.
+
+All 37 API helpers are mandatory. API 0 rejects directly at `0x01EB743E`.
+APIs 1 through 36 reject at the following static branch offsets, in API order:
+
+```text
+1EB748D 1EB74CB 1EB7509 1EB7547 1EB7585 1EB75C3
+1EB7613 1EB7663 1EB76B3 1EB7703 1EB7753 1EB77A3
+1EB77F3 1EB7843 1EB7893 1EB78E3 1EB7933 1EB7983
+1EB79D3 1EB7A23 1EB7A73 1EB7AC3 1EB7B13 1EB7B63
+1EB7BB3 1EB7C03 1EB7C53 1EB7CA3 1EB7CF3 1EB7D43
+1EB7D93 1EB7DE3 1EB7E33 1EB7E83 1EB7ED3 1EB7F23
+```
+
+Those 36 branches converge at `0x01EB8066`, set `R14B=0`, and join the common
+epilogue. Before the API sequence, all normal failure-producing branches are:
+
+- `0x01EB6952` and `0x01EB6958`: `<ss>` missing or its remaining range invalid;
+- `0x01EB69C6`, `0x01EB69EF`, and `0x01EB69F4`: `</ss>` missing or search range
+  exhausted;
+- `0x01EB6A42` and `0x01EB6A4C`: invalid open/close offsets (`npos`);
+- `0x01EB6C13`: numeric conversion did not consume the entire `ss` substring.
+
+Every normal failure ultimately reaches static `0x01EB6DF4` or
+`0x01EB6DFE`, leaves `R14B=0`, and uses the single return. Subtracting `0x280`
+gives the corresponding expected runtime offsets, but installation never uses
+that arithmetic: every observer is independently selected by an exact runtime
+signature plus surrounding semantic context.
+
+The final parser record includes `failure_reason`, static
+`failure_branch_offset`, failing API index/name, both `ss` match offsets,
+numeric-conversion details, input pointer/length/hash, raw group and formatted
+gameurl suffix, config `ss`, both API counts, and the existing 37-entry API
+presence/length list. A visible `[BLOODBORNE SS.PARSER FAIL]` INFO line is
+emitted only when the parser actually returns zero. All of these new observers
+are gated to the latest request whose API index is 38; they never write guest
+registers, guest memory, config fields, flags, or control flow.
