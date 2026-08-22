@@ -84,6 +84,7 @@ enum class TraceKind : u8 {
     HealingFountainAvailability,
     ChairRespawnNotification,
     WorldStateValidation,
+    MaintenanceSource,
 };
 
 struct TraceSite {
@@ -192,6 +193,62 @@ constexpr s32 BellUseArgument = 17;
 constexpr u32 ResponderResumeStableObservations = 20;
 constexpr u32 ResponderResumeMaxAttempts = 2;
 constexpr auto ResponderResumeRetryDelay = std::chrono::seconds{15};
+constexpr u32 MaintenanceResKind = 0x00100108;
+constexpr u64 MaintenanceDispatchOffset = 0x01E894E1;
+constexpr u64 MaintenanceExtractedOffset = 0x01E7F9F9;
+constexpr auto BloodborneApiNames = std::to_array<std::string_view>({
+    "api_Login",
+    "api_ServerTimeGet",
+    "api_SyncCharaId",
+    "api_NoticeNormalGet",
+    "api_NoticeEmergencyGet",
+    "api_UserAgreementGet",
+    "api_BloodMessCreate",
+    "api_BloodMessGetList",
+    "api_BloodMessEvaluate",
+    "api_BloodMessGetEvaluate",
+    "api_BloodMessRemove",
+    "api_BloodMessSearchAdd",
+    "api_ChannelUpload",
+    "api_ChannelShare",
+    "api_ChannelSearch",
+    "api_ChannelWordSearch",
+    "api_ChannelGetDetailsInfo",
+    "api_ChannelGetInfo",
+    "api_ChannelRandomJoin",
+    "api_ChannelAddMaterial",
+    "api_ChannelAddMaterialCompleteNotify",
+    "api_MessengerShellUpload",
+    "api_MultiPlayNetError",
+    "api_UserPropertiesMoveCount",
+    "api_UserPropertiesMoveCountCheck",
+    "api_SummonDataCreate",
+    "api_SummonDataGetList",
+    "api_SummonDataRemove",
+    "api_SummonDataSummon",
+    "api_ChairMessGetList",
+    "api_ChairMessRespawnPointNotice",
+    "api_TombMessCreate",
+    "api_TombMessGetList",
+    "api_DeathVisionGet",
+    "api_TombMessRemove",
+    "api_WanderingGhostCreate",
+    "api_WanderingGhostGet",
+    "unknown",
+    "ss.info",
+});
+static_assert(BloodborneApiNames.size() == 39);
+
+constexpr auto MaintenanceSourceSignatures = std::to_array<NativeCallSignature>({
+    {"Http.Maintenance.Dispatch.Context",
+     0x01E894DA,
+     {0xC6, 0x87, 0xE8, 0x03, 0x00, 0x00, 0x00, 0x41, 0x81, 0xFE, 0x08, 0x01, 0x10, 0x00},
+     14},
+    {"Http.ResKind.StackStores",
+     0x01E7F9EA,
+     {0x44, 0x89, 0xBC, 0x24, 0x5C, 0x0D, 0x00, 0x00, 0x89, 0x8C, 0x24, 0x60, 0x0D, 0x00, 0x00},
+     15},
+});
 
 constexpr auto CrossMapNativeCalls = std::to_array<NativeCallSignature>({
     {"SetForcedSummonMap",
@@ -730,6 +787,17 @@ constexpr auto Sites = std::to_array<TraceSite>({
      TraceKind::WorldStateValidation,
      {0x44, 0x89, 0xE1, 0x41, 0x88, 0xC4},
      6},
+
+    {"Http.ResKind.Extracted",
+     MaintenanceExtractedOffset,
+     TraceKind::MaintenanceSource,
+     {0x8A, 0x84, 0x24, 0x64, 0x0D, 0x00, 0x00},
+     7},
+    {"Http.Maintenance.Dispatch",
+     MaintenanceDispatchOffset,
+     TraceKind::MaintenanceSource,
+     {0x41, 0x81, 0xFE, 0x08, 0x01, 0x10, 0x00},
+     7},
 });
 
 std::array<std::atomic<u64>, Sites.size()> site_hits{};
@@ -932,6 +1000,40 @@ T ReadValue(u64 address, size_t offset) {
 
     std::memcpy(&value, reinterpret_cast<const void*>(source), sizeof(value));
     return value;
+}
+
+std::string_view GetBloodborneApiName(u32 api_index) {
+    return api_index < BloodborneApiNames.size() ? BloodborneApiNames[api_index] : "unknown";
+}
+
+struct MaintenanceSourceRecord {
+    u32 request_id{};
+    u32 api_index{};
+    u32 res_kind{};
+    u32 r14d{};
+    u64 return_address{};
+    u64 caller_offset{};
+};
+
+std::optional<MaintenanceSourceRecord> ReadMaintenanceSource(
+    const TraceSite& site, const GuestRegisterSnapshot& registers) {
+    MaintenanceSourceRecord record{
+        .request_id = ReadValue<u32>(registers.rsp, 0xD58),
+        .api_index = ReadValue<u32>(registers.rsp, 0xD5C),
+        .res_kind = ReadValue<u32>(registers.rsp, 0xD60),
+        .r14d = static_cast<u32>(registers.r14),
+        .return_address = ReadValue<u64>(registers.rbp, sizeof(u64)),
+    };
+
+    if ((site.offset == MaintenanceDispatchOffset && record.r14d != MaintenanceResKind) ||
+        (site.offset == MaintenanceExtractedOffset && record.res_kind != MaintenanceResKind)) {
+        return std::nullopt;
+    }
+    if (record.return_address >= image_base &&
+        record.return_address - image_base < MemoryPatcher::g_eboot_image_size) {
+        record.caller_offset = record.return_address - image_base;
+    }
+    return record;
 }
 
 template <typename T>
@@ -2825,6 +2927,13 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         site.offset == HealingFountainAvailabilityOffset) {
         ApplyHealingFountainHostAvailability(*registers);
     }
+    std::optional<MaintenanceSourceRecord> maintenance_source;
+    if (site.kind == TraceKind::MaintenanceSource) {
+        maintenance_source = ReadMaintenanceSource(site, *registers);
+        if (!maintenance_source.has_value()) {
+            return;
+        }
+    }
     if (site.kind == TraceKind::ActionFlags && !HasActionTransition(registers->rdi)) {
         return;
     }
@@ -2872,7 +2981,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     const u64 hit = site_hits[tag].fetch_add(1, std::memory_order_relaxed) + 1;
     const u64 dense_capture_limit =
         site.kind == TraceKind::ActionFlags || site.kind == TraceKind::GoodsParamLookup ? 2048 : 64;
-    if (hit > dense_capture_limit && hit % 300 != 0) {
+    if (site.kind != TraceKind::MaintenanceSource && hit > dense_capture_limit && hit % 300 != 0) {
         return;
     }
 
@@ -3328,11 +3437,58 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         case TraceKind::WorldStateValidation:
             WriteWorldStateValidation(capture_file, site, *registers);
             break;
+        case TraceKind::MaintenanceSource: {
+            const auto& record = *maintenance_source;
+            capture_file << ",\"maintenance_source\":{";
+            capture_file << "\"request_id\":";
+            WriteHex(capture_file, record.request_id);
+            capture_file << ",\"api_index\":" << record.api_index;
+            capture_file << ",\"api_name\":\"" << GetBloodborneApiName(record.api_index) << '"';
+            capture_file << ",\"res_kind\":";
+            WriteHex(capture_file, record.res_kind);
+            capture_file << ",\"r14d\":";
+            WriteHex(capture_file, record.r14d);
+            capture_file << ",\"rsp\":";
+            WriteHex(capture_file, registers->rsp);
+            capture_file << ",\"rbp\":";
+            WriteHex(capture_file, registers->rbp);
+            capture_file << ",\"return_address\":";
+            WriteHex(capture_file, record.return_address);
+            capture_file << ",\"caller_offset\":";
+            WriteHex(capture_file, record.caller_offset);
+            capture_file << ",\"frame_chain\":[";
+            u64 frame = registers->rbp;
+            for (size_t index = 0; index < 8 && frame >= 0x10000 &&
+                                   HasMemoryAccess(frame, 2 * sizeof(u64), MemoryProt::CpuRead);
+                 ++index) {
+                if (index != 0) {
+                    capture_file << ',';
+                }
+                WriteHex(capture_file, ReadValue<u64>(frame, sizeof(u64)));
+                const u64 next = ReadValue<u64>(frame, 0);
+                if (next <= frame || next - frame > 0x100000) {
+                    break;
+                }
+                frame = next;
+            }
+            capture_file << ']';
+            capture_file << '}';
+            break;
+        }
         }
         capture_file << "}\n";
         capture_file.flush();
 
-        if (hit <= 8 || hit % 300 == 0) {
+        if (site.kind == TraceKind::MaintenanceSource) {
+            const auto& record = *maintenance_source;
+            LOG_INFO(Debug,
+                     "[BLOODBORNE MAINTENANCE SOURCE] site={} request_id={:#x} api_index={} "
+                     "api_name={} res_kind={:#x} r14d={:#x} rsp={:#x} return_address={:#x} "
+                     "caller_offset={:#x}",
+                     site.name, record.request_id, record.api_index,
+                     GetBloodborneApiName(record.api_index), record.res_kind, record.r14d,
+                     registers->rsp, record.return_address, record.caller_offset);
+        } else if (hit <= 8 || hit % 300 == 0) {
             LOG_INFO(Debug,
                      "Bloodborne RE entry {} hit={} rdi={:#x} rsi={:#x} rdx={:#x} capture={}",
                      site.name, hit, registers->rdi, registers->rsi, registers->rdx,
@@ -3366,6 +3522,24 @@ bool VerifySites() {
             LOG_ERROR(Debug,
                       "Bloodborne RE signature mismatch at {} ({:#x}): expected={} actual={}",
                       site.name, site.offset, BytesToHex(expected), BytesToHex(actual));
+            return false;
+        }
+    }
+    for (const auto& signature : MaintenanceSourceSignatures) {
+        const auto expected =
+            std::span<const u8>{signature.prologue.data(), signature.prologue_size};
+        if (signature.offset > image_size || expected.size() > image_size - signature.offset) {
+            LOG_ERROR(Debug, "Bloodborne RE maintenance signature {} lies outside the eboot image",
+                      signature.name);
+            return false;
+        }
+        const auto actual = std::span<const u8>{
+            reinterpret_cast<const u8*>(image_base + signature.offset), expected.size()};
+        if (!std::ranges::equal(actual, expected)) {
+            LOG_ERROR(Debug,
+                      "Bloodborne RE maintenance signature mismatch at {} ({:#x}): expected={} "
+                      "actual={}",
+                      signature.name, signature.offset, BytesToHex(expected), BytesToHex(actual));
             return false;
         }
     }

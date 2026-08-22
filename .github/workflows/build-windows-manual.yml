@@ -1,0 +1,97 @@
+# SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: Build Windows x64 (Manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-manual-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build-windows-x64:
+    name: Build shadPS4 Windows x64 Release
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Cache CMake configuration
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/build
+          key: windows-manual-cmake-${{ hashFiles('**/CMakeLists.txt', 'cmake/**', '.gitmodules') }}
+          restore-keys: |
+            windows-manual-cmake-
+
+      - name: Cache compiler output
+        uses: hendrikmuhs/ccache-action@v1.2.21
+        with:
+          append-timestamp: false
+          key: windows-manual-ccache-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+
+      - name: Configure CMake
+        shell: pwsh
+        run: >-
+          cmake --fresh -G Ninja
+          -B "${{ github.workspace }}/build"
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON
+          -DCMAKE_C_COMPILER=clang-cl
+          -DCMAKE_CXX_COMPILER=clang-cl
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build Release
+        shell: pwsh
+        run: >-
+          cmake --build "${{ github.workspace }}/build"
+          --config "${{ env.BUILD_TYPE }}"
+          --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Package executable and runtime files
+        shell: pwsh
+        run: |
+          $buildDir = Join-Path '${{ github.workspace }}' 'build'
+          $packageDir = Join-Path '${{ github.workspace }}' 'artifact/windows-x64'
+          $executable = Join-Path $buildDir 'shadPS4.exe'
+          $packagedExecutable = Join-Path $packageDir 'shadPS4.exe'
+
+          if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+              throw "Build completed without producing $executable"
+          }
+
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          Copy-Item -LiteralPath $executable -Destination $packagedExecutable
+
+          $runtimeExtensions = '.dll', '.json', '.pak', '.dat'
+          Get-ChildItem -LiteralPath $buildDir -File |
+              Where-Object { $runtimeExtensions -contains $_.Extension.ToLowerInvariant() } |
+              ForEach-Object {
+                  Copy-Item -LiteralPath $_.FullName -Destination $packageDir -Force
+              }
+
+          Get-ChildItem -LiteralPath $packageDir -File |
+              Sort-Object Name |
+              Select-Object Name, Length
+
+      - name: Upload Windows x64 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: shadps4-windows-x64-bloodborne-trace
+          path: ${{ github.workspace }}/artifact/windows-x64/
+          if-no-files-found: error
+          retention-days: 14

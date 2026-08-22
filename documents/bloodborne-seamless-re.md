@@ -748,6 +748,12 @@ Set this environment variable before launching shadPS4:
 SHADPS4_BLOODBORNE_RE_TRACE=1
 ```
 
+This flag alone also enables the read-only maintenance-source observers for
+CUSA03173 01.09. They capture the API index and request ID when `ResKind`
+`0x100108` is extracted and when it reaches the maintenance dispatch. Other
+result kinds are discarded before the hit counter and produce no log entry.
+No seamless-coop or shadNet option is required for this trace.
+
 For the two-client comparison, enable all three shadPS4 flags in both client
 processes:
 
