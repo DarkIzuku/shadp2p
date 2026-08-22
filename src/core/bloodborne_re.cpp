@@ -22,6 +22,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
@@ -250,6 +251,24 @@ constexpr NativeCallSignature MaintenanceExtractedContext{
     0x01E7F9EA,
     {0x44, 0x89, 0xBC, 0x24, 0x5C, 0x0D, 0x00, 0x00},
     8,
+};
+constexpr NativeCallSignature MaintenanceExtractedRequestContext{
+    "Http.ResKind.RequestId.StackStore",
+    0x01E7F9E3,
+    {0x89, 0x84, 0x24, 0x58, 0x0D, 0x00, 0x00},
+    7,
+};
+constexpr NativeCallSignature MaintenanceExtractedPostContext{
+    "Http.ResKind.Extracted.Post",
+    0x01E7F9F9,
+    {0x8A, 0x84, 0x24, 0x64, 0x0D, 0x00, 0x00},
+    7,
+};
+constexpr NativeCallSignature MaintenanceDispatchPostContext{
+    "Http.Maintenance.Dispatch.Post",
+    0x01E894E8,
+    {0x0F, 0x84, 0x88, 0x03, 0x00, 0x00},
+    2,
 };
 
 constexpr auto CrossMapNativeCalls = std::to_array<NativeCallSignature>({
@@ -802,6 +821,7 @@ constexpr auto Sites = std::to_array<TraceSite>({
      7},
 });
 
+auto RuntimeSites = Sites;
 std::array<std::atomic<u64>, Sites.size()> site_hits{};
 std::atomic<u64> event_sequence{};
 std::atomic<s32> observed_sos_area{-1};
@@ -830,6 +850,37 @@ bool deferred_summon_reload_hook_installed{};
 bool healing_fountain_host_availability_hook_installed{};
 thread_local u64 responder_availability_frame{};
 thread_local s32 responder_availability_goods{-1};
+
+struct MaintenanceLocatorMatch {
+    u64 offset{};
+    bool context_valid{};
+    std::string bytes;
+    std::string before;
+    std::string after;
+};
+
+struct MaintenanceLocatorResult {
+    std::string_view site;
+    u64 static_offset{};
+    std::string pattern;
+    std::string static_runtime_bytes;
+    std::string static_before;
+    std::string static_after;
+    std::vector<MaintenanceLocatorMatch> matches;
+    std::optional<u64> selected_offset;
+};
+
+struct ReverseEngineeringImageStage {
+    std::string stage;
+    uintptr_t image_base{};
+    u64 image_size{};
+    u64 executable_offset{};
+    u64 executable_size{};
+    std::array<MaintenanceLocatorResult, 2> locators;
+};
+
+std::mutex image_stage_mutex;
+std::vector<ReverseEngineeringImageStage> image_stages;
 
 struct SummonPlacementDescriptor {
     u32 packed_region{};
@@ -985,6 +1036,173 @@ bool HasMemoryAccess(u64 address, size_t size, MemoryProt required) {
            address + size <= reinterpret_cast<u64>(mapping_end);
 }
 
+std::string ReadDiagnosticBytes(uintptr_t stage_image_base, u64 stage_image_size, u64 offset,
+                                size_t size) {
+    if (offset > stage_image_size || size > stage_image_size - offset ||
+        !HasMemoryAccess(stage_image_base + offset, size, MemoryProt::CpuRead)) {
+        return "unavailable";
+    }
+    return BytesToHex(
+        std::span<const u8>{reinterpret_cast<const u8*>(stage_image_base + offset), size});
+}
+
+bool MatchesRuntimeBytes(uintptr_t stage_image_base, u64 stage_image_size, u64 offset,
+                         const NativeCallSignature& signature) {
+    const auto expected = std::span<const u8>{signature.prologue.data(), signature.prologue_size};
+    if (offset > stage_image_size || expected.size() > stage_image_size - offset ||
+        !HasMemoryAccess(stage_image_base + offset, expected.size(), MemoryProt::CpuRead)) {
+        return false;
+    }
+    const auto actual = std::span<const u8>{reinterpret_cast<const u8*>(stage_image_base + offset),
+                                            expected.size()};
+    return std::ranges::equal(actual, expected);
+}
+
+bool IsMaintenanceContextValid(const TraceSite& site, uintptr_t stage_image_base,
+                               u64 stage_image_size, u64 candidate_offset) {
+    if (site.name == "Http.ResKind.Extracted") {
+        return candidate_offset >= 15 &&
+               MatchesRuntimeBytes(stage_image_base, stage_image_size, candidate_offset - 15,
+                                   MaintenanceExtractedRequestContext) &&
+               MatchesRuntimeBytes(stage_image_base, stage_image_size, candidate_offset - 8,
+                                   MaintenanceExtractedContext) &&
+               MatchesRuntimeBytes(stage_image_base, stage_image_size,
+                                   candidate_offset + site.prologue_size,
+                                   MaintenanceExtractedPostContext);
+    }
+    if (site.name == "Http.Maintenance.Dispatch") {
+        return candidate_offset >= 7 &&
+               MatchesRuntimeBytes(stage_image_base, stage_image_size, candidate_offset - 7,
+                                   MaintenanceDispatchContext) &&
+               MatchesRuntimeBytes(stage_image_base, stage_image_size,
+                                   candidate_offset + site.prologue_size,
+                                   MaintenanceDispatchPostContext);
+    }
+    return false;
+}
+
+MaintenanceLocatorResult LocateMaintenanceSite(const TraceSite& site, uintptr_t stage_image_base,
+                                               u64 stage_image_size, uintptr_t executable_base,
+                                               u64 executable_size) {
+    constexpr size_t DiagnosticRadius = 64;
+    const auto pattern = std::span<const u8>{site.prologue.data(), site.prologue_size};
+    MaintenanceLocatorResult result{
+        .site = site.name,
+        .static_offset = site.offset,
+        .pattern = BytesToHex(pattern),
+        .static_runtime_bytes =
+            ReadDiagnosticBytes(stage_image_base, stage_image_size, site.offset, pattern.size()),
+    };
+
+    const u64 before_start = site.offset > DiagnosticRadius ? site.offset - DiagnosticRadius : 0;
+    result.static_before = ReadDiagnosticBytes(stage_image_base, stage_image_size, before_start,
+                                               site.offset - before_start);
+    if (site.offset <= stage_image_size && pattern.size() <= stage_image_size - site.offset) {
+        const u64 after_start = site.offset + pattern.size();
+        const size_t after_size =
+            static_cast<size_t>(std::min<u64>(DiagnosticRadius, stage_image_size - after_start));
+        result.static_after =
+            ReadDiagnosticBytes(stage_image_base, stage_image_size, after_start, after_size);
+    } else {
+        result.static_after = "unavailable";
+    }
+
+    if (executable_base < stage_image_base || executable_size < pattern.size() ||
+        executable_base - stage_image_base > stage_image_size ||
+        executable_size > stage_image_size - (executable_base - stage_image_base) ||
+        !HasMemoryAccess(executable_base, executable_size, MemoryProt::CpuRead)) {
+        return result;
+    }
+
+    const auto* cursor = reinterpret_cast<const u8*>(executable_base);
+    const auto* const end = cursor + executable_size;
+    while (cursor <= end - pattern.size()) {
+        const auto remaining = static_cast<size_t>(end - cursor);
+        const auto* found = static_cast<const u8*>(std::memchr(cursor, pattern.front(), remaining));
+        if (found == nullptr || found > end - pattern.size()) {
+            break;
+        }
+        if (std::memcmp(found, pattern.data(), pattern.size()) == 0) {
+            const u64 candidate_offset =
+                static_cast<u64>(reinterpret_cast<uintptr_t>(found) - stage_image_base);
+            const u64 candidate_before_start =
+                candidate_offset > DiagnosticRadius ? candidate_offset - DiagnosticRadius : 0;
+            const u64 candidate_after_start = candidate_offset + pattern.size();
+            const size_t candidate_after_size = static_cast<size_t>(
+                std::min<u64>(DiagnosticRadius, stage_image_size - candidate_after_start));
+            result.matches.push_back({
+                .offset = candidate_offset,
+                .context_valid = IsMaintenanceContextValid(site, stage_image_base, stage_image_size,
+                                                           candidate_offset),
+                .bytes = ReadDiagnosticBytes(stage_image_base, stage_image_size, candidate_offset,
+                                             pattern.size()),
+                .before =
+                    ReadDiagnosticBytes(stage_image_base, stage_image_size, candidate_before_start,
+                                        candidate_offset - candidate_before_start),
+                .after = ReadDiagnosticBytes(stage_image_base, stage_image_size,
+                                             candidate_after_start, candidate_after_size),
+            });
+        }
+        cursor = found + 1;
+    }
+
+    const auto valid_match = std::ranges::find_if(
+        result.matches, [](const MaintenanceLocatorMatch& match) { return match.context_valid; });
+    const size_t valid_match_count = static_cast<size_t>(std::ranges::count_if(
+        result.matches, [](const MaintenanceLocatorMatch& match) { return match.context_valid; }));
+    if (valid_match_count == 1) {
+        result.selected_offset = valid_match->offset;
+    }
+    return result;
+}
+
+ReverseEngineeringImageStage CaptureImageStage(std::string_view stage, uintptr_t stage_image_base,
+                                               u64 stage_image_size, uintptr_t executable_base,
+                                               u64 executable_size) {
+    ReverseEngineeringImageStage result{
+        .stage = std::string{stage},
+        .image_base = stage_image_base,
+        .image_size = stage_image_size,
+        .executable_offset =
+            executable_base >= stage_image_base ? executable_base - stage_image_base : 0,
+        .executable_size = executable_size,
+        .locators =
+            {
+                LocateMaintenanceSite(Sites[Sites.size() - 2], stage_image_base, stage_image_size,
+                                      executable_base, executable_size),
+                LocateMaintenanceSite(Sites[Sites.size() - 1], stage_image_base, stage_image_size,
+                                      executable_base, executable_size),
+            },
+    };
+
+    for (const auto& locator : result.locators) {
+        std::ostringstream selected_out;
+        if (locator.selected_offset.has_value()) {
+            selected_out << "0x" << std::hex << *locator.selected_offset;
+        } else {
+            selected_out << "none";
+        }
+        LOG_INFO(Debug,
+                 "[BLOODBORNE RE LOCATOR] stage={} site={} static_offset={:#x} "
+                 "runtime_matches={} selected_offset={} bytes={}",
+                 result.stage, locator.site, locator.static_offset, locator.matches.size(),
+                 selected_out.str(), locator.static_runtime_bytes);
+        for (const auto& match : locator.matches) {
+            LOG_INFO(Debug,
+                     "[BLOODBORNE RE LOCATOR] stage={} site={} candidate_offset={:#x} "
+                     "context_valid={} bytes={}",
+                     result.stage, locator.site, match.offset, match.context_valid, match.bytes);
+        }
+        if (locator.static_runtime_bytes != locator.pattern) {
+            LOG_INFO(Debug,
+                     "[BLOODBORNE RE LOCATOR] stage={} site={} static_before={} "
+                     "static_after={}",
+                     result.stage, locator.site, locator.static_before, locator.static_after);
+        }
+    }
+    return result;
+}
+
 template <typename T>
 T ReadValue(u64 address, size_t offset) {
     T value{};
@@ -1019,7 +1237,7 @@ struct MaintenanceSourceRecord {
 
 std::optional<MaintenanceSourceRecord> ReadMaintenanceSource(
     const TraceSite& site, const GuestRegisterSnapshot& registers) {
-    const bool extracted_site = site.offset == MaintenanceExtractedOffset;
+    const bool extracted_site = site.name == "Http.ResKind.Extracted";
     MaintenanceSourceRecord record{
         .request_id = ReadValue<u32>(registers.rsp, 0xD58),
         .api_index = ReadValue<u32>(registers.rsp, 0xD5C),
@@ -1031,8 +1249,8 @@ std::optional<MaintenanceSourceRecord> ReadMaintenanceSource(
         .return_address = ReadValue<u64>(registers.rbp, sizeof(u64)),
     };
 
-    if ((site.offset == MaintenanceDispatchOffset && record.r14d != MaintenanceResKind) ||
-        (site.offset == MaintenanceExtractedOffset && record.res_kind != MaintenanceResKind)) {
+    if ((site.name == "Http.Maintenance.Dispatch" && record.r14d != MaintenanceResKind) ||
+        (extracted_site && record.res_kind != MaintenanceResKind)) {
         return std::nullopt;
     }
     if (record.return_address >= image_base &&
@@ -2913,7 +3131,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         return;
     }
 
-    const auto& site = Sites[tag];
+    const auto& site = RuntimeSites[tag];
     if (summon_build_host_placement_hook_installed && site.offset == SummonBuildEntryOffset) {
         ApplyCrossMapSummonHostPlacement(*registers);
     }
@@ -3539,45 +3757,84 @@ bool VerifySites() {
     return true;
 }
 
-bool VerifyMaintenanceSignature(std::string_view site_name, const NativeCallSignature& signature) {
-    const auto expected = std::span<const u8>{signature.prologue.data(), signature.prologue_size};
-    const auto image_size = MemoryPatcher::g_eboot_image_size;
-    if (signature.offset > image_size || expected.size() > image_size - signature.offset) {
-        LOG_ERROR(Debug,
-                  "Bloodborne RE maintenance site {} skipped: signature {} lies outside the "
-                  "eboot image",
-                  site_name, signature.name);
-        return false;
-    }
-    const auto actual = std::span<const u8>{
-        reinterpret_cast<const u8*>(image_base + signature.offset), expected.size()};
-    if (!std::ranges::equal(actual, expected)) {
-        LOG_ERROR(Debug,
-                  "Bloodborne RE maintenance site {} skipped: signature mismatch at {} ({:#x}): "
-                  "expected={} actual={}",
-                  site_name, signature.name, signature.offset, BytesToHex(expected),
-                  BytesToHex(actual));
-        return false;
-    }
-    return true;
+std::vector<ReverseEngineeringImageStage> CopyImageStages() {
+    std::scoped_lock lock{image_stage_mutex};
+    return image_stages;
 }
 
-bool VerifyMaintenanceSite(const TraceSite& site) {
-    const NativeCallSignature hook_signature{
-        site.name,
-        site.offset,
-        site.prologue,
-        site.prologue_size,
-    };
-    if (!VerifyMaintenanceSignature(site.name, hook_signature)) {
-        return false;
+void WriteImageStageDiagnostics(std::ostream& out,
+                                std::span<const ReverseEngineeringImageStage> stages) {
+    for (const auto& stage : stages) {
+        out << "{\"type\":\"maintenance_locator\",\"stage\":\"" << stage.stage
+            << "\",\"image_base\":";
+        WriteHex(out, stage.image_base);
+        out << ",\"eboot_image_size\":";
+        WriteHex(out, stage.image_size);
+        out << ",\"executable_offset\":";
+        WriteHex(out, stage.executable_offset);
+        out << ",\"executable_size\":";
+        WriteHex(out, stage.executable_size);
+        out << ",\"sites\":[";
+        for (size_t site_index = 0; site_index < stage.locators.size(); ++site_index) {
+            const auto& locator = stage.locators[site_index];
+            if (site_index != 0) {
+                out << ',';
+            }
+            out << "{\"site\":\"" << locator.site << "\",\"static_offset\":";
+            WriteHex(out, locator.static_offset);
+            out << ",\"elf_virtual_address\":";
+            WriteHex(out, locator.static_offset);
+            out << ",\"rva\":";
+            WriteHex(out, locator.static_offset);
+            out << ",\"static_runtime_address\":";
+            WriteHex(out, stage.image_base + locator.static_offset);
+            out << ",\"file_offset\":null,\"pattern\":\"" << locator.pattern
+                << "\",\"static_runtime_bytes\":\"" << locator.static_runtime_bytes
+                << "\",\"static_before\":\"" << locator.static_before << "\",\"static_after\":\""
+                << locator.static_after << "\",\"runtime_match_count\":" << locator.matches.size()
+                << ",\"semantic_match_count\":"
+                << std::ranges::count_if(
+                       locator.matches,
+                       [](const MaintenanceLocatorMatch& match) { return match.context_valid; })
+                << ",\"matches\":[";
+            for (size_t match_index = 0; match_index < locator.matches.size(); ++match_index) {
+                const auto& match = locator.matches[match_index];
+                if (match_index != 0) {
+                    out << ',';
+                }
+                out << "{\"offset\":";
+                WriteHex(out, match.offset);
+                out << ",\"runtime_address\":";
+                WriteHex(out, stage.image_base + match.offset);
+                out << ",\"context_valid\":" << (match.context_valid ? "true" : "false")
+                    << ",\"bytes\":\"" << match.bytes << "\",\"before\":\"" << match.before
+                    << "\",\"after\":\"" << match.after << "\"}";
+            }
+            out << "],\"selected_offset\":";
+            if (locator.selected_offset.has_value()) {
+                WriteHex(out, *locator.selected_offset);
+            } else {
+                out << "null";
+            }
+            out << '}';
+        }
+        out << "]}\n";
     }
-    const auto& context = site.offset == MaintenanceDispatchOffset ? MaintenanceDispatchContext
-                                                                   : MaintenanceExtractedContext;
-    return VerifyMaintenanceSignature(site.name, context);
 }
 
 } // namespace
+
+void RecordReverseEngineeringImageStage(std::string_view stage, uintptr_t stage_image_base,
+                                        u64 stage_image_size, uintptr_t executable_base,
+                                        u64 executable_size) {
+    if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_RE_TRACE")) {
+        return;
+    }
+    auto result = CaptureImageStage(stage, stage_image_base, stage_image_size, executable_base,
+                                    executable_size);
+    std::scoped_lock lock{image_stage_mutex};
+    image_stages.push_back(std::move(result));
+}
 
 std::optional<std::string> GetSeamlessHostPlacementHeader() {
     std::optional<SummonPlacementDescriptor> placement;
@@ -4172,41 +4429,9 @@ void InstallReverseEngineeringTrace() {
     if (installed || !EnvFlagEnabled("SHADPS4_BLOODBORNE_RE_TRACE")) {
         return;
     }
-    if (MemoryPatcher::g_game_serial != "CUSA03173") {
-        LOG_WARNING(Debug, "Bloodborne RE trace ignored for title {}",
-                    MemoryPatcher::g_game_serial);
-        return;
-    }
-
     const auto* param_sfo = Common::Singleton<PSF>::Instance();
     const std::string_view app_version = param_sfo->GetString("APP_VER").value_or("Unknown");
-    if (app_version != "01.09") {
-        LOG_ERROR(Debug, "Bloodborne RE trace requires CUSA03173 01.09; loaded version is {}",
-                  app_version);
-        return;
-    }
-
     image_base = MemoryPatcher::g_eboot_address;
-    if (image_base == 0 || !VerifySites()) {
-        LOG_ERROR(Debug, "Bloodborne RE trace was not installed");
-        return;
-    }
-
-    std::array<bool, Sites.size()> maintenance_site_valid{};
-    size_t verified_maintenance_site_count = 0;
-    for (size_t index = 0; index < Sites.size(); ++index) {
-        if (Sites[index].kind != TraceKind::MaintenanceSource) {
-            continue;
-        }
-        maintenance_site_valid[index] = VerifyMaintenanceSite(Sites[index]);
-        verified_maintenance_site_count += maintenance_site_valid[index] ? 1 : 0;
-    }
-    if (verified_maintenance_site_count == 0) {
-        LOG_ERROR(Debug,
-                  "Bloodborne RE trace was not installed: no maintenance observer passed its "
-                  "independent signatures");
-        return;
-    }
 
     const auto capture_dir =
         Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) / "bloodborne-re";
@@ -4231,9 +4456,13 @@ void InstallReverseEngineeringTrace() {
         return;
     }
     capture_file << "{\"type\":\"header\",\"title\":\"CUSA03173\","
-                    "\"app_version\":\"01.09\",\"image_base\":\"0x"
-                 << std::hex << image_base << std::dec << "\",\"process_id\":" << process_id
-                 << ",\"site_count\":" << Sites.size() << ",\"negative_area_patch\":"
+                    "\"app_version\":\""
+                 << app_version << "\",\"image_base\":\"0x" << std::hex << image_base
+                 << "\",\"eboot_image_size\":\"0x" << MemoryPatcher::g_eboot_image_size << std::dec
+                 << "\",\"process_id\":" << process_id << ",\"site_count\":" << Sites.size()
+                 << ",\"windows_guest_red_zone_static\":"
+                 << (WindowsGuestRedZoneProtection::IsStaticPatchingEnabled() ? "true" : "false")
+                 << ",\"negative_area_patch\":"
                  << (negative_area_patch_installed ? "true" : "false")
                  << ",\"area_flag_patch\":" << (area_flag_patch_installed ? "true" : "false")
                  << ",\"responder_bell_area_patch\":"
@@ -4268,13 +4497,93 @@ void InstallReverseEngineeringTrace() {
                  << (deferred_summon_reload_hook_installed ? "true" : "false")
                  << ",\"healing_fountain_host_availability_hook\":"
                  << (healing_fountain_host_availability_hook_installed ? "true" : "false") << "}\n";
+    const auto stages = CopyImageStages();
+    WriteImageStageDiagnostics(capture_file, stages);
     capture_file.flush();
+
+    if (MemoryPatcher::g_game_serial != "CUSA03173") {
+        LOG_WARNING(Debug, "Bloodborne RE trace ignored for title {}; diagnostics={}",
+                    MemoryPatcher::g_game_serial, Common::FS::PathToUTF8String(capture_path));
+        return;
+    }
+    if (app_version != "01.09") {
+        LOG_ERROR(Debug,
+                  "Bloodborne RE trace requires CUSA03173 01.09; loaded version is {}; "
+                  "diagnostics={}",
+                  app_version, Common::FS::PathToUTF8String(capture_path));
+        return;
+    }
+    if (image_base == 0) {
+        LOG_ERROR(Debug,
+                  "Bloodborne RE trace was not installed: missing eboot image base; "
+                  "diagnostics={}",
+                  Common::FS::PathToUTF8String(capture_path));
+        return;
+    }
+
+    RuntimeSites = Sites;
+    std::array<bool, Sites.size()> maintenance_site_valid{};
+    size_t verified_maintenance_site_count = 0;
+    const ReverseEngineeringImageStage* final_stage{};
+    for (auto stage = stages.rbegin(); stage != stages.rend(); ++stage) {
+        if (stage->stage == "before_trace_install" && stage->image_base == image_base) {
+            final_stage = &*stage;
+            break;
+        }
+    }
+    if (final_stage == nullptr) {
+        LOG_ERROR(Debug, "Bloodborne RE runtime locator has no final executable-stage snapshot; "
+                         "maintenance observers skipped");
+    } else {
+        for (size_t index = 0; index < Sites.size(); ++index) {
+            if (Sites[index].kind != TraceKind::MaintenanceSource) {
+                continue;
+            }
+            const auto locator = std::ranges::find_if(final_stage->locators,
+                                                      [&](const MaintenanceLocatorResult& result) {
+                                                          return result.site == Sites[index].name;
+                                                      });
+            if (locator == final_stage->locators.end() || !locator->selected_offset.has_value()) {
+                const size_t match_count =
+                    locator != final_stage->locators.end() ? locator->matches.size() : 0;
+                LOG_ERROR(Debug,
+                          "Bloodborne RE maintenance observer {} skipped: runtime_matches={} "
+                          "and no unique semantically valid candidate",
+                          Sites[index].name, match_count);
+                continue;
+            }
+            RuntimeSites[index].offset = *locator->selected_offset;
+            maintenance_site_valid[index] = true;
+            ++verified_maintenance_site_count;
+            LOG_INFO(Debug,
+                     "[BLOODBORNE RE LOCATOR] site={} static_offset={:#x} runtime_matches={} "
+                     "selected_offset={:#x} bytes={}",
+                     Sites[index].name, Sites[index].offset, locator->matches.size(),
+                     RuntimeSites[index].offset, locator->pattern);
+        }
+    }
+    if (verified_maintenance_site_count == 0) {
+        LOG_ERROR(Debug,
+                  "Bloodborne RE trace was not installed: no maintenance observer passed the "
+                  "runtime locator; diagnostics={}",
+                  Common::FS::PathToUTF8String(capture_path));
+        return;
+    }
+
+    const bool auxiliary_sites_valid = VerifySites();
+    if (!auxiliary_sites_valid) {
+        LOG_WARNING(Debug, "Bloodborne RE auxiliary trace sites failed validation; maintenance "
+                           "observers will still be installed independently");
+    }
 
     size_t hook_count = 0;
     size_t maintenance_hook_count = 0;
     for (size_t index = 0; index < Sites.size(); ++index) {
-        const auto& site = Sites[index];
+        const auto& site = RuntimeSites[index];
         if (site.kind == TraceKind::MaintenanceSource && !maintenance_site_valid[index]) {
+            continue;
+        }
+        if (site.kind != TraceKind::MaintenanceSource && !auxiliary_sites_valid) {
             continue;
         }
         if ((summon_build_host_placement_hook_installed && site.offset == SummonBuildEntryOffset) ||

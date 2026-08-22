@@ -754,20 +754,48 @@ CUSA03173 01.09. They capture the API index and request ID when `ResKind`
 result kinds are discarded before the hit counter and produce no log entry.
 No seamless-coop or shadNet option is required for this trace.
 
-The extraction observer is installed at `0x01E7F9F2`, on the exact
-`mov dword ptr [rsp+0xD60], ecx` instruction (`89 8C 24 60 0D 00 00`). At that
-point the request ID is already at `[rsp+0xD58]`, the API index is already at
-`[rsp+0xD5C]`, and `ECX` is the `ResKind` that the intercepted instruction will
-store. The observer reads `ECX` before the hook replays the original instruction;
-it does not write guest registers or memory. The previous observer at
-`0x01E7F9F9` was removed because the loaded Windows image reported
-`74 3B C7 05 0B 0C 71` there instead of the eboot bytes
-`8A 84 24 64 0D 00 00`.
+The original eboot SHA-256
+`6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80` contains
+the extraction instruction at ELF virtual address `0x01E7F9F2` and the dispatch
+comparison at `0x01E894E1`. Its executable `PT_LOAD` has `p_vaddr == 0`, so these
+values are also RVAs and the initial runtime addresses are
+`g_eboot_address + RVA`. They are not SELF physical file offsets. In this SELF,
+the executable payload starts at physical file offset `0x28EB0`, making the two
+physical locations `0x1EA88A2` and `0x1EB2391`, respectively. This mapping is
+specific to the analyzed SELF and is never used to install a runtime hook.
 
-The dispatch observer remains at `0x01E894E1`, protected by
-`41 81 FE 08 01 10 00` (`cmp r14d, 0x100108`). The extraction and dispatch
-observers validate independently. A mismatch skips and reports only that site;
-the capture remains active if at least one maintenance observer installs.
+The loaded image is mutable. On Windows, `PrePatchInstructions` itself does no
+ahead-of-time substitution, but optional static red-zone protection runs later.
+`MemoryPatcher::OnGameLoaded()` then applies enabled XML and queued patches, and
+the seamless instrumentation runs after that. Runtime logs showed that the bytes
+at both original RVAs had changed by the time the trace installer ran. This
+proves that using the correct ELF VA/RVA alone is insufficient; it does not yet
+prove which mutation phase changed a particular user's image.
+
+The maintenance observers therefore use a runtime locator over the loaded
+eboot's executable segment. It captures and scans four stages:
+
+- immediately after `PrePatchInstructions`;
+- after optional static red-zone processing;
+- after `MemoryPatcher::OnGameLoaded()`;
+- immediately before reverse-engineering trace installation.
+
+For extraction, the locator searches for
+`89 8C 24 60 0D 00 00` (`mov dword ptr [rsp+0xD60], ecx`) and validates the
+adjacent request-ID store, API-index store
+`44 89 BC 24 5C 0D 00 00`, and following load. For dispatch, it searches for
+`41 81 FE 08 01 10 00` (`cmp r14d, 0x100108`) and validates the preceding state
+store and following conditional branch. Every raw candidate and its surrounding
+bytes is logged. A hook is installed only when exactly one candidate passes all
+semantic context checks; ambiguous candidates are reported and skipped.
+
+The capture directory and JSONL diagnostic file are now created whenever
+`SHADPS4_BLOODBORNE_RE_TRACE=1`, even if neither maintenance observer can be
+installed. Each `maintenance_locator` record contains the image base and size,
+executable range, static RVA bytes, at least 64 bytes on both sides, all runtime
+matches, context results, and any selected runtime offset. The extraction and
+dispatch observers remain independent, and auxiliary trace-site mismatches no
+longer prevent a valid maintenance observer from installing.
 
 For the two-client comparison, enable all three shadPS4 flags in both client
 processes:

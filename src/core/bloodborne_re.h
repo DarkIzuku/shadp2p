@@ -15,6 +15,9 @@ bool SetSeamlessHostPlacementHeader(std::string_view value);
 void ClearSeamlessHostPlacementHeader();
 void TraceMatching2LeaveRoom(std::uintptr_t return_address, std::uint64_t room_id);
 void InstallSeamlessCoopPatches();
+void RecordReverseEngineeringImageStage(std::string_view stage, std::uintptr_t image_base,
+                                        std::uint64_t image_size, std::uintptr_t executable_base,
+                                        std::uint64_t executable_size);
 void InstallReverseEngineeringTrace();
 
 } // namespace Core::Bloodborne
