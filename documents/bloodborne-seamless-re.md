@@ -1605,3 +1605,91 @@ presence/length list. A visible `[BLOODBORNE SS.PARSER FAIL]` INFO line is
 emitted only when the parser actually returns zero. All of these new observers
 are gated to the latest request whose API index is 38; they never write guest
 registers, guest memory, config fields, flags, or control flow.
+
+### `ss.info` callback-anchored parser instrumentation
+
+The control run with `<gameurl2>` proves dynamically that the parser-return
+observer at runtime `0x01EB6B87` is correct. It returned zero while `config->ss`
+remained at its sentinel 999 and no API value was installed, so changing
+`gameurl3` to `gameurl2` is necessary but does not address the earlier failure.
+
+The callback instructions immediately preceding its confirmed
+`test al,al` are:
+
+```text
+static 1E89C88  mov r8,  [r15+18h]
+static 1E89C8C  lea rsi, [rbp-68h]
+static 1E89C90  lea rdx, [rbp-4CCh]
+static 1E89C97  lea rcx, [rbp-4D0h]
+static 1E89C9E  mov rdi, r12
+static 1E89CA1  E8 BA CB 02 00  call 1EB6860
+static 1E89CA6  84 C0             test al,al
+```
+
+The corresponding runtime call is `0x01E89A21`. Its signed displacement is
+`+0x2CBBA`; because the next instruction is runtime `0x01E89A26`, the decoded
+target is exactly `0x01EB65E0`. The failure `JE` at runtime `0x01E89A28`
+decodes to `0x01E89AE9`; fall-through success starts at `0x01E89A2E`.
+
+The parser's actual five-argument signature is therefore:
+
+```text
+bool ParseSsInfo(
+    ParserHelper*       rdi,
+    const std::string&  rsi,  // callback accumulator at RBP-68h
+    const u32*          rdx,  // selected gameurl group at RBP-4CCh
+    const u32*          rcx,  // language at RBP-4D0h
+    SsInfoConfig*       r8);
+```
+
+The prologue saves those five register arguments and does not consume a stack
+argument. The call observer nevertheless records the first eight caller stack
+qwords, raw registers, and the two final arguments reconstructed from the safe
+`lea rcx; mov rdi` instructions that its trampoline replays immediately before
+the call.
+
+The parser sites are no longer found by scanning the executable. Installation
+validates the known runtime callback anchor locally, decodes the `CALL rel32`,
+validates the target prologue, and derives every parser site from its static
+delta relative to `0x01EB6860`. Each derived location must match its exact safe
+whole-instruction signature and a 32-byte local diagnostic window. The buffer
+append, callback result, and both callback branches are derived from the call
+site in the same manner.
+
+The safe pre-call observer begins at static `0x01E89C97` / runtime
+`0x01E89A17`. It contains only `lea rcx,[rbp-4D0h]; mov rdi,r12`; the following
+relative call is validated as context but never copied into the trampoline.
+It records the actual string object, data pointer, length, capacity, terminating
+NUL, first and last 128 bytes in hex and escaped ASCII, and complete FNV-1a
+hash. Success and failure callback observers record `AL`, config `ss`, selected
+group, API count, buffer identity, and whether the independent parser-return
+observer fired.
+
+The early checks are also derived locally from the decoded parser target.
+Relative branches themselves are not copied. Safe observations cover:
+
+- the combined `<ss>` result/range decision before static `0x01EB6952` and
+  `0x01EB6958`;
+- `</ss>` null at `0x01EB69C6`, empty range at `0x01EB69F4`, and exhausted
+  search at `0x01EB69EF`;
+- invalid close/open positions at `0x01EB6A42` and `0x01EB6A4C`;
+- the exact `endptr-start == substring_length` decision feeding
+  `0x01EB6C13`.
+
+Only the condition that will really take a failure branch emits a
+`[BLOODBORNE SS.PARSER FAIL]` line. The search observers independently emit
+the open/close match offsets and numeric substring/conversion result.
+
+The missing return event in build `582b813d` was an instrumentation regression,
+not contrary address evidence. That build discarded every parser-return hit
+when thread-local `ss_info_parser_trace.active` was false. Only the new,
+globally scanned parser-entry observer could set it. If that generic entry
+signature was ambiguous or skipped, the valid return hook could execute and be
+silently filtered. The callback call now establishes context first, and the
+return observer is gated only by request API 38; it cannot be hidden by failure
+of an auxiliary parser observer.
+
+Remaining general runtime locators retain their existing behavior, but console
+and JSONL diagnostics store at most the first five ambiguous candidates plus
+the total match count and selected candidate. Parser instrumentation produces
+no executable-wide candidate array.

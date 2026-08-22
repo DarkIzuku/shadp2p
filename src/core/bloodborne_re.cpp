@@ -89,7 +89,9 @@ enum class TraceKind : u8 {
     HttpMessageSelection,
     FrpgMaintenanceFlagWrite,
     SsInfoBufferAssembly,
+    SsInfoParserCall,
     SsInfoParserStep,
+    SsInfoParserFailure,
     SsInfoApiSearch,
     SsInfoParserExit,
     SsInfoCallbackResult,
@@ -209,6 +211,9 @@ constexpr u64 FrpgMaintenanceFlagOffset = 0x3E8;
 constexpr u64 FrpgConfigOffset = 0x18;
 constexpr u64 HttpHandlerStartOffset = 0x01E7F4C0;
 constexpr u64 HttpHandlerEndOffset = 0x01E89AD0;
+constexpr u64 SsInfoCallbackTestRuntimeOffset = 0x01E89A26;
+constexpr u64 SsInfoParserCallStaticOffset = 0x01E89CA1;
+constexpr u64 SsInfoParserCallPrepareStaticOffset = 0x01E89C97;
 constexpr u64 SsInfoParserEntryOffset = 0x01EB6860;
 constexpr u64 SsInfoParserReturnOffset = 0x01EB6E07;
 constexpr u64 SsInfoApiHelperTraceOffset = 0x01ECB624;
@@ -289,10 +294,18 @@ constexpr NativeCallSignature MaintenanceDispatchPostContext{
 
 constexpr bool IsRuntimeLocatedKind(TraceKind kind) {
     return kind == TraceKind::MaintenanceSource || kind == TraceKind::HttpMessageSelection ||
-           kind == TraceKind::FrpgMaintenanceFlagWrite || kind == TraceKind::SsInfoParserExit ||
-           kind == TraceKind::SsInfoCallbackResult || kind == TraceKind::HttpMessageSink ||
-           kind == TraceKind::SsInfoBufferAssembly || kind == TraceKind::SsInfoParserStep ||
-           kind == TraceKind::SsInfoApiSearch;
+           kind == TraceKind::FrpgMaintenanceFlagWrite || kind == TraceKind::HttpMessageSink;
+}
+
+constexpr bool IsSsInfoAnchoredKind(TraceKind kind) {
+    return kind == TraceKind::SsInfoBufferAssembly || kind == TraceKind::SsInfoParserCall ||
+           kind == TraceKind::SsInfoParserStep || kind == TraceKind::SsInfoParserFailure ||
+           kind == TraceKind::SsInfoApiSearch || kind == TraceKind::SsInfoParserExit ||
+           kind == TraceKind::SsInfoCallbackResult;
+}
+
+constexpr bool IsIndependentlyLocatedKind(TraceKind kind) {
+    return IsRuntimeLocatedKind(kind) || IsSsInfoAnchoredKind(kind);
 }
 
 constexpr NativeCallSignature Message4402PreContext{
@@ -433,11 +446,23 @@ constexpr NativeCallSignature SsInfoParserEntryPostContext{
     {0x48, 0x81, 0xEC, 0x68, 0x07, 0x00, 0x00},
     7,
 };
+constexpr NativeCallSignature SsInfoParserCallPreContext{
+    "SsInfo.Parser.Call.Pre",
+    0,
+    {0x48, 0x8D, 0x95, 0x34, 0xFB, 0xFF, 0xFF},
+    7,
+};
+constexpr NativeCallSignature SsInfoParserCallPostContext{
+    "SsInfo.Parser.Call.Post",
+    0,
+    {0xE8, 0xBA, 0xCB, 0x02, 0x00},
+    5,
+};
 constexpr NativeCallSignature SsInfoOpenPreContext{
     "SsInfo.Parser.FindSsOpen.Pre",
     0,
-    {0x48, 0x8B, 0x0D, 0x78, 0xD2, 0x52, 0x03, 0x48, 0x8B, 0xB5, 0x08, 0xFC, 0xFF, 0xFF},
-    14,
+    {0x48, 0x8B, 0x0D, 0x78, 0xD2, 0x52, 0x03},
+    7,
 };
 constexpr NativeCallSignature SsInfoOpenPostContext{
     "SsInfo.Parser.FindSsOpen.Post",
@@ -454,8 +479,8 @@ constexpr NativeCallSignature SsInfoClosePreContext{
 constexpr NativeCallSignature SsInfoClosePostContext{
     "SsInfo.Parser.FindSsClose.Post",
     0,
-    {0x48, 0x8B, 0xB5, 0x08, 0xFC, 0xFF, 0xFF},
-    7,
+    {0x72, 0x1A},
+    2,
 };
 constexpr NativeCallSignature SsInfoParsePreContext{
     "SsInfo.Parser.ParseSs.Pre",
@@ -1083,21 +1108,55 @@ constexpr auto Sites = std::to_array<TraceSite>({
      TraceKind::SsInfoBufferAssembly,
      {0x49, 0x8B, 0x06, 0x4C, 0x89, 0xF7},
      6},
+    {"SsInfo.Parser.Call",
+     SsInfoParserCallPrepareStaticOffset,
+     TraceKind::SsInfoParserCall,
+     {0x48, 0x8D, 0x8D, 0x30, 0xFB, 0xFF, 0xFF, 0x4C, 0x89, 0xE7},
+     10},
     {"SsInfo.Parser.Entry",
      SsInfoParserEntryOffset,
      TraceKind::SsInfoParserStep,
      {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53},
      13},
-    {"SsInfo.Parser.FindSsOpen", 0x01EB694F, TraceKind::SsInfoParserStep, {0x49, 0x29, 0xC6}, 3},
+    {"SsInfo.Parser.FindSsOpen",
+     0x01EB6948,
+     TraceKind::SsInfoParserStep,
+     {0x48, 0x8B, 0xB5, 0x08, 0xFC, 0xFF, 0xFF, 0x49, 0x29, 0xC6},
+     10},
     {"SsInfo.Parser.FindSsClose",
      0x01EB69FC,
      TraceKind::SsInfoParserStep,
-     {0x49, 0x83, 0xFF, 0x10},
-     4},
+     {0x49, 0x83, 0xFF, 0x10, 0x48, 0x8B, 0xB5, 0x08, 0xFC, 0xFF, 0xFF},
+     11},
     {"SsInfo.Parser.ParseSs",
      0x01EB6BCB,
      TraceKind::SsInfoParserStep,
      {0x48, 0x8B, 0x95, 0xF0, 0xFE, 0xFF, 0xFF},
+     7},
+    {"SsInfo.Parser.FailSsCloseNull",
+     0x01EB69C0,
+     TraceKind::SsInfoParserFailure,
+     {0x49, 0x89, 0xC4, 0x4D, 0x85, 0xE4},
+     6},
+    {"SsInfo.Parser.FailSsCloseEmpty",
+     0x01EB696E,
+     TraceKind::SsInfoParserFailure,
+     {0x4C, 0x8B, 0x7E, 0x20, 0x48, 0x8D, 0x56, 0x08, 0x49, 0x83, 0xFF, 0x10},
+     12},
+    {"SsInfo.Parser.FailSsCloseExhausted",
+     0x01EB69E0,
+     TraceKind::SsInfoParserFailure,
+     {0x4D, 0x8D, 0x74, 0x1E, 0xFF, 0x49, 0x8D, 0x5C, 0x24, 0x01, 0x4D, 0x29, 0xE6},
+     13},
+    {"SsInfo.Parser.FailSsPositions",
+     0x01EB6A38,
+     TraceKind::SsInfoParserFailure,
+     {0x49, 0x29, 0xC4, 0x45, 0x31, 0xF6, 0x49, 0x83, 0xFC, 0xFF},
+     10},
+    {"SsInfo.Parser.FailSsParse",
+     0x01EB6BE0,
+     TraceKind::SsInfoParserFailure,
+     {0x48, 0x29, 0xDA, 0x48, 0x3B, 0x55, 0xB0},
      7},
     {"SsInfo.ApiSearch.Entry",
      SsInfoApiHelperTraceOffset,
@@ -1144,6 +1203,8 @@ std::mutex capture_mutex;
 std::ofstream capture_file;
 std::filesystem::path capture_path;
 uintptr_t image_base{};
+u64 ss_info_parser_call_runtime_offset{};
+u64 ss_info_parser_target_runtime_offset{};
 bool installed{};
 bool negative_area_patch_installed{};
 bool area_flag_patch_installed{};
@@ -1435,8 +1496,11 @@ bool IsRuntimeContextValid(const TraceSite& site, uintptr_t stage_image_base, u6
     if (site.name == "SsInfo.Parser.Entry") {
         return after(SsInfoParserEntryPostContext);
     }
+    if (site.name == "SsInfo.Parser.Call") {
+        return before(7, SsInfoParserCallPreContext) && after(SsInfoParserCallPostContext);
+    }
     if (site.name == "SsInfo.Parser.FindSsOpen") {
-        return before(14, SsInfoOpenPreContext) && after(SsInfoOpenPostContext);
+        return before(7, SsInfoOpenPreContext) && after(SsInfoOpenPostContext);
     }
     if (site.name == "SsInfo.Parser.FindSsClose") {
         return before(8, SsInfoClosePreContext) && after(SsInfoClosePostContext);
@@ -1528,6 +1592,104 @@ MaintenanceLocatorResult LocateMaintenanceSite(const TraceSite& site, uintptr_t 
     return result;
 }
 
+struct SsInfoAnchorResult {
+    bool valid{};
+    u64 test_offset{SsInfoCallbackTestRuntimeOffset};
+    u64 call_offset{};
+    s32 call_displacement{};
+    u64 target_offset{};
+    u64 success_offset{};
+    u64 failure_offset{};
+    std::string test_bytes;
+    std::string call_bytes;
+    std::string target_bytes;
+};
+
+SsInfoAnchorResult LocateSsInfoParserAnchor(uintptr_t stage_image_base, u64 stage_image_size) {
+    SsInfoAnchorResult result{};
+    constexpr std::array<u8, 2> TestAlAl{0x84, 0xC0};
+    constexpr std::array<u8, 2> JeNear{0x0F, 0x84};
+    constexpr u64 CallLength = 5;
+    constexpr u64 JeLength = 6;
+    if (result.test_offset < CallLength ||
+        result.test_offset + TestAlAl.size() + JeLength > stage_image_size) {
+        return result;
+    }
+    result.call_offset = result.test_offset - CallLength;
+    result.test_bytes = ReadDiagnosticBytes(stage_image_base, stage_image_size, result.test_offset,
+                                            TestAlAl.size() + JeLength);
+    result.call_bytes =
+        ReadDiagnosticBytes(stage_image_base, stage_image_size, result.call_offset, CallLength);
+    if (!HasMemoryAccess(stage_image_base + result.call_offset, CallLength, MemoryProt::CpuRead) ||
+        !HasMemoryAccess(stage_image_base + result.test_offset, TestAlAl.size() + JeLength,
+                         MemoryProt::CpuRead)) {
+        return result;
+    }
+    const auto* call = reinterpret_cast<const u8*>(stage_image_base + result.call_offset);
+    const auto* test = reinterpret_cast<const u8*>(stage_image_base + result.test_offset);
+    if (call[0] != 0xE8 || !std::ranges::equal(TestAlAl, std::span<const u8>{test, 2}) ||
+        !std::ranges::equal(JeNear, std::span<const u8>{test + 2, 2})) {
+        return result;
+    }
+    std::memcpy(&result.call_displacement, call + 1, sizeof(result.call_displacement));
+    s32 failure_displacement{};
+    std::memcpy(&failure_displacement, test + 4, sizeof(failure_displacement));
+    result.target_offset = static_cast<u64>(static_cast<s64>(result.test_offset) +
+                                            static_cast<s64>(result.call_displacement));
+    result.success_offset = result.test_offset + TestAlAl.size() + JeLength;
+    result.failure_offset = static_cast<u64>(static_cast<s64>(result.success_offset) +
+                                             static_cast<s64>(failure_displacement));
+    const auto parser_entry = std::ranges::find_if(
+        Sites, [](const TraceSite& site) { return site.name == "SsInfo.Parser.Entry"; });
+    if (parser_entry == Sites.end() || result.target_offset > stage_image_size ||
+        parser_entry->prologue_size > stage_image_size - result.target_offset) {
+        return result;
+    }
+    const auto expected =
+        std::span<const u8>{parser_entry->prologue.data(), parser_entry->prologue_size};
+    const auto actual = std::span<const u8>{
+        reinterpret_cast<const u8*>(stage_image_base + result.target_offset), expected.size()};
+    result.target_bytes =
+        ReadDiagnosticBytes(stage_image_base, stage_image_size, result.target_offset, 32);
+    result.valid = std::ranges::equal(expected, actual);
+    return result;
+}
+
+std::optional<u64> GetSsInfoAnchoredOffset(const TraceSite& site,
+                                           const SsInfoAnchorResult& anchor) {
+    if (!anchor.valid || !IsSsInfoAnchoredKind(site.kind)) {
+        return std::nullopt;
+    }
+    const bool callback_site = site.kind == TraceKind::SsInfoBufferAssembly ||
+                               site.kind == TraceKind::SsInfoParserCall ||
+                               site.kind == TraceKind::SsInfoCallbackResult;
+    const s64 relative =
+        callback_site
+            ? static_cast<s64>(site.offset) - static_cast<s64>(SsInfoParserCallStaticOffset)
+            : static_cast<s64>(site.offset) - static_cast<s64>(SsInfoParserEntryOffset);
+    const s64 anchored =
+        static_cast<s64>(callback_site ? anchor.call_offset : anchor.target_offset) + relative;
+    return anchored >= 0 ? std::optional<u64>{static_cast<u64>(anchored)} : std::nullopt;
+}
+
+bool ValidateSsInfoAnchoredSite(const TraceSite& site, uintptr_t stage_image_base,
+                                u64 stage_image_size, u64 candidate_offset) {
+    const auto expected = std::span<const u8>{site.prologue.data(), site.prologue_size};
+    if (candidate_offset > stage_image_size ||
+        expected.size() > stage_image_size - candidate_offset ||
+        !HasMemoryAccess(stage_image_base + candidate_offset, expected.size(),
+                         MemoryProt::CpuRead)) {
+        return false;
+    }
+    const auto actual = std::span<const u8>{
+        reinterpret_cast<const u8*>(stage_image_base + candidate_offset), expected.size()};
+    if (!std::ranges::equal(expected, actual)) {
+        return false;
+    }
+    return site.kind == TraceKind::SsInfoParserFailure ||
+           IsRuntimeContextValid(site, stage_image_base, stage_image_size, candidate_offset);
+}
+
 ReverseEngineeringImageStage CaptureImageStage(std::string_view stage, uintptr_t stage_image_base,
                                                u64 stage_image_size, uintptr_t executable_base,
                                                u64 executable_size) {
@@ -1565,7 +1727,9 @@ ReverseEngineeringImageStage CaptureImageStage(std::string_view stage, uintptr_t
                  result.stage, locator.site, locator.static_offset, result.image_base,
                  result.executable_base, result.executable_base_delta, locator.matches.size(),
                  selected_out.str(), locator.static_runtime_bytes);
-        for (const auto& match : locator.matches) {
+        const size_t logged_match_count = std::min<size_t>(locator.matches.size(), 5);
+        for (size_t match_index = 0; match_index < logged_match_count; ++match_index) {
+            const auto& match = locator.matches[match_index];
             LOG_INFO(Debug,
                      "[BLOODBORNE RE LOCATOR] stage={} site={} candidate_offset={:#x} "
                      "context_valid={} bytes={}",
@@ -1744,8 +1908,15 @@ std::optional<u64> HashGuestStringFnv1a64(const GuestStringSnapshot& snapshot) {
 
 struct SsInfoParserTraceContext {
     bool active{};
+    bool parser_return_seen{};
     u64 parser_frame{};
     u64 frpg_net_man{};
+    u64 parser_helper{};
+    u64 config{};
+    u64 call_site{};
+    u64 target{};
+    u64 gameurl_argument{};
+    u64 language_argument{};
     GuestStringSnapshot input{};
     bool ss_open_checked{};
     bool ss_open_found{};
@@ -1768,6 +1939,26 @@ struct SsInfoParserTraceContext {
 };
 
 thread_local SsInfoParserTraceContext ss_info_parser_trace{};
+
+bool IsSsInfoParserFailureHit(const TraceSite& site, const GuestRegisterSnapshot& registers) {
+    if (site.name == "SsInfo.Parser.FailSsCloseNull") {
+        return registers.rax == 0;
+    }
+    if (site.name == "SsInfo.Parser.FailSsCloseEmpty") {
+        return registers.r14 == 0;
+    }
+    if (site.name == "SsInfo.Parser.FailSsCloseExhausted") {
+        return registers.r14 + registers.rbx - 1 - registers.r12 == 0;
+    }
+    if (site.name == "SsInfo.Parser.FailSsPositions") {
+        return registers.r12 - registers.rax == std::numeric_limits<u64>::max() ||
+               registers.rdx == std::numeric_limits<u64>::max();
+    }
+    if (site.name == "SsInfo.Parser.FailSsParse") {
+        return registers.rdx - registers.rbx != ReadValue<u64>(registers.rbp - 0x50, 0);
+    }
+    return false;
+}
 
 struct MaintenanceSourceRecord {
     u32 request_id{};
@@ -3722,6 +3913,10 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         latest_ss_info_api_index.load(std::memory_order_relaxed) != 38) {
         return;
     }
+    if (site.kind == TraceKind::SsInfoParserCall &&
+        latest_ss_info_api_index.load(std::memory_order_relaxed) != 38) {
+        return;
+    }
     if (site.kind == TraceKind::SsInfoParserStep && site.name != "SsInfo.Parser.Entry" &&
         !ss_info_parser_trace.active) {
         return;
@@ -3733,7 +3928,15 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (site.kind == TraceKind::SsInfoApiSearch && !ss_info_parser_trace.active) {
         return;
     }
-    if (site.kind == TraceKind::SsInfoParserExit && !ss_info_parser_trace.active) {
+    if (site.kind == TraceKind::SsInfoParserFailure && !ss_info_parser_trace.active) {
+        return;
+    }
+    if (site.kind == TraceKind::SsInfoParserFailure &&
+        !IsSsInfoParserFailureHit(site, *registers)) {
+        return;
+    }
+    if (site.kind == TraceKind::SsInfoParserExit &&
+        latest_ss_info_api_index.load(std::memory_order_relaxed) != 38) {
         return;
     }
     u64 flag_write_sequence{};
@@ -3810,7 +4013,8 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     const u64 hit =
         early_hit != 0 ? early_hit : site_hits[tag].fetch_add(1, std::memory_order_relaxed) + 1;
     const bool ss_info_step =
-        site.kind == TraceKind::SsInfoBufferAssembly || site.kind == TraceKind::SsInfoParserStep ||
+        site.kind == TraceKind::SsInfoBufferAssembly || site.kind == TraceKind::SsInfoParserCall ||
+        site.kind == TraceKind::SsInfoParserStep || site.kind == TraceKind::SsInfoParserFailure ||
         site.kind == TraceKind::SsInfoApiSearch || site.kind == TraceKind::SsInfoParserExit;
     const u64 dense_capture_limit =
         site.kind == TraceKind::ActionFlags || site.kind == TraceKind::GoodsParamLookup ? 2048
@@ -4461,6 +4665,97 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
                      before_append ? registers->r12 : 0, chunk_length, accumulator.nul_terminated);
             break;
         }
+        case TraceKind::SsInfoParserCall: {
+            const u64 language_argument = registers->rbp - 0x4D0;
+            ss_info_parser_trace = {
+                .active = true,
+                .frpg_net_man = registers->r15,
+                .parser_helper = registers->r12,
+                .config = registers->r8,
+                .call_site = ss_info_parser_call_runtime_offset,
+                .target = ss_info_parser_target_runtime_offset,
+                .gameurl_argument = registers->rdx,
+                .language_argument = language_argument,
+                .input = ReadGuestStringSnapshot(registers->rsi),
+                .raw_gameurl_index = ReadValue<u32>(registers->rdx, 0),
+                .language_index = ReadValue<u32>(language_argument, 0),
+            };
+            const auto hash = HashGuestStringFnv1a64(ss_info_parser_trace.input);
+            capture_file << ",\"ss_info_parser_call\":{";
+            capture_file << "\"call_site\":";
+            WriteHex(capture_file, ss_info_parser_trace.call_site);
+            capture_file << ",\"target\":";
+            WriteHex(capture_file, ss_info_parser_trace.target);
+            capture_file << ",\"parser_helper\":";
+            WriteHex(capture_file, ss_info_parser_trace.parser_helper);
+            capture_file << ",\"config\":";
+            WriteHex(capture_file, ss_info_parser_trace.config);
+            capture_file << ",\"buffer_object\":";
+            WriteHex(capture_file, ss_info_parser_trace.input.object);
+            capture_file << ",\"buffer_ptr\":";
+            WriteHex(capture_file, ss_info_parser_trace.input.data);
+            capture_file << ",\"buffer_length\":" << ss_info_parser_trace.input.length;
+            capture_file << ",\"buffer_capacity\":" << ss_info_parser_trace.input.capacity;
+            capture_file << ",\"nul_terminated\":"
+                         << (ss_info_parser_trace.input.nul_terminated ? "true" : "false");
+            capture_file << ",\"first_128_hex\":\""
+                         << ReadGuestBytesHex(ss_info_parser_trace.input, false, 128) << '"';
+            capture_file << ",\"first_128_ascii\":\""
+                         << ReadGuestBytesEscaped(ss_info_parser_trace.input, false, 128) << '"';
+            capture_file << ",\"last_128_hex\":\""
+                         << ReadGuestBytesHex(ss_info_parser_trace.input, true, 128) << '"';
+            capture_file << ",\"last_128_ascii\":\""
+                         << ReadGuestBytesEscaped(ss_info_parser_trace.input, true, 128) << '"';
+            capture_file << ",\"fnv1a64\":";
+            WriteHex(capture_file, hash.value_or(0));
+            capture_file << ",\"gameurl_argument\":";
+            WriteHex(capture_file, ss_info_parser_trace.gameurl_argument);
+            capture_file << ",\"gameurl_index\":" << ss_info_parser_trace.raw_gameurl_index;
+            capture_file << ",\"language_argument\":";
+            WriteHex(capture_file, ss_info_parser_trace.language_argument);
+            capture_file << ",\"language_index\":" << ss_info_parser_trace.language_index;
+            capture_file << ",\"effective_rdi\":";
+            WriteHex(capture_file, registers->r12);
+            capture_file << ",\"effective_rsi\":";
+            WriteHex(capture_file, registers->rsi);
+            capture_file << ",\"effective_rdx\":";
+            WriteHex(capture_file, registers->rdx);
+            capture_file << ",\"effective_rcx\":";
+            WriteHex(capture_file, language_argument);
+            capture_file << ",\"effective_r8\":";
+            WriteHex(capture_file, registers->r8);
+            capture_file << ",\"effective_r9\":";
+            WriteHex(capture_file, registers->r9);
+            capture_file << ",\"raw_rdi\":";
+            WriteHex(capture_file, registers->rdi);
+            capture_file << ",\"raw_rcx\":";
+            WriteHex(capture_file, registers->rcx);
+            capture_file << ",\"rsp\":";
+            WriteHex(capture_file, registers->rsp);
+            capture_file << ",\"rbp\":";
+            WriteHex(capture_file, registers->rbp);
+            capture_file << ",\"stack_qwords\":[";
+            for (size_t index = 0; index < 8; ++index) {
+                if (index != 0) {
+                    capture_file << ',';
+                }
+                WriteHex(capture_file, ReadValue<u64>(registers->rsp, index * sizeof(u64)));
+            }
+            capture_file << "]}";
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SS.PARSER CALL] call_site={:#x} target={:#x} "
+                     "buffer_ptr={:#x} buffer_length={} config={:#x} gameurl_argument={:#x} "
+                     "gameurl_index={} language_argument={:#x} language_index={} rdi={:#x} "
+                     "rsi={:#x} rdx={:#x} rcx={:#x} r8={:#x} r9={:#x} rsp={:#x} rbp={:#x}",
+                     ss_info_parser_trace.call_site, ss_info_parser_trace.target,
+                     ss_info_parser_trace.input.data, ss_info_parser_trace.input.length,
+                     ss_info_parser_trace.config, ss_info_parser_trace.gameurl_argument,
+                     ss_info_parser_trace.raw_gameurl_index, ss_info_parser_trace.language_argument,
+                     ss_info_parser_trace.language_index, registers->r12, registers->rsi,
+                     registers->rdx, language_argument, registers->r8, registers->r9,
+                     registers->rsp, registers->rbp);
+            break;
+        }
         case TraceKind::SsInfoParserStep: {
             capture_file << ",\"ss_info_parser_step\":{";
             capture_file << "\"request_id\":";
@@ -4474,20 +4769,25 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
                 const u64 return_address = ReadValue<u64>(registers->rsp, 0);
                 const u64 runtime_return_offset =
                     return_address >= image_base ? return_address - image_base : 0;
-                const s64 runtime_delta =
-                    static_cast<s64>(site.offset) - static_cast<s64>(Sites[tag].offset);
-                const s64 static_return_offset =
-                    static_cast<s64>(runtime_return_offset) - runtime_delta;
-                const bool ss_info_caller = static_return_offset == 0x01E89CA6;
-                ss_info_parser_trace = {
-                    .active = ss_info_caller &&
-                              latest_ss_info_api_index.load(std::memory_order_relaxed) == 38,
-                    .parser_frame = registers->rsp - sizeof(u64),
-                    .frpg_net_man = latest_ss_info_frpg_net_man.load(std::memory_order_relaxed),
-                    .input = ReadGuestStringSnapshot(registers->rsi),
-                    .raw_gameurl_index = ReadValue<u32>(registers->rdx, 0),
-                    .language_index = ReadValue<u32>(registers->rcx, 0),
-                };
+                const bool ss_info_caller =
+                    runtime_return_offset == ss_info_parser_call_runtime_offset + 5;
+                if (!ss_info_parser_trace.active) {
+                    ss_info_parser_trace = {
+                        .active = ss_info_caller &&
+                                  latest_ss_info_api_index.load(std::memory_order_relaxed) == 38,
+                        .frpg_net_man = latest_ss_info_frpg_net_man.load(std::memory_order_relaxed),
+                        .parser_helper = registers->rdi,
+                        .config = registers->r8,
+                        .call_site = ss_info_parser_call_runtime_offset,
+                        .target = ss_info_parser_target_runtime_offset,
+                        .gameurl_argument = registers->rdx,
+                        .language_argument = registers->rcx,
+                    };
+                }
+                ss_info_parser_trace.parser_frame = registers->rsp - sizeof(u64);
+                ss_info_parser_trace.input = ReadGuestStringSnapshot(registers->rsi);
+                ss_info_parser_trace.raw_gameurl_index = ReadValue<u32>(registers->rdx, 0);
+                ss_info_parser_trace.language_index = ReadValue<u32>(registers->rcx, 0);
                 const auto hash = HashGuestStringFnv1a64(ss_info_parser_trace.input);
                 capture_file << "\"step\":\"entry\"";
                 capture_file << ",\"active\":" << (ss_info_parser_trace.active ? "true" : "false");
@@ -4515,8 +4815,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
                 capture_file << ",\"return_address\":";
                 WriteHex(capture_file, return_address);
                 capture_file << ",\"static_caller_offset\":";
-                WriteHex(capture_file,
-                         static_return_offset >= 0 ? static_cast<u64>(static_return_offset) : 0);
+                WriteHex(capture_file, SsInfoParserCallStaticOffset + 5);
                 LOG_INFO(Debug,
                          "[BLOODBORNE SS.PARSER STEP] step=entry buffer_ptr={:#x} "
                          "buffer_length={} capacity={} nul_terminated={} fnv1a64={:#x} "
@@ -4545,10 +4844,28 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
                 capture_file << ",\"match_offset\":";
                 WriteHex(capture_file, registers->rax);
                 capture_file << ",\"remaining_length\":" << remaining;
+                if (!found || remaining < 5) {
+                    capture_file << ",\"failure_reason\":\"" << ss_info_parser_trace.failure_reason
+                                 << '"';
+                    capture_file << ",\"failure_branch_offset\":";
+                    WriteHex(capture_file, ss_info_parser_trace.failure_branch_offset);
+                }
                 LOG_INFO(Debug,
                          "[BLOODBORNE SS.PARSER STEP] step=find_ss_open found={} "
                          "match_offset={:#x}",
                          found, registers->rax);
+                if (!found || remaining < 5) {
+                    const u64 runtime_failure =
+                        ss_info_parser_trace.target +
+                        (ss_info_parser_trace.failure_branch_offset - SsInfoParserEntryOffset);
+                    LOG_INFO(Debug,
+                             "[BLOODBORNE SS.PARSER FAIL] reason={} runtime_offset={:#x} "
+                             "buffer_ptr={:#x} buffer_length={} ss_open_offset={:#x} "
+                             "gameurl_index={}",
+                             ss_info_parser_trace.failure_reason, runtime_failure,
+                             ss_info_parser_trace.input.data, ss_info_parser_trace.input.length,
+                             registers->rax, ss_info_parser_trace.raw_gameurl_index);
+                }
             } else if (site.name == "SsInfo.Parser.FindSsClose") {
                 const bool found = registers->r12 >= ss_info_parser_trace.input.data &&
                                    registers->r12 - ss_info_parser_trace.input.data <
@@ -4595,6 +4912,80 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
                          valid);
             }
             capture_file << '}';
+            break;
+        }
+        case TraceKind::SsInfoParserFailure: {
+            std::string_view reason{"other"};
+            u64 static_branch{};
+            GuestStringSnapshot parsed_text{};
+            s32 strtol_value{};
+            u64 endptr_offset{std::numeric_limits<u64>::max()};
+            if (site.name == "SsInfo.Parser.FailSsCloseNull") {
+                reason = "ss_close_missing";
+                static_branch = 0x01EB69C6;
+            } else if (site.name == "SsInfo.Parser.FailSsCloseEmpty") {
+                reason = "ss_close_range_empty";
+                static_branch = 0x01EB69F4;
+            } else if (site.name == "SsInfo.Parser.FailSsCloseExhausted") {
+                reason = "ss_close_search_exhausted";
+                static_branch = 0x01EB69EF;
+            } else if (site.name == "SsInfo.Parser.FailSsPositions") {
+                const u64 close_offset = registers->r12 - registers->rax;
+                if (close_offset == std::numeric_limits<u64>::max()) {
+                    reason = "ss_close_position_invalid";
+                    static_branch = 0x01EB6A42;
+                } else {
+                    reason = "ss_open_position_invalid";
+                    static_branch = 0x01EB6A4C;
+                }
+            } else if (site.name == "SsInfo.Parser.FailSsParse") {
+                reason = "ss_parse_invalid";
+                static_branch = 0x01EB6C13;
+                parsed_text = ReadGuestStringSnapshot(registers->rbp - 0x68);
+                strtol_value = static_cast<s32>(registers->rax);
+                endptr_offset = registers->rdx >= registers->rbx ? registers->rdx - registers->rbx
+                                                                 : std::numeric_limits<u64>::max();
+                ss_info_parser_trace.ss_parse_checked = true;
+                ss_info_parser_trace.ss_parse_valid = false;
+                ss_info_parser_trace.ss_value = strtol_value;
+                ss_info_parser_trace.ss_endptr_offset = endptr_offset;
+            }
+            ss_info_parser_trace.failure_reason = reason;
+            ss_info_parser_trace.failure_branch_offset = static_branch;
+            const u64 runtime_failure =
+                ss_info_parser_trace.target + (static_branch - SsInfoParserEntryOffset);
+            capture_file << ",\"ss_info_parser_failure\":{";
+            capture_file << "\"reason\":\"" << reason << '"';
+            capture_file << ",\"static_branch_offset\":";
+            WriteHex(capture_file, static_branch);
+            capture_file << ",\"runtime_offset\":";
+            WriteHex(capture_file, runtime_failure);
+            capture_file << ",\"observer_offset\":";
+            WriteHex(capture_file, site.offset);
+            capture_file << ",\"buffer_ptr\":";
+            WriteHex(capture_file, ss_info_parser_trace.input.data);
+            capture_file << ",\"buffer_length\":" << ss_info_parser_trace.input.length;
+            capture_file << ",\"ss_open_offset\":";
+            WriteHex(capture_file, ss_info_parser_trace.ss_open_offset);
+            capture_file << ",\"ss_close_offset\":";
+            WriteHex(capture_file, ss_info_parser_trace.ss_close_offset);
+            capture_file << ",\"parsed_text\":\"" << ReadGuestBytesEscaped(parsed_text, false, 128)
+                         << '"';
+            capture_file << ",\"strtol_value\":" << strtol_value;
+            capture_file << ",\"endptr_offset\":";
+            WriteHex(capture_file, endptr_offset);
+            capture_file << ",\"gameurl_index\":" << ss_info_parser_trace.raw_gameurl_index;
+            capture_file << '}';
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SS.PARSER FAIL] reason={} runtime_offset={:#x} "
+                     "buffer_ptr={:#x} buffer_length={} ss_open_offset={:#x} "
+                     "ss_close_offset={:#x} parsed_text={} strtol_value={} "
+                     "endptr_offset={:#x} gameurl_index={}",
+                     reason, runtime_failure, ss_info_parser_trace.input.data,
+                     ss_info_parser_trace.input.length, ss_info_parser_trace.ss_open_offset,
+                     ss_info_parser_trace.ss_close_offset,
+                     ReadGuestBytesEscaped(parsed_text, false, 128), strtol_value, endptr_offset,
+                     ss_info_parser_trace.raw_gameurl_index);
             break;
         }
         case TraceKind::SsInfoApiSearch: {
@@ -4732,11 +5123,29 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             const u32 language_index = ReadValue<u32>(language_index_pointer, 0);
             const u32 api_found_count = CountSsInfoApis(config);
             const u32 return_value = static_cast<u32>(registers->r14 & 0xFF);
+            if (!ss_info_parser_trace.active) {
+                ss_info_parser_trace = {
+                    .active = true,
+                    .frpg_net_man = latest_ss_info_frpg_net_man.load(std::memory_order_relaxed),
+                    .config = config,
+                    .call_site = ss_info_parser_call_runtime_offset,
+                    .target = ss_info_parser_target_runtime_offset,
+                    .gameurl_argument = gameurl_index_pointer,
+                    .language_argument = language_index_pointer,
+                    .raw_gameurl_index = gameurl_index,
+                    .language_index = language_index,
+                    .failure_reason = "unobserved_before_return",
+                };
+            }
+            ss_info_parser_trace.parser_return_seen = true;
+            ss_info_parser_trace.config = config;
             if (return_value == 0 && ss_info_parser_trace.failure_reason == "other") {
                 if (ss_info_parser_trace.ss_open_checked && !ss_info_parser_trace.ss_open_found) {
                     ss_info_parser_trace.failure_reason = "ss_open_missing";
                     ss_info_parser_trace.failure_branch_offset = 0x01EB6952;
-                } else if (!ss_info_parser_trace.ss_close_found) {
+                } else if (ss_info_parser_trace.ss_open_checked &&
+                           ss_info_parser_trace.ss_open_found &&
+                           !ss_info_parser_trace.ss_close_found) {
                     ss_info_parser_trace.failure_reason = "ss_close_missing";
                     ss_info_parser_trace.failure_branch_offset = 0x01EB69C6;
                 } else if (ss_info_parser_trace.ss_parse_checked &&
@@ -4847,7 +5256,6 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
                      return_value, ReadValue<s32>(config, 0x08), gameurl_index, gameurl_index,
                      language_index, api_found_count, config, snapshot.object,
                      snapshot.maintenance_flag);
-            ss_info_parser_trace.active = false;
             break;
         }
         case TraceKind::SsInfoCallbackResult: {
@@ -4895,6 +5303,36 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             capture_file << ",\"caller_offset\":";
             WriteHex(capture_file, return_address >= image_base ? return_address - image_base : 0);
             capture_file << '}';
+            const u32 call_result_al = static_cast<u32>(registers->rax & 0xFF);
+            const u64 call_config =
+                ss_info_parser_trace.config != 0 ? ss_info_parser_trace.config : config;
+            const u32 call_api_found_count = CountSsInfoApis(call_config);
+            capture_file << ",\"ss_info_parser_call_result\":{";
+            capture_file << "\"al\":" << call_result_al;
+            capture_file << ",\"success\":" << (parser_success ? "true" : "false");
+            capture_file << ",\"parser_return_seen\":"
+                         << (ss_info_parser_trace.parser_return_seen ? "true" : "false");
+            capture_file << ",\"ss\":" << ReadValue<s32>(call_config, 0x08);
+            capture_file << ",\"config\":";
+            WriteHex(capture_file, call_config);
+            capture_file << ",\"gameurl_index\":" << ReadValue<u32>(registers->rbp - 0x4CC, 0);
+            capture_file << ",\"api_found_count\":" << call_api_found_count;
+            capture_file << ",\"buffer_ptr\":";
+            WriteHex(capture_file, ss_info_parser_trace.input.data);
+            capture_file << ",\"buffer_length\":" << ss_info_parser_trace.input.length;
+            capture_file << ",\"call_site\":";
+            WriteHex(capture_file, ss_info_parser_trace.call_site);
+            capture_file << ",\"target\":";
+            WriteHex(capture_file, ss_info_parser_trace.target);
+            capture_file << '}';
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SS.PARSER CALL RESULT] al={} success={} ss={} config={:#x} "
+                     "gameurl_index={} api_found_count={} buffer_ptr={:#x} buffer_length={} "
+                     "parser_return_seen={}",
+                     call_result_al, parser_success, ReadValue<s32>(call_config, 0x08), call_config,
+                     ReadValue<u32>(registers->rbp - 0x4CC, 0), call_api_found_count,
+                     ss_info_parser_trace.input.data, ss_info_parser_trace.input.length,
+                     ss_info_parser_trace.parser_return_seen);
             LOG_INFO(Debug,
                      "[BLOODBORNE SS.INFO CALLBACK RESULT] parser_success={} frpg_net_man={:#x} "
                      "maintenance_flag={} config={:#x} ss={} gameurl_index={} "
@@ -4902,6 +5340,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
                      parser_success, frpg_net_man, snapshot.maintenance_flag, config, snapshot.ss,
                      ReadValue<u32>(registers->rbp - 0x4CC, 0), api_found_count, request_id,
                      api_type, res_kind);
+            ss_info_parser_trace.active = false;
             break;
         }
         case TraceKind::MaintenanceSource: {
@@ -4999,7 +5438,7 @@ bool VerifySites() {
     for (const auto& site : Sites) {
         // Runtime-located observers are experimental and are validated independently during
         // installation. A mismatch at one must not suppress any other observer.
-        if (IsRuntimeLocatedKind(site.kind)) {
+        if (IsIndependentlyLocatedKind(site.kind)) {
             continue;
         }
         if ((summon_build_host_placement_hook_installed && site.offset == SummonBuildEntryOffset) ||
@@ -5070,7 +5509,8 @@ void WriteImageStageDiagnostics(std::ostream& out,
                        locator.matches,
                        [](const MaintenanceLocatorMatch& match) { return match.context_valid; })
                 << ",\"matches\":[";
-            for (size_t match_index = 0; match_index < locator.matches.size(); ++match_index) {
+            const size_t stored_match_count = std::min<size_t>(locator.matches.size(), 5);
+            for (size_t match_index = 0; match_index < stored_match_count; ++match_index) {
                 const auto& match = locator.matches[match_index];
                 if (match_index != 0) {
                     out << ',';
@@ -5083,7 +5523,9 @@ void WriteImageStageDiagnostics(std::ostream& out,
                     << ",\"bytes\":\"" << match.bytes << "\",\"before\":\"" << match.before
                     << "\",\"after\":\"" << match.after << "\"}";
             }
-            out << "],\"selected_offset\":";
+            out << "],\"matches_truncated\":"
+                << (locator.matches.size() > stored_match_count ? "true" : "false")
+                << ",\"selected_offset\":";
             if (locator.selected_offset.has_value()) {
                 WriteHex(out, *locator.selected_offset);
             } else {
@@ -5836,6 +6278,87 @@ void InstallReverseEngineeringTrace() {
                      Sites[index].name, Sites[index].offset, locator->matches.size(),
                      RuntimeSites[index].offset, locator->pattern);
         }
+
+        const auto ss_info_anchor =
+            LocateSsInfoParserAnchor(final_stage->image_base, final_stage->image_size);
+        capture_file << "{\"type\":\"ss_info_anchor\",\"valid\":"
+                     << (ss_info_anchor.valid ? "true" : "false");
+        capture_file << ",\"test_offset\":";
+        WriteHex(capture_file, ss_info_anchor.test_offset);
+        capture_file << ",\"test_bytes\":\"" << ss_info_anchor.test_bytes << '"';
+        capture_file << ",\"static_call_offset\":";
+        WriteHex(capture_file, SsInfoParserCallStaticOffset);
+        capture_file << ",\"call_offset\":";
+        WriteHex(capture_file, ss_info_anchor.call_offset);
+        capture_file << ",\"call_bytes\":\"" << ss_info_anchor.call_bytes << '"';
+        capture_file << ",\"call_displacement\":" << ss_info_anchor.call_displacement;
+        capture_file << ",\"target_offset\":";
+        WriteHex(capture_file, ss_info_anchor.target_offset);
+        capture_file << ",\"static_target_offset\":";
+        WriteHex(capture_file, SsInfoParserEntryOffset);
+        capture_file << ",\"target_bytes\":\"" << ss_info_anchor.target_bytes << '"';
+        capture_file << ",\"success_offset\":";
+        WriteHex(capture_file, ss_info_anchor.success_offset);
+        capture_file << ",\"failure_offset\":";
+        WriteHex(capture_file, ss_info_anchor.failure_offset);
+        capture_file << ",\"sites\":[";
+        bool first_anchored_site = true;
+        if (ss_info_anchor.valid) {
+            ss_info_parser_call_runtime_offset = ss_info_anchor.call_offset;
+            ss_info_parser_target_runtime_offset = ss_info_anchor.target_offset;
+            for (size_t index = 0; index < Sites.size(); ++index) {
+                if (!IsSsInfoAnchoredKind(Sites[index].kind)) {
+                    continue;
+                }
+                const auto anchored_offset = GetSsInfoAnchoredOffset(Sites[index], ss_info_anchor);
+                const bool valid =
+                    anchored_offset.has_value() &&
+                    ValidateSsInfoAnchoredSite(Sites[index], final_stage->image_base,
+                                               final_stage->image_size, *anchored_offset);
+                if (!first_anchored_site) {
+                    capture_file << ',';
+                }
+                first_anchored_site = false;
+                capture_file << "{\"site\":\"" << Sites[index].name << "\",\"offset\":";
+                if (anchored_offset.has_value()) {
+                    WriteHex(capture_file, *anchored_offset);
+                } else {
+                    capture_file << "null";
+                }
+                capture_file << ",\"valid\":" << (valid ? "true" : "false") << ",\"bytes\":\"";
+                if (anchored_offset.has_value()) {
+                    capture_file << ReadDiagnosticBytes(
+                        final_stage->image_base, final_stage->image_size, *anchored_offset, 32);
+                } else {
+                    capture_file << "unavailable";
+                }
+                capture_file << "\"}";
+                if (!valid) {
+                    LOG_ERROR(Debug,
+                              "Bloodborne RE ss.info anchored observer {} skipped at {:#x}: "
+                              "local signature/context validation failed",
+                              Sites[index].name, anchored_offset.value_or(0));
+                    continue;
+                }
+                RuntimeSites[index].offset = *anchored_offset;
+                runtime_site_valid[index] = true;
+                ++verified_runtime_site_count;
+                LOG_INFO(Debug, "[BLOODBORNE SS.ANCHOR] site={} selected_offset={:#x} bytes={}",
+                         Sites[index].name, *anchored_offset,
+                         ReadDiagnosticBytes(final_stage->image_base, final_stage->image_size,
+                                             *anchored_offset, Sites[index].prologue_size));
+            }
+        }
+        capture_file << "]}\n";
+        capture_file.flush();
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SS.ANCHOR] valid={} test_offset={:#x} test_bytes={} "
+                 "call_offset={:#x} call_bytes={} displacement={:#x} target={:#x} "
+                 "success={:#x} failure={:#x}",
+                 ss_info_anchor.valid, ss_info_anchor.test_offset, ss_info_anchor.test_bytes,
+                 ss_info_anchor.call_offset, ss_info_anchor.call_bytes,
+                 ss_info_anchor.call_displacement, ss_info_anchor.target_offset,
+                 ss_info_anchor.success_offset, ss_info_anchor.failure_offset);
     }
     if (verified_runtime_site_count == 0) {
         LOG_ERROR(Debug,
@@ -5856,10 +6379,10 @@ void InstallReverseEngineeringTrace() {
     size_t maintenance_hook_count = 0;
     for (size_t index = 0; index < Sites.size(); ++index) {
         const auto& site = RuntimeSites[index];
-        if (IsRuntimeLocatedKind(site.kind) && !runtime_site_valid[index]) {
+        if (IsIndependentlyLocatedKind(site.kind) && !runtime_site_valid[index]) {
             continue;
         }
-        if (!IsRuntimeLocatedKind(site.kind) && !auxiliary_sites_valid) {
+        if (!IsIndependentlyLocatedKind(site.kind) && !auxiliary_sites_valid) {
             continue;
         }
         if ((summon_build_host_placement_hook_installed && site.offset == SummonBuildEntryOffset) ||
@@ -5880,7 +6403,7 @@ void InstallReverseEngineeringTrace() {
             continue;
         }
         ++hook_count;
-        runtime_hook_count += IsRuntimeLocatedKind(site.kind) ? 1 : 0;
+        runtime_hook_count += IsIndependentlyLocatedKind(site.kind) ? 1 : 0;
         maintenance_hook_count += site.kind == TraceKind::MaintenanceSource ? 1 : 0;
     }
 
