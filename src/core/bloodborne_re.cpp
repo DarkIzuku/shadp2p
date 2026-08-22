@@ -89,7 +89,8 @@ enum class TraceKind : u8 {
     HttpMessageSelection,
     FrpgMaintenanceFlagWrite,
     SsInfoParserExit,
-    SsInfoCallbackAfterParser,
+    SsInfoCallbackResult,
+    HttpMessageSink,
 };
 
 struct TraceSite {
@@ -203,6 +204,8 @@ constexpr u64 MaintenanceDispatchOffset = 0x01E894E1;
 constexpr u64 MaintenanceExtractedOffset = 0x01E7F9F2;
 constexpr u64 FrpgMaintenanceFlagOffset = 0x3E8;
 constexpr u64 FrpgConfigOffset = 0x18;
+constexpr u64 HttpHandlerStartOffset = 0x01E7F4C0;
+constexpr u64 HttpHandlerEndOffset = 0x01E89AD0;
 constexpr auto BloodborneApiNames = std::to_array<std::string_view>({
     "api_Login",
     "api_ServerTimeGet",
@@ -280,7 +283,7 @@ constexpr NativeCallSignature MaintenanceDispatchPostContext{
 constexpr bool IsRuntimeLocatedKind(TraceKind kind) {
     return kind == TraceKind::MaintenanceSource || kind == TraceKind::HttpMessageSelection ||
            kind == TraceKind::FrpgMaintenanceFlagWrite || kind == TraceKind::SsInfoParserExit ||
-           kind == TraceKind::SsInfoCallbackAfterParser;
+           kind == TraceKind::SsInfoCallbackResult || kind == TraceKind::HttpMessageSink;
 }
 
 constexpr NativeCallSignature Message4402PreContext{
@@ -358,8 +361,8 @@ constexpr NativeCallSignature FlagSetPostContext{
 constexpr NativeCallSignature ParserReturnPreContext{
     "SsInfo.Parser.Return.Pre",
     0,
-    {0x48, 0x8B, 0x01, 0x48, 0x3B, 0x45, 0xD0, 0x75},
-    8,
+    {0x48, 0x8B, 0x01, 0x48, 0x3B, 0x45, 0xD0, 0x75, 0x15},
+    9,
 };
 constexpr NativeCallSignature ParserReturnPostContext{
     "SsInfo.Parser.Return.Post",
@@ -367,17 +370,35 @@ constexpr NativeCallSignature ParserReturnPostContext{
     {0x5B, 0x41, 0x5C, 0x41, 0x5D, 0x41, 0x5E, 0x41, 0x5F, 0x5D, 0xC3},
     11,
 };
-constexpr NativeCallSignature ParserCallbackPreContext{
-    "SsInfo.Callback.AfterParser.Pre",
+constexpr NativeCallSignature ParserCallbackSuccessPreContext{
+    "SsInfo.Callback.Success.Pre",
     0,
-    {0xE8, 0xBA, 0xCB, 0x02, 0x00},
+    {0x84, 0xC0, 0x0F, 0x84, 0xBB, 0x00, 0x00, 0x00},
+    8,
+};
+constexpr NativeCallSignature ParserCallbackSuccessPostContext{
+    "SsInfo.Callback.Success.Post",
+    0,
+    {0x49, 0x8B, 0x47, 0x18, 0x83, 0x78, 0x08, 0x00},
+    8,
+};
+constexpr NativeCallSignature ParserCallbackFailurePreContext{
+    "SsInfo.Callback.Failure.Pre",
+    0,
+    {0x4D, 0x8B, 0x24, 0x24, 0xEB, 0x4E},
+    6,
+};
+constexpr NativeCallSignature ParserCallbackFailurePostContext{
+    "SsInfo.Callback.Failure.Post",
+    0,
+    {0x74, 0x27, 0x48, 0x89, 0xDF},
     5,
 };
-constexpr NativeCallSignature ParserCallbackPostContext{
-    "SsInfo.Callback.AfterParser.Post",
+constexpr NativeCallSignature HttpMessageSinkPostContext{
+    "Http.Message.Sink.Post",
     0,
-    {0x41, 0xC7, 0x87, 0xE4, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
-    11,
+    {0x89, 0xF3, 0x49, 0x89, 0xFE},
+    5,
 };
 
 constexpr auto CrossMapNativeCalls = std::to_array<NativeCallSignature>({
@@ -964,11 +985,21 @@ constexpr auto Sites = std::to_array<TraceSite>({
      TraceKind::SsInfoParserExit,
      {0x44, 0x88, 0xF0, 0x48, 0x81, 0xC4, 0x68, 0x07, 0x00, 0x00},
      10},
-    {"SsInfo.Callback.AfterParser",
-     0x01E89CA6,
-     TraceKind::SsInfoCallbackAfterParser,
-     {0x84, 0xC0, 0x0F, 0x84, 0xBB, 0x00, 0x00, 0x00},
-     8},
+    {"SsInfo.Callback.Success",
+     0x01E89CAE,
+     TraceKind::SsInfoCallbackResult,
+     {0x41, 0xC7, 0x87, 0xE4, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+     11},
+    {"SsInfo.Callback.Failure",
+     0x01E89D69,
+     TraceKind::SsInfoCallbackResult,
+     {0x49, 0x8B, 0x5F, 0x18, 0x48, 0x85, 0xDB},
+     7},
+    {"Http.Message.Sink",
+     0x01EA5F60,
+     TraceKind::HttpMessageSink,
+     {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x83, 0xEC, 0x40},
+     15},
 });
 
 auto RuntimeSites = Sites;
@@ -976,6 +1007,9 @@ std::array<std::atomic<u64>, Sites.size()> site_hits{};
 std::atomic<u64> event_sequence{};
 std::atomic<s32> observed_sos_area{-1};
 std::atomic<u64> frpg_maintenance_flag_write_sequence{};
+std::atomic<u32> latest_ss_info_request_id{};
+std::atomic<u32> latest_ss_info_api_index{38};
+std::atomic<u32> latest_ss_info_res_kind{};
 std::mutex capture_mutex;
 std::ofstream capture_file;
 std::filesystem::path capture_path;
@@ -1248,10 +1282,18 @@ bool IsRuntimeContextValid(const TraceSite& site, uintptr_t stage_image_base, u6
         return before(5, FlagSetPreContext) && after(FlagSetPostContext);
     }
     if (site.name == "SsInfo.Parser.Return") {
-        return before(8, ParserReturnPreContext) && after(ParserReturnPostContext);
+        return before(9, ParserReturnPreContext) && after(ParserReturnPostContext);
     }
-    if (site.name == "SsInfo.Callback.AfterParser") {
-        return before(5, ParserCallbackPreContext) && after(ParserCallbackPostContext);
+    if (site.name == "SsInfo.Callback.Success") {
+        return before(8, ParserCallbackSuccessPreContext) &&
+               after(ParserCallbackSuccessPostContext);
+    }
+    if (site.name == "SsInfo.Callback.Failure") {
+        return before(6, ParserCallbackFailurePreContext) &&
+               after(ParserCallbackFailurePostContext);
+    }
+    if (site.name == "Http.Message.Sink") {
+        return after(HttpMessageSinkPostContext);
     }
     return false;
 }
@@ -1407,6 +1449,51 @@ std::string_view GetBloodborneApiName(u32 api_index) {
     return api_index < BloodborneApiNames.size() ? BloodborneApiNames[api_index] : "unknown";
 }
 
+struct FrpgNetManSnapshot {
+    u64 object{};
+    u8 maintenance_flag{};
+    u64 config{};
+    u64 config_value_08{};
+    s32 ss{999};
+};
+
+FrpgNetManSnapshot ReadFrpgNetManSnapshot(u64 object) {
+    FrpgNetManSnapshot snapshot{
+        .object = object,
+        .maintenance_flag = ReadValue<u8>(object, FrpgMaintenanceFlagOffset),
+        .config = ReadValue<u64>(object, FrpgConfigOffset),
+    };
+    if (snapshot.config >= 0x10000) {
+        snapshot.config_value_08 = ReadValue<u64>(snapshot.config, 0x08);
+        snapshot.ss = static_cast<s32>(snapshot.config_value_08);
+    }
+    return snapshot;
+}
+
+u32 CountSsInfoApis(u64 config) {
+    u32 count{};
+    for (u32 api_index = 0; api_index < 37; ++api_index) {
+        if (ReadValue<u64>(config, 0x60 + api_index * 0x38) != 0) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+void WriteSsInfoApis(std::ostream& out, u64 config) {
+    out << "[";
+    for (u32 api_index = 0; api_index < 37; ++api_index) {
+        if (api_index != 0) {
+            out << ',';
+        }
+        const u64 length = ReadValue<u64>(config, 0x60 + api_index * 0x38);
+        out << "{\"index\":" << api_index << ",\"name\":\"" << GetBloodborneApiName(api_index)
+            << "\",\"present\":" << (length != 0 ? "true" : "false") << ",\"length\":" << length
+            << '}';
+    }
+    out << ']';
+}
+
 struct MaintenanceSourceRecord {
     u32 request_id{};
     u32 api_index{};
@@ -1415,6 +1502,7 @@ struct MaintenanceSourceRecord {
     u32 r14d{};
     u64 rcx{};
     bool is_maintenance{};
+    FrpgNetManSnapshot frpg{};
     u64 return_address{};
     u64 caller_offset{};
 };
@@ -1432,6 +1520,7 @@ MaintenanceSourceRecord ReadMaintenanceSource(const TraceSite& site,
         .stack_res_kind = ReadValue<u32>(registers.rsp, 0xD60),
         .r14d = static_cast<u32>(registers.r14),
         .rcx = registers.rcx,
+        .frpg = ReadFrpgNetManSnapshot(ReadValue<u64>(registers.rsp, 0x78)),
         .return_address = ReadValue<u64>(registers.rbp, sizeof(u64)),
     };
 
@@ -3339,8 +3428,16 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     u64 early_hit{};
     if (site.kind == TraceKind::MaintenanceSource) {
         maintenance_source = ReadMaintenanceSource(site, *registers);
+        if (site.name == "Http.ResKind.Extracted" && maintenance_source->api_index == 38) {
+            latest_ss_info_request_id.store(maintenance_source->request_id,
+                                            std::memory_order_relaxed);
+            latest_ss_info_api_index.store(maintenance_source->api_index,
+                                           std::memory_order_relaxed);
+            latest_ss_info_res_kind.store(maintenance_source->res_kind, std::memory_order_relaxed);
+        }
         early_hit = site_hits[tag].fetch_add(1, std::memory_order_relaxed) + 1;
-        if (!maintenance_source->is_maintenance && early_hit > 32) {
+        if (!maintenance_source->is_maintenance && maintenance_source->api_index != 38 &&
+            early_hit > 32) {
             return;
         }
     }
@@ -3375,6 +3472,24 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     }
     if (site.kind == TraceKind::SosValidityCode) {
         observed_sos_area.store(static_cast<s32>(registers->rax), std::memory_order_relaxed);
+    }
+    if (site.kind == TraceKind::HttpMessageSink) {
+        const u32 message_id = static_cast<u32>(registers->rsi);
+        const u64 return_address = ReadValue<u64>(registers->rsp, 0);
+        const u64 runtime_return_offset =
+            return_address >= image_base &&
+                    return_address - image_base < MemoryPatcher::g_eboot_image_size
+                ? return_address - image_base
+                : 0;
+        const s64 runtime_delta =
+            static_cast<s64>(site.offset) - static_cast<s64>(Sites[tag].offset);
+        const s64 static_return_offset = static_cast<s64>(runtime_return_offset) - runtime_delta;
+        const bool http_caller = static_return_offset >= static_cast<s64>(HttpHandlerStartOffset) &&
+                                 static_return_offset < static_cast<s64>(HttpHandlerEndOffset);
+        const bool tracked_message = message_id == 4401 || message_id == 4402 || message_id == 4403;
+        if (!http_caller && !tracked_message) {
+            return;
+        }
     }
     s32 responder_goods = -1;
     if (site.kind == TraceKind::ResponderBellAvailability) {
@@ -3924,6 +4039,45 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
                      return_address, caller_offset);
             break;
         }
+        case TraceKind::HttpMessageSink: {
+            const u32 message_id = static_cast<u32>(registers->rsi);
+            const auto snapshot = ReadFrpgNetManSnapshot(registers->rdi);
+            const u64 return_address = ReadValue<u64>(registers->rsp, 0);
+            const u64 runtime_caller_offset =
+                return_address >= image_base &&
+                        return_address - image_base < MemoryPatcher::g_eboot_image_size
+                    ? return_address - image_base
+                    : 0;
+            const s64 runtime_delta =
+                static_cast<s64>(site.offset) - static_cast<s64>(Sites[tag].offset);
+            const s64 static_caller_offset =
+                static_cast<s64>(runtime_caller_offset) - runtime_delta;
+            capture_file << ",\"http_message_sink\":{";
+            capture_file << "\"message_id\":" << message_id;
+            capture_file << ",\"frpg_net_man\":";
+            WriteHex(capture_file, snapshot.object);
+            capture_file << ",\"maintenance_flag\":" << static_cast<u32>(snapshot.maintenance_flag);
+            capture_file << ",\"frpg_config_18\":";
+            WriteHex(capture_file, snapshot.config);
+            capture_file << ",\"config_value_08\":";
+            WriteHex(capture_file, snapshot.config_value_08);
+            capture_file << ",\"ss\":" << snapshot.ss;
+            capture_file << ",\"return_address\":";
+            WriteHex(capture_file, return_address);
+            capture_file << ",\"runtime_caller_offset\":";
+            WriteHex(capture_file, runtime_caller_offset);
+            capture_file << ",\"static_caller_offset\":";
+            WriteHex(capture_file,
+                     static_caller_offset >= 0 ? static_cast<u64>(static_caller_offset) : 0);
+            capture_file << '}';
+            LOG_INFO(Debug,
+                     "[BLOODBORNE MESSAGE SINK] message_id={} caller_offset={:#x} "
+                     "static_caller_offset={:#x} frpg_net_man={:#x} maintenance_flag={} ss={}",
+                     message_id, runtime_caller_offset,
+                     static_caller_offset >= 0 ? static_cast<u64>(static_caller_offset) : 0,
+                     snapshot.object, snapshot.maintenance_flag, snapshot.ss);
+            break;
+        }
         case TraceKind::FrpgMaintenanceFlagWrite: {
             const bool is_set = site.name == "FrpgNetMan.MaintenanceFlag.Set";
             const u64 frpg_net_man = site.name == "FrpgNetMan.MaintenanceFlag.Initialize"
@@ -3972,21 +4126,28 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             const u64 language_index_pointer = ReadValue<u64>(registers->rbp - 0x3F0, 0);
             const u32 gameurl_index = ReadValue<u32>(gameurl_index_pointer, 0);
             const u32 language_index = ReadValue<u32>(language_index_pointer, 0);
-            u32 api_found_count{};
-            for (u32 api_index = 0; api_index < 37; ++api_index) {
-                if (ReadValue<u64>(config, 0x60 + api_index * 0x38) != 0) {
-                    ++api_found_count;
-                }
-            }
+            const u32 api_found_count = CountSsInfoApis(config);
+            const auto snapshot = ReadFrpgNetManSnapshot(ReadValue<u64>(registers->rbp - 8, 0));
             const u64 return_address = ReadValue<u64>(registers->rbp, sizeof(u64));
             capture_file << ",\"ss_info_parser_return\":{";
             capture_file << "\"return_value\":" << static_cast<u32>(registers->r14 & 0xFF);
+            capture_file << ",\"r14b\":" << static_cast<u32>(registers->r14 & 0xFF);
+            capture_file << ",\"al_before_epilogue\":" << static_cast<u32>(registers->rax & 0xFF);
             capture_file << ",\"ss\":" << ReadValue<s32>(config, 0x08);
             capture_file << ",\"gameurl_index\":" << gameurl_index;
             capture_file << ",\"language_index\":" << language_index;
             capture_file << ",\"api_found_count\":" << api_found_count;
+            capture_file << ",\"apis\":";
+            WriteSsInfoApis(capture_file, config);
             capture_file << ",\"config\":";
             WriteHex(capture_file, config);
+            capture_file << ",\"frpg_net_man\":";
+            WriteHex(capture_file, snapshot.object);
+            capture_file << ",\"maintenance_flag\":" << static_cast<u32>(snapshot.maintenance_flag);
+            capture_file << ",\"frpg_config_18\":";
+            WriteHex(capture_file, snapshot.config);
+            capture_file << ",\"frpg_config_value_08\":";
+            WriteHex(capture_file, snapshot.config_value_08);
             capture_file << ",\"config_898\":";
             WriteHex(capture_file, ReadValue<u32>(config, 0x898));
             capture_file << ",\"config_89c\":";
@@ -4000,49 +4161,65 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             capture_file << '}';
             LOG_INFO(Debug,
                      "[BLOODBORNE SS.INFO PARSER] return_value={} ss={} gameurl_index={} "
-                     "language_index={} api_found_count={} config={:#x}",
+                     "language_index={} api_found_count={} config={:#x} frpg_net_man={:#x} "
+                     "maintenance_flag={}",
                      static_cast<u32>(registers->r14 & 0xFF), ReadValue<s32>(config, 0x08),
-                     gameurl_index, language_index, api_found_count, config);
+                     gameurl_index, language_index, api_found_count, config, snapshot.object,
+                     snapshot.maintenance_flag);
             break;
         }
-        case TraceKind::SsInfoCallbackAfterParser: {
+        case TraceKind::SsInfoCallbackResult: {
             const u64 frpg_net_man = registers->r15;
-            const u64 config = ReadValue<u64>(frpg_net_man, FrpgConfigOffset);
-            const bool parser_success = static_cast<u8>(registers->rax) != 0;
+            const auto snapshot = ReadFrpgNetManSnapshot(frpg_net_man);
+            const u64 config = snapshot.config;
+            const bool parser_success = site.name == "SsInfo.Callback.Success";
+            const u64 response = ReadValue<u64>(registers->rbp - 0x4E0, 0);
+            const u32 request_id = latest_ss_info_request_id.load(std::memory_order_relaxed);
+            const u32 api_type = latest_ss_info_api_index.load(std::memory_order_relaxed);
+            const u32 res_kind = latest_ss_info_res_kind.load(std::memory_order_relaxed);
+            const u32 api_found_count = CountSsInfoApis(config);
             const u64 return_address = ReadValue<u64>(registers->rbp, sizeof(u64));
-            capture_file << ",\"ss_info_callback_after_parser\":{";
-            capture_file << "\"parser_return_value\":"
-                         << static_cast<u32>(static_cast<u8>(registers->rax));
+            capture_file << ",\"ss_info_callback_result\":{";
+            capture_file << "\"parser_success\":" << (parser_success ? "true" : "false");
             capture_file << ",\"transition\":\""
                          << (parser_success ? "success_config_retained"
                                             : "failure_will_destroy_config")
                          << '"';
             capture_file << ",\"frpg_net_man\":";
             WriteHex(capture_file, frpg_net_man);
-            capture_file << ",\"maintenance_flag\":"
-                         << static_cast<u32>(
-                                ReadValue<u8>(frpg_net_man, FrpgMaintenanceFlagOffset));
-            capture_file << ",\"config\":";
+            capture_file << ",\"maintenance_flag\":" << static_cast<u32>(snapshot.maintenance_flag);
+            capture_file << ",\"frpg_config_18\":";
             WriteHex(capture_file, config);
-            capture_file << ",\"ss\":" << ReadValue<s32>(config, 0x08);
+            capture_file << ",\"config_value_08\":";
+            WriteHex(capture_file, snapshot.config_value_08);
+            capture_file << ",\"ss\":" << snapshot.ss;
             capture_file << ",\"gameurl_index\":" << ReadValue<u32>(registers->rbp - 0x4CC, 0);
             capture_file << ",\"language_index\":" << ReadValue<u32>(registers->rbp - 0x4D0, 0);
+            capture_file << ",\"api_found_count\":" << api_found_count;
+            capture_file << ",\"request_id\":";
+            WriteHex(capture_file, request_id);
+            capture_file << ",\"api_type\":" << api_type;
+            capture_file << ",\"api_name\":\"" << GetBloodborneApiName(api_type) << '"';
+            capture_file << ",\"res_kind\":";
+            WriteHex(capture_file, res_kind);
+            capture_file << ",\"response\":";
+            WriteHex(capture_file, response);
             capture_file << ",\"response_status\":";
-            WriteHex(capture_file, ReadValue<u32>(registers->rsi, 0x08));
+            WriteHex(capture_file, ReadValue<u32>(response, 0x08));
             capture_file << ",\"response_flags\":";
-            WriteHex(capture_file, ReadValue<u32>(registers->rsi, 0x0C));
+            WriteHex(capture_file, ReadValue<u32>(response, 0x0C));
             capture_file << ",\"return_address\":";
             WriteHex(capture_file, return_address);
             capture_file << ",\"caller_offset\":";
             WriteHex(capture_file, return_address >= image_base ? return_address - image_base : 0);
             capture_file << '}';
             LOG_INFO(Debug,
-                     "[BLOODBORNE SS.INFO CALLBACK] parser_return_value={} transition={} "
-                     "frpg_net_man={:#x} maintenance_flag={} config={:#x} ss={} gameurl_index={}",
-                     static_cast<u32>(static_cast<u8>(registers->rax)),
-                     parser_success ? "success_config_retained" : "failure_will_destroy_config",
-                     frpg_net_man, ReadValue<u8>(frpg_net_man, FrpgMaintenanceFlagOffset), config,
-                     ReadValue<s32>(config, 0x08), ReadValue<u32>(registers->rbp - 0x4CC, 0));
+                     "[BLOODBORNE SS.INFO CALLBACK RESULT] parser_success={} frpg_net_man={:#x} "
+                     "maintenance_flag={} config={:#x} ss={} gameurl_index={} "
+                     "api_found_count={} request_id={:#x} api_type={} res_kind={:#x}",
+                     parser_success, frpg_net_man, snapshot.maintenance_flag, config, snapshot.ss,
+                     ReadValue<u32>(registers->rbp - 0x4CC, 0), api_found_count, request_id,
+                     api_type, res_kind);
             break;
         }
         case TraceKind::MaintenanceSource: {
@@ -4061,6 +4238,15 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             capture_file << ",\"r14d\":";
             WriteHex(capture_file, record.r14d);
             capture_file << ",\"is_maintenance\":" << (record.is_maintenance ? "true" : "false");
+            capture_file << ",\"frpg_net_man\":";
+            WriteHex(capture_file, record.frpg.object);
+            capture_file << ",\"maintenance_flag\":"
+                         << static_cast<u32>(record.frpg.maintenance_flag);
+            capture_file << ",\"frpg_config_18\":";
+            WriteHex(capture_file, record.frpg.config);
+            capture_file << ",\"config_value_08\":";
+            WriteHex(capture_file, record.frpg.config_value_08);
+            capture_file << ",\"ss\":" << record.frpg.ss;
             capture_file << ",\"rsp\":";
             WriteHex(capture_file, registers->rsp);
             capture_file << ",\"rbp\":";
@@ -4107,11 +4293,13 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
                 LOG_INFO(Debug,
                          "[BLOODBORNE MAINTENANCE RAW] site={} raw_hit={} request_id={:#x} "
                          "api_index={} api_name={} res_kind={:#x} stack_res_kind={:#x} rcx={:#x} "
-                         "r14d={:#x} return_address={:#x} caller_offset={:#x}",
+                         "r14d={:#x} frpg_net_man={:#x} maintenance_flag={} config={:#x} ss={} "
+                         "return_address={:#x} caller_offset={:#x}",
                          site.name, hit, record.request_id, record.api_index,
                          GetBloodborneApiName(record.api_index), record.res_kind,
-                         record.stack_res_kind, record.rcx, record.r14d, record.return_address,
-                         record.caller_offset);
+                         record.stack_res_kind, record.rcx, record.r14d, record.frpg.object,
+                         record.frpg.maintenance_flag, record.frpg.config, record.frpg.ss,
+                         record.return_address, record.caller_offset);
             }
         } else if (hit <= 8 || hit % 300 == 0) {
             LOG_INFO(Debug,

@@ -1447,13 +1447,32 @@ distinguished from the three direct stores.
 The parser entry is the offline label `0x01EB6860`; its single recovered caller
 is the `ss.info` completion callback at `0x01E89CA1`. The parser returns its
 validity result in `AL`: zero is failure and one is success. Its common return
-site copies `R14B` to `AL`. On the successful path, the callback retains the
-new `0x9C0`-byte configuration object and resets the retry counter. On failure,
-the next branch destroys that object and clears `FrpgNetMan+0x18`. The new
-observers are placed at the common parser return and immediately after the
-callback's parser call. They record the result, parsed `ss`, selected
-`gameurl` index, language index, populated API-string count, configuration
-fields used by the callback, and the ensuing success/failure transition.
+site is offline `0x01EB6E07`, runtime `0x01EB6B87`, and begins with the exact
+complete-instruction signature `44 88 F0 48 81 C4 68 07 00 00`: `mov al,r14b;
+add rsp,0x768`. The observer runs before either instruction is replayed, while
+the parser frame and `R14B` result remain intact. Its context requires the full
+preceding `mov/cmp/jne` sequence and the following `pop/ret` epilogue. It records
+the result, parsed `ss`, selected `gameurl` and language indexes, configuration
+fields, and a 37-entry name/presence/length list for the API strings.
+
+The callback's `test al,al; je` at runtime `0x01E89A26` is deliberately not
+hooked because the generic guest hook cannot relocate that relative branch.
+Instead, two independently located observers start on safe non-relative
+instructions: success at offline `0x01E89CAE` / runtime `0x01E89A2E`, and
+failure at offline `0x01E89D69` / runtime `0x01E89AE9`. The success point is
+the fall-through store that resets `FrpgNetMan+0x3E4`; the failure point is the
+branch target before it destroys the config and clears `FrpgNetMan+0x18`.
+Both record the config and maintenance snapshots, parser branch, selected
+indexes, API count, and the latest observed `ss.info` request/API/ResKind tuple.
+
+All three immediate message selectors remain observed, but they are no longer
+the only diagnostic boundary. Their common call at offline `0x01E894CD`
+resolves to function `0x01EA5F60`, whose runtime entry is `0x01EA5CE0` and
+whose first argument pair is `FrpgNetMan*` in `RDI` and message ID in `ESI`.
+An entry observer uses its 15-byte non-relative prologue and records 4401,
+4402, 4403, plus any other ID whose return address maps into the same HTTP
+handler. This distinguishes a missing selector hook from a genuinely different
+localized message path.
 
 The two maintenance observers now additionally emit their first 32 raw hits,
 even when neither `RCX` nor `R14D` is `0x100108`. After 32 executions they
