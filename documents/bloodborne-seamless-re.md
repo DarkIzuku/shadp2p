@@ -754,6 +754,21 @@ CUSA03173 01.09. They capture the API index and request ID when `ResKind`
 result kinds are discarded before the hit counter and produce no log entry.
 No seamless-coop or shadNet option is required for this trace.
 
+The extraction observer is installed at `0x01E7F9F2`, on the exact
+`mov dword ptr [rsp+0xD60], ecx` instruction (`89 8C 24 60 0D 00 00`). At that
+point the request ID is already at `[rsp+0xD58]`, the API index is already at
+`[rsp+0xD5C]`, and `ECX` is the `ResKind` that the intercepted instruction will
+store. The observer reads `ECX` before the hook replays the original instruction;
+it does not write guest registers or memory. The previous observer at
+`0x01E7F9F9` was removed because the loaded Windows image reported
+`74 3B C7 05 0B 0C 71` there instead of the eboot bytes
+`8A 84 24 64 0D 00 00`.
+
+The dispatch observer remains at `0x01E894E1`, protected by
+`41 81 FE 08 01 10 00` (`cmp r14d, 0x100108`). The extraction and dispatch
+observers validate independently. A mismatch skips and reports only that site;
+the capture remains active if at least one maintenance observer installs.
+
 For the two-client comparison, enable all three shadPS4 flags in both client
 processes:
 

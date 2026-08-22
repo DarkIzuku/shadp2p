@@ -195,7 +195,7 @@ constexpr u32 ResponderResumeMaxAttempts = 2;
 constexpr auto ResponderResumeRetryDelay = std::chrono::seconds{15};
 constexpr u32 MaintenanceResKind = 0x00100108;
 constexpr u64 MaintenanceDispatchOffset = 0x01E894E1;
-constexpr u64 MaintenanceExtractedOffset = 0x01E7F9F9;
+constexpr u64 MaintenanceExtractedOffset = 0x01E7F9F2;
 constexpr auto BloodborneApiNames = std::to_array<std::string_view>({
     "api_Login",
     "api_ServerTimeGet",
@@ -239,16 +239,18 @@ constexpr auto BloodborneApiNames = std::to_array<std::string_view>({
 });
 static_assert(BloodborneApiNames.size() == 39);
 
-constexpr auto MaintenanceSourceSignatures = std::to_array<NativeCallSignature>({
-    {"Http.Maintenance.Dispatch.Context",
-     0x01E894DA,
-     {0xC6, 0x87, 0xE8, 0x03, 0x00, 0x00, 0x00, 0x41, 0x81, 0xFE, 0x08, 0x01, 0x10, 0x00},
-     14},
-    {"Http.ResKind.StackStores",
-     0x01E7F9EA,
-     {0x44, 0x89, 0xBC, 0x24, 0x5C, 0x0D, 0x00, 0x00, 0x89, 0x8C, 0x24, 0x60, 0x0D, 0x00, 0x00},
-     15},
-});
+constexpr NativeCallSignature MaintenanceDispatchContext{
+    "Http.Maintenance.Dispatch.Context",
+    0x01E894DA,
+    {0xC6, 0x87, 0xE8, 0x03, 0x00, 0x00, 0x00},
+    7,
+};
+constexpr NativeCallSignature MaintenanceExtractedContext{
+    "Http.ResKind.ApiIndex.StackStore",
+    0x01E7F9EA,
+    {0x44, 0x89, 0xBC, 0x24, 0x5C, 0x0D, 0x00, 0x00},
+    8,
+};
 
 constexpr auto CrossMapNativeCalls = std::to_array<NativeCallSignature>({
     {"SetForcedSummonMap",
@@ -791,7 +793,7 @@ constexpr auto Sites = std::to_array<TraceSite>({
     {"Http.ResKind.Extracted",
      MaintenanceExtractedOffset,
      TraceKind::MaintenanceSource,
-     {0x8A, 0x84, 0x24, 0x64, 0x0D, 0x00, 0x00},
+     {0x89, 0x8C, 0x24, 0x60, 0x0D, 0x00, 0x00},
      7},
     {"Http.Maintenance.Dispatch",
      MaintenanceDispatchOffset,
@@ -1017,10 +1019,14 @@ struct MaintenanceSourceRecord {
 
 std::optional<MaintenanceSourceRecord> ReadMaintenanceSource(
     const TraceSite& site, const GuestRegisterSnapshot& registers) {
+    const bool extracted_site = site.offset == MaintenanceExtractedOffset;
     MaintenanceSourceRecord record{
         .request_id = ReadValue<u32>(registers.rsp, 0xD58),
         .api_index = ReadValue<u32>(registers.rsp, 0xD5C),
-        .res_kind = ReadValue<u32>(registers.rsp, 0xD60),
+        // The extracted hook runs immediately before the guest stores ECX at [RSP+0xD60].
+        // Reading ECX observes the exact value without changing the guest stack or registers.
+        .res_kind =
+            extracted_site ? static_cast<u32>(registers.rcx) : ReadValue<u32>(registers.rsp, 0xD60),
         .r14d = static_cast<u32>(registers.r14),
         .return_address = ReadValue<u64>(registers.rbp, sizeof(u64)),
     };
@@ -3483,11 +3489,11 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             const auto& record = *maintenance_source;
             LOG_INFO(Debug,
                      "[BLOODBORNE MAINTENANCE SOURCE] site={} request_id={:#x} api_index={} "
-                     "api_name={} res_kind={:#x} r14d={:#x} rsp={:#x} return_address={:#x} "
-                     "caller_offset={:#x}",
+                     "api_name={} res_kind={:#x} r14d={:#x} rsp={:#x} rbp={:#x} "
+                     "return_address={:#x} caller_offset={:#x}",
                      site.name, record.request_id, record.api_index,
                      GetBloodborneApiName(record.api_index), record.res_kind, record.r14d,
-                     registers->rsp, record.return_address, record.caller_offset);
+                     registers->rsp, registers->rbp, record.return_address, record.caller_offset);
         } else if (hit <= 8 || hit % 300 == 0) {
             LOG_INFO(Debug,
                      "Bloodborne RE entry {} hit={} rdi={:#x} rsi={:#x} rdx={:#x} capture={}",
@@ -3502,6 +3508,11 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
 bool VerifySites() {
     const auto image_size = MemoryPatcher::g_eboot_image_size;
     for (const auto& site : Sites) {
+        // The two maintenance observers are experimental and are validated independently during
+        // installation. A mismatch at one must not suppress the other observer.
+        if (site.kind == TraceKind::MaintenanceSource) {
+            continue;
+        }
         if ((summon_build_host_placement_hook_installed && site.offset == SummonBuildEntryOffset) ||
             (cross_map_guest_handoff_hook_installed && site.offset == CrossMapGuestHandoffOffset) ||
             (summon_reload_state_hook_installed &&
@@ -3525,25 +3536,45 @@ bool VerifySites() {
             return false;
         }
     }
-    for (const auto& signature : MaintenanceSourceSignatures) {
-        const auto expected =
-            std::span<const u8>{signature.prologue.data(), signature.prologue_size};
-        if (signature.offset > image_size || expected.size() > image_size - signature.offset) {
-            LOG_ERROR(Debug, "Bloodborne RE maintenance signature {} lies outside the eboot image",
-                      signature.name);
-            return false;
-        }
-        const auto actual = std::span<const u8>{
-            reinterpret_cast<const u8*>(image_base + signature.offset), expected.size()};
-        if (!std::ranges::equal(actual, expected)) {
-            LOG_ERROR(Debug,
-                      "Bloodborne RE maintenance signature mismatch at {} ({:#x}): expected={} "
-                      "actual={}",
-                      signature.name, signature.offset, BytesToHex(expected), BytesToHex(actual));
-            return false;
-        }
+    return true;
+}
+
+bool VerifyMaintenanceSignature(std::string_view site_name, const NativeCallSignature& signature) {
+    const auto expected = std::span<const u8>{signature.prologue.data(), signature.prologue_size};
+    const auto image_size = MemoryPatcher::g_eboot_image_size;
+    if (signature.offset > image_size || expected.size() > image_size - signature.offset) {
+        LOG_ERROR(Debug,
+                  "Bloodborne RE maintenance site {} skipped: signature {} lies outside the "
+                  "eboot image",
+                  site_name, signature.name);
+        return false;
+    }
+    const auto actual = std::span<const u8>{
+        reinterpret_cast<const u8*>(image_base + signature.offset), expected.size()};
+    if (!std::ranges::equal(actual, expected)) {
+        LOG_ERROR(Debug,
+                  "Bloodborne RE maintenance site {} skipped: signature mismatch at {} ({:#x}): "
+                  "expected={} actual={}",
+                  site_name, signature.name, signature.offset, BytesToHex(expected),
+                  BytesToHex(actual));
+        return false;
     }
     return true;
+}
+
+bool VerifyMaintenanceSite(const TraceSite& site) {
+    const NativeCallSignature hook_signature{
+        site.name,
+        site.offset,
+        site.prologue,
+        site.prologue_size,
+    };
+    if (!VerifyMaintenanceSignature(site.name, hook_signature)) {
+        return false;
+    }
+    const auto& context = site.offset == MaintenanceDispatchOffset ? MaintenanceDispatchContext
+                                                                   : MaintenanceExtractedContext;
+    return VerifyMaintenanceSignature(site.name, context);
 }
 
 } // namespace
@@ -4161,6 +4192,22 @@ void InstallReverseEngineeringTrace() {
         return;
     }
 
+    std::array<bool, Sites.size()> maintenance_site_valid{};
+    size_t verified_maintenance_site_count = 0;
+    for (size_t index = 0; index < Sites.size(); ++index) {
+        if (Sites[index].kind != TraceKind::MaintenanceSource) {
+            continue;
+        }
+        maintenance_site_valid[index] = VerifyMaintenanceSite(Sites[index]);
+        verified_maintenance_site_count += maintenance_site_valid[index] ? 1 : 0;
+    }
+    if (verified_maintenance_site_count == 0) {
+        LOG_ERROR(Debug,
+                  "Bloodborne RE trace was not installed: no maintenance observer passed its "
+                  "independent signatures");
+        return;
+    }
+
     const auto capture_dir =
         Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) / "bloodborne-re";
     std::error_code error;
@@ -4224,8 +4271,12 @@ void InstallReverseEngineeringTrace() {
     capture_file.flush();
 
     size_t hook_count = 0;
+    size_t maintenance_hook_count = 0;
     for (size_t index = 0; index < Sites.size(); ++index) {
         const auto& site = Sites[index];
+        if (site.kind == TraceKind::MaintenanceSource && !maintenance_site_valid[index]) {
+            continue;
+        }
         if ((summon_build_host_placement_hook_installed && site.offset == SummonBuildEntryOffset) ||
             (cross_map_guest_handoff_hook_installed && site.offset == CrossMapGuestHandoffOffset) ||
             (summon_reload_state_hook_installed &&
@@ -4244,11 +4295,22 @@ void InstallReverseEngineeringTrace() {
             continue;
         }
         ++hook_count;
+        maintenance_hook_count += site.kind == TraceKind::MaintenanceSource ? 1 : 0;
     }
 
-    installed = hook_count == Sites.size();
-    LOG_INFO(Debug, "Bloodborne RE trace installed {}/{} hooks; capture={}", hook_count,
-             Sites.size(), Common::FS::PathToUTF8String(capture_path));
+    installed = maintenance_hook_count != 0;
+    if (!installed) {
+        LOG_ERROR(Debug,
+                  "Bloodborne RE trace installed {}/{} hooks but no maintenance observer; "
+                  "capture={}",
+                  hook_count, Sites.size(), Common::FS::PathToUTF8String(capture_path));
+        return;
+    }
+    LOG_INFO(Debug,
+             "Bloodborne RE trace installed {}/{} hooks including {}/{} independently verified "
+             "maintenance observers; capture={}",
+             hook_count, Sites.size(), maintenance_hook_count, verified_maintenance_site_count,
+             Common::FS::PathToUTF8String(capture_path));
 }
 
 } // namespace Core::Bloodborne
