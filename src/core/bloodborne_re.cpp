@@ -85,6 +85,7 @@ enum class TraceKind : u8 {
     HealingFountainAvailability,
     ChairRespawnNotification,
     WorldStateValidation,
+    BloodMessFlow,
     MaintenanceSource,
     HttpMessageSelection,
     FrpgMaintenanceFlagWrite,
@@ -293,7 +294,8 @@ constexpr NativeCallSignature MaintenanceDispatchPostContext{
 };
 
 constexpr bool IsRuntimeLocatedKind(TraceKind kind) {
-    return kind == TraceKind::MaintenanceSource || kind == TraceKind::HttpMessageSelection ||
+    return kind == TraceKind::BloodMessFlow || kind == TraceKind::MaintenanceSource ||
+           kind == TraceKind::HttpMessageSelection ||
            kind == TraceKind::FrpgMaintenanceFlagWrite || kind == TraceKind::HttpMessageSink;
 }
 
@@ -307,6 +309,103 @@ constexpr bool IsSsInfoAnchoredKind(TraceKind kind) {
 constexpr bool IsIndependentlyLocatedKind(TraceKind kind) {
     return IsRuntimeLocatedKind(kind) || IsSsInfoAnchoredKind(kind);
 }
+
+constexpr NativeCallSignature BloodMessListInvalidPostContext{
+    "BloodMess.Parse.ListInvalid.Post",
+    0,
+    {0x83, 0x38, 0x06, 0x48, 0x8D, 0x0D, 0x40, 0xEB, 0x6B, 0x03},
+    10,
+};
+constexpr NativeCallSignature BloodMessParseBeginPreContext{
+    "BloodMess.Parse.Begin.Pre",
+    0,
+    {0x48, 0x83, 0xC1, 0x10, 0x4C, 0x8B, 0x21},
+    7,
+};
+constexpr NativeCallSignature BloodMessParseBeginPostContext{
+    "BloodMess.Parse.Begin.Post",
+    0,
+    {0x0F, 0x84, 0xC9, 0x09, 0x00, 0x00},
+    6,
+};
+constexpr NativeCallSignature BloodMessItemBeginPostContext{
+    "BloodMess.Parse.Item.Begin.Post",
+    0,
+    {0x48, 0xC7, 0x84, 0x24, 0x80, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    12,
+};
+constexpr NativeCallSignature BloodMessBloodDataSizePreContext{
+    "BloodMess.Validate.BloodDataSize.Pre",
+    0,
+    {0xE8, 0xCB, 0x51, 0x02, 0x00},
+    5,
+};
+constexpr NativeCallSignature BloodMessBloodDataSizePostContext{
+    "BloodMess.Validate.BloodDataSize.Post",
+    0,
+    {0x0F, 0x85, 0x38, 0x06, 0x00, 0x00},
+    6,
+};
+constexpr NativeCallSignature BloodMessShellDecodePreContext{
+    "BloodMess.Decode.MessShellInfo.Pre",
+    0,
+    {0xE8, 0xDB, 0x4E, 0x02, 0x00},
+    5,
+};
+constexpr NativeCallSignature BloodMessShellDecodePostContext{
+    "BloodMess.Decode.MessShellInfo.Post",
+    0,
+    {0x41, 0x83, 0x7D, 0x00, 0x07},
+    5,
+};
+constexpr NativeCallSignature BloodMessItemAppendPreContext{
+    "BloodMess.Parse.Item.Append.Pre",
+    0,
+    {0xE8, 0xE7, 0x6C, 0x02, 0x00},
+    5,
+};
+constexpr NativeCallSignature BloodMessItemAppendPostContext{
+    "BloodMess.Parse.Item.Append.Post",
+    0,
+    {0x48, 0x8B, 0xBC, 0x24, 0xD8, 0x11, 0x00, 0x00, 0x48, 0x85, 0xFF},
+    11,
+};
+constexpr NativeCallSignature BloodMessParseResultPreContext{
+    "BloodMess.Parse.Result.Pre",
+    0,
+    {0x49, 0x83, 0xC5, 0x20, 0x4D, 0x39, 0xEC, 0x0F, 0x85, 0x56, 0xF6, 0xFF, 0xFF},
+    13,
+};
+constexpr NativeCallSignature BloodMessParseResultPostContext{
+    "BloodMess.Parse.Result.Post",
+    0,
+    {0x0F, 0x95, 0xC1, 0x48, 0x0F, 0xBA, 0xE0, 0x20},
+    8,
+};
+constexpr NativeCallSignature BloodMessConsumerDispatchPreContext{
+    "BloodMess.Consumer.Dispatch.Pre",
+    0,
+    {0x48, 0x8B, 0x7B, 0x50, 0x48, 0x85, 0xFF, 0x0F, 0x84, 0x65, 0x4D, 0x00, 0x00},
+    13,
+};
+constexpr NativeCallSignature BloodMessConsumerDispatchPostContext{
+    "BloodMess.Consumer.Dispatch.Post",
+    0,
+    {0x48, 0x8D, 0xB4, 0x24, 0x38, 0x11, 0x00, 0x00},
+    8,
+};
+constexpr NativeCallSignature BloodMessConsumerReturnPreContext{
+    "BloodMess.Consumer.Return.Pre",
+    0,
+    {0x48, 0x8D, 0xB4, 0x24, 0x38, 0x11, 0x00, 0x00, 0xFF, 0x50, 0x10},
+    11,
+};
+constexpr NativeCallSignature BloodMessConsumerReturnPostContext{
+    "BloodMess.Consumer.Return.Post",
+    0,
+    {0x48, 0x89, 0x8C, 0x24, 0xD0, 0x12, 0x00, 0x00},
+    8,
+};
 
 constexpr NativeCallSignature Message4402PreContext{
     "Http.Message.Select.4402.Pre",
@@ -1057,6 +1156,54 @@ constexpr auto Sites = std::to_array<TraceSite>({
      {0x44, 0x89, 0xE1, 0x41, 0x88, 0xC4},
      6},
 
+    {"BloodMess.Parse.ListInvalid",
+     0x01E816BF,
+     TraceKind::BloodMessFlow,
+     {0x8A, 0x1A, 0x80, 0xCB, 0x01, 0x88, 0x1A},
+     7},
+    {"BloodMess.Parse.Begin",
+     0x01E84063,
+     TraceKind::BloodMessFlow,
+     {0x4C, 0x89, 0x64, 0x24, 0x58, 0x4D, 0x39, 0xE5},
+     8},
+    {"BloodMess.Parse.Item.Begin",
+     0x01E84090,
+     TraceKind::BloodMessFlow,
+     {0x4C, 0x89, 0xAC, 0x24, 0x88, 0x04, 0x00, 0x00, 0x4C, 0x89, 0xB4, 0x24, 0x90, 0x04, 0x00,
+      0x00},
+     16},
+    {"BloodMess.Validate.BloodDataSize",
+     0x01E84395,
+     TraceKind::BloodMessFlow,
+     {0x48, 0x81, 0xBC, 0x24, 0xF8, 0x12, 0x00, 0x00, 0x98, 0x00, 0x00, 0x00},
+     12},
+    {"BloodMess.Decode.MessShellInfo",
+     0x01E84685,
+     TraceKind::BloodMessFlow,
+     {0x48, 0xC7, 0x84, 0x24, 0x30, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+     12},
+    {"BloodMess.Parse.Item.Append",
+     0x01E84989,
+     TraceKind::BloodMessFlow,
+     {0x48, 0x8B, 0x44, 0x24, 0x70, 0x48, 0x89, 0x84, 0x24, 0xD0, 0x11, 0x00, 0x00},
+     13},
+    {"BloodMess.Parse.Result",
+     0x01E84A3A,
+     TraceKind::BloodMessFlow,
+     {0x48, 0x8B, 0x84, 0x24, 0x60, 0x0D, 0x00, 0x00, 0xA9, 0x00, 0x00, 0xFF, 0xFF},
+     13},
+    {"BloodMess.Consumer.Dispatch",
+     0x01E84AE3,
+     TraceKind::BloodMessFlow,
+     {0x48, 0x8B, 0x44, 0x24, 0x78, 0x4C, 0x8D, 0xB0, 0x10, 0x02, 0x00, 0x00, 0x48, 0x8B, 0x07},
+     15},
+    {"BloodMess.Consumer.Return",
+     0x01E84AFD,
+     TraceKind::BloodMessFlow,
+     {0x48, 0x8B, 0x84, 0x24, 0x70, 0x13, 0x00, 0x00, 0x48, 0x8B, 0x8C, 0x24, 0x78, 0x13, 0x00,
+      0x00},
+     16},
+
     {"Http.ResKind.Extracted",
      MaintenanceExtractedOffset,
      TraceKind::MaintenanceSource,
@@ -1447,6 +1594,37 @@ bool IsRuntimeContextValid(const TraceSite& site, uintptr_t stage_image_base, u6
         return MatchesRuntimeBytes(stage_image_base, stage_image_size,
                                    candidate_offset + site.prologue_size, signature);
     };
+    if (site.name == "BloodMess.Parse.ListInvalid") {
+        return after(BloodMessListInvalidPostContext);
+    }
+    if (site.name == "BloodMess.Parse.Begin") {
+        return before(7, BloodMessParseBeginPreContext) && after(BloodMessParseBeginPostContext);
+    }
+    if (site.name == "BloodMess.Parse.Item.Begin") {
+        return after(BloodMessItemBeginPostContext);
+    }
+    if (site.name == "BloodMess.Validate.BloodDataSize") {
+        return before(5, BloodMessBloodDataSizePreContext) &&
+               after(BloodMessBloodDataSizePostContext);
+    }
+    if (site.name == "BloodMess.Decode.MessShellInfo") {
+        return before(5, BloodMessShellDecodePreContext) && after(BloodMessShellDecodePostContext);
+    }
+    if (site.name == "BloodMess.Parse.Item.Append") {
+        return before(5, BloodMessItemAppendPreContext) && after(BloodMessItemAppendPostContext);
+    }
+    if (site.name == "BloodMess.Parse.Result") {
+        return before(13, BloodMessParseResultPreContext) &&
+               after(BloodMessParseResultPostContext);
+    }
+    if (site.name == "BloodMess.Consumer.Dispatch") {
+        return before(13, BloodMessConsumerDispatchPreContext) &&
+               after(BloodMessConsumerDispatchPostContext);
+    }
+    if (site.name == "BloodMess.Consumer.Return") {
+        return before(11, BloodMessConsumerReturnPreContext) &&
+               after(BloodMessConsumerReturnPostContext);
+    }
     if (site.name == "Http.ResKind.Extracted") {
         return before(15, MaintenanceExtractedRequestContext) &&
                before(8, MaintenanceExtractedContext) && after(MaintenanceExtractedPostContext);
@@ -1939,6 +2117,22 @@ struct SsInfoParserTraceContext {
 };
 
 thread_local SsInfoParserTraceContext ss_info_parser_trace{};
+
+struct BloodMessParserTraceContext {
+    bool active{};
+    u32 request_id{};
+    u64 list_begin{};
+    u64 list_end{};
+    u64 declared_count{};
+    u64 current_index{};
+    u64 appended_count{};
+    u64 callback_object{};
+    u64 callback_target{};
+    u64 callback_target_runtime_offset{};
+    u64 callback_target_static_offset{};
+};
+
+thread_local BloodMessParserTraceContext blood_mess_parser_trace{};
 
 bool IsSsInfoParserFailureHit(const TraceSite& site, const GuestRegisterSnapshot& registers) {
     if (site.name == "SsInfo.Parser.FailSsCloseNull") {
@@ -3865,6 +4059,224 @@ void WriteWorldStateValidation(std::ostream& out, const TraceSite& site,
     out << '}';
 }
 
+void WriteBloodMessFlow(std::ostream& out, const TraceSite& site,
+                        const GuestRegisterSnapshot& registers) {
+    constexpr u64 JsonNodeStride = 0x20;
+    constexpr u64 ParsedItemStride = 0x30;
+    constexpr u64 RequiredBloodDataSize = 0x98;
+    constexpr u64 StaticConsumerDispatchOffset = 0x01E84AE3;
+    const u64 request_id = ReadValue<u32>(registers.rsp, 0xD58);
+
+    out << ",\"blood_mess\":{";
+    out << "\"request_id\":";
+    WriteHex(out, request_id);
+
+    if (site.name == "BloodMess.Parse.ListInvalid") {
+        blood_mess_parser_trace = {
+            .active = true,
+            .request_id = static_cast<u32>(request_id),
+        };
+        out << ",\"event\":\"BloodMess.Parse.Result\"";
+        out << ",\"success\":false";
+        out << ",\"reason\":\"blood_mess_list_not_array\"";
+        out << ",\"list_node\":";
+        WriteHex(out, registers.rax);
+        out << ",\"list_node_type\":" << ReadValue<u32>(registers.rax, 0);
+        out << ",\"parser_error_flag_before\":"
+            << static_cast<u32>(ReadValue<u8>(registers.rdx, 0));
+    } else if (site.name == "BloodMess.Parse.Begin") {
+        u64 declared_count{};
+        const bool range_valid =
+            registers.r12 >= registers.r13 &&
+            (registers.r12 - registers.r13) % JsonNodeStride == 0;
+        if (range_valid) {
+            declared_count = (registers.r12 - registers.r13) / JsonNodeStride;
+        }
+        blood_mess_parser_trace = {
+            .active = true,
+            .request_id = static_cast<u32>(request_id),
+            .list_begin = registers.r13,
+            .list_end = registers.r12,
+            .declared_count = declared_count,
+        };
+        out << ",\"event\":\"BloodMess.Parse.Begin\"";
+        out << ",\"response_list_begin\":";
+        WriteHex(out, registers.r13);
+        out << ",\"response_list_end\":";
+        WriteHex(out, registers.r12);
+        out << ",\"range_valid\":" << (range_valid ? "true" : "false");
+        out << ",\"declared_count\":" << declared_count;
+        out << ",\"parser_error_flag\":"
+            << static_cast<u32>(ReadValue<u8>(registers.rsp, 0xD64));
+    } else if (site.name == "BloodMess.Parse.Item.Begin") {
+        const bool index_valid =
+            blood_mess_parser_trace.active &&
+            registers.r13 >= blood_mess_parser_trace.list_begin &&
+            (registers.r13 - blood_mess_parser_trace.list_begin) % JsonNodeStride == 0;
+        const u64 index = index_valid
+                              ? (registers.r13 - blood_mess_parser_trace.list_begin) / JsonNodeStride
+                              : std::numeric_limits<u64>::max();
+        blood_mess_parser_trace.current_index = index;
+        out << ",\"event\":\"BloodMess.Parse.Item.Begin\"";
+        out << ",\"index\":";
+        if (index_valid) {
+            out << index;
+        } else {
+            out << "null";
+        }
+        out << ",\"json_node\":";
+        WriteHex(out, registers.r13);
+        const u32 node_type = ReadValue<u32>(registers.r13, 0);
+        out << ",\"json_node_type\":" << node_type;
+        out << ",\"object_valid\":" << (node_type == 7 ? "true" : "false");
+    } else if (site.name == "BloodMess.Validate.BloodDataSize") {
+        const u64 allocation_offset = ReadValue<u64>(registers.rsp, 0x12D8);
+        const u64 allocation_base = ReadValue<u64>(registers.rsp, 0x12F0);
+        const u64 data_pointer =
+            allocation_offset != 0 &&
+                    allocation_base <= std::numeric_limits<u64>::max() - allocation_offset
+                ? allocation_base + allocation_offset
+                : 0;
+        const u64 data_size = ReadValue<u64>(registers.rsp, 0x12F8);
+        const GuestStringSnapshot blood_data{
+            .data = data_pointer,
+            .length = data_size,
+            .readable = data_size <= 0x100000 &&
+                        HasMemoryAccess(data_pointer, data_size, MemoryProt::CpuRead),
+        };
+        out << ",\"event\":\"BloodMess.Validate\"";
+        out << ",\"index\":" << blood_mess_parser_trace.current_index;
+        out << ",\"condition\":\"blood_data_size_eq_0x98\"";
+        out << ",\"required_size\":" << RequiredBloodDataSize;
+        out << ",\"blood_data_pointer\":";
+        WriteHex(out, data_pointer);
+        out << ",\"blood_data_size\":" << data_size;
+        out << ",\"result\":\""
+            << (data_size == RequiredBloodDataSize ? "accept" : "reject") << '\"';
+        out << ",\"blood_data_first_64_hex\":\""
+            << ReadGuestBytesHex(blood_data, false, 64) << '\"';
+        out << ",\"blood_data_fnv1a64\":";
+        WriteHex(out, HashGuestStringFnv1a64(blood_data).value_or(0));
+    } else if (site.name == "BloodMess.Decode.MessShellInfo") {
+        const u64 allocation_offset = ReadValue<u64>(registers.rsp, 0x11E0);
+        const u64 allocation_base = ReadValue<u64>(registers.rsp, 0x11F8);
+        const u64 shell_pointer =
+            allocation_offset != 0 &&
+                    allocation_base <= std::numeric_limits<u64>::max() - allocation_offset
+                ? allocation_base + allocation_offset
+                : 0;
+        const u64 shell_size = ReadValue<u64>(registers.rsp, 0x1200);
+        const GuestStringSnapshot shell_data{
+            .data = shell_pointer,
+            .length = shell_size,
+            .readable = shell_size <= 0x100000 &&
+                        HasMemoryAccess(shell_pointer, shell_size, MemoryProt::CpuRead),
+        };
+        out << ",\"event\":\"BloodMess.Decode.MessShellInfo\"";
+        out << ",\"index\":" << blood_mess_parser_trace.current_index;
+        out << ",\"shell_data_pointer\":";
+        WriteHex(out, shell_pointer);
+        out << ",\"shell_data_size\":" << shell_size;
+        out << ",\"shell_data_first_64_hex\":\""
+            << ReadGuestBytesHex(shell_data, false, 64) << '\"';
+        out << ",\"shell_data_fnv1a64\":";
+        WriteHex(out, HashGuestStringFnv1a64(shell_data).value_or(0));
+    } else if (site.name == "BloodMess.Parse.Item.Append") {
+        const u64 item = registers.rsp + 0x1370;
+        const u64 blood_data_pointer = ReadValue<u64>(item, 0x10);
+        const u32 blood_data_size = ReadValue<u32>(item, 0x18);
+        const u64 shell_data_pointer = ReadValue<u64>(item, 0x20);
+        const u32 shell_data_size = ReadValue<u32>(item, 0x28);
+        const u64 parsed_begin = ReadValue<u64>(registers.rsp, 0x1150);
+        const u64 parsed_end = ReadValue<u64>(registers.rsp, 0x1158);
+        const bool parsed_range_valid =
+            parsed_end >= parsed_begin && (parsed_end - parsed_begin) % ParsedItemStride == 0;
+        blood_mess_parser_trace.appended_count =
+            parsed_range_valid ? (parsed_end - parsed_begin) / ParsedItemStride : 0;
+        out << ",\"event\":\"BloodMess.Parse.Item\"";
+        out << ",\"index\":" << blood_mess_parser_trace.current_index;
+        out << ",\"message_id\":";
+        WriteHex(out, ReadValue<u64>(item, 0));
+        out << ",\"evaluate_plus\":" << ReadValue<u16>(item, 0x08);
+        out << ",\"evaluate_minus\":" << ReadValue<u16>(item, 0x0A);
+        out << ",\"blood_data_pointer\":";
+        WriteHex(out, blood_data_pointer);
+        out << ",\"blood_data_size\":" << blood_data_size;
+        out << ",\"blood_data_version\":" << ReadValue<u32>(item, 0x1C);
+        out << ",\"shell_data_pointer\":";
+        WriteHex(out, shell_data_pointer);
+        out << ",\"shell_data_size\":" << shell_data_size;
+        out << ",\"shell_data_version\":" << ReadValue<u32>(item, 0x2C);
+        out << ",\"parsed_count_after_append\":" << blood_mess_parser_trace.appended_count;
+        out << ",\"owner_chara_area_position\":null";
+        out << ",\"opaque_location\":\"BloodData\"";
+    } else if (site.name == "BloodMess.Parse.Result") {
+        const u64 parsed_begin = ReadValue<u64>(registers.rsp, 0x1150);
+        const u64 parsed_end = ReadValue<u64>(registers.rsp, 0x1158);
+        const bool parsed_range_valid =
+            parsed_end >= parsed_begin && (parsed_end - parsed_begin) % ParsedItemStride == 0;
+        const u64 parsed_count =
+            parsed_range_valid ? (parsed_end - parsed_begin) / ParsedItemStride : 0;
+        blood_mess_parser_trace.appended_count = parsed_count;
+        const u32 parser_error_flag = ReadValue<u8>(registers.rsp, 0xD64);
+        const u32 res_kind = ReadValue<u32>(registers.rsp, 0xD60);
+        out << ",\"event\":\"BloodMess.Parse.Result\"";
+        out << ",\"declared_count\":" << blood_mess_parser_trace.declared_count;
+        out << ",\"parsed_count\":" << parsed_count;
+        out << ",\"parsed_range_valid\":" << (parsed_range_valid ? "true" : "false");
+        out << ",\"parser_error_flag\":" << parser_error_flag;
+        out << ",\"res_kind\":";
+        WriteHex(out, res_kind);
+        out << ",\"success\":"
+            << (parser_error_flag == 0 && res_kind == 0 ? "true" : "false");
+    } else if (site.name == "BloodMess.Consumer.Dispatch") {
+        const u64 callback_object = registers.rdi;
+        const u64 callback_vtable = ReadValue<u64>(callback_object, 0);
+        const u64 callback_target = ReadValue<u64>(callback_vtable, 0x10);
+        const u64 runtime_target_offset =
+            callback_target >= image_base &&
+                    callback_target - image_base < MemoryPatcher::g_eboot_image_size
+                ? callback_target - image_base
+                : 0;
+        const s64 runtime_delta =
+            static_cast<s64>(site.offset) - static_cast<s64>(StaticConsumerDispatchOffset);
+        const s64 static_target_offset = static_cast<s64>(runtime_target_offset) - runtime_delta;
+        blood_mess_parser_trace.callback_object = callback_object;
+        blood_mess_parser_trace.callback_target = callback_target;
+        blood_mess_parser_trace.callback_target_runtime_offset = runtime_target_offset;
+        blood_mess_parser_trace.callback_target_static_offset =
+            static_target_offset >= 0 ? static_cast<u64>(static_target_offset) : 0;
+        out << ",\"event\":\"BloodMess.Consumer.Dispatch\"";
+        out << ",\"parsed_count\":" << blood_mess_parser_trace.appended_count;
+        out << ",\"response_object\":";
+        WriteHex(out, registers.rsp + 0x1138);
+        out << ",\"callback_object\":";
+        WriteHex(out, callback_object);
+        out << ",\"callback_vtable\":";
+        WriteHex(out, callback_vtable);
+        out << ",\"callback_target\":";
+        WriteHex(out, callback_target);
+        out << ",\"callback_target_runtime_offset\":";
+        WriteHex(out, runtime_target_offset);
+        out << ",\"callback_target_static_offset\":";
+        WriteHex(out, blood_mess_parser_trace.callback_target_static_offset);
+    } else if (site.name == "BloodMess.Consumer.Return") {
+        out << ",\"event\":\"BloodMess.Consumer.Return\"";
+        out << ",\"callback_object\":";
+        WriteHex(out, blood_mess_parser_trace.callback_object);
+        out << ",\"callback_target\":";
+        WriteHex(out, blood_mess_parser_trace.callback_target);
+        out << ",\"callback_target_runtime_offset\":";
+        WriteHex(out, blood_mess_parser_trace.callback_target_runtime_offset);
+        out << ",\"callback_target_static_offset\":";
+        WriteHex(out, blood_mess_parser_trace.callback_target_static_offset);
+        out << ",\"return_rax\":";
+        WriteHex(out, registers.rax);
+        blood_mess_parser_trace.active = false;
+    }
+    out << '}';
+}
+
 void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (tag >= Sites.size() || registers == nullptr) {
         return;
@@ -3911,6 +4323,13 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     }
     if (site.kind == TraceKind::SsInfoBufferAssembly &&
         latest_ss_info_api_index.load(std::memory_order_relaxed) != 38) {
+        return;
+    }
+    if (site.kind == TraceKind::BloodMessFlow &&
+        (site.name == "BloodMess.Parse.Result" ||
+         site.name == "BloodMess.Consumer.Dispatch" ||
+         site.name == "BloodMess.Consumer.Return") &&
+        !blood_mess_parser_trace.active) {
         return;
     }
     if (site.kind == TraceKind::SsInfoParserCall &&
@@ -4018,6 +4437,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         site.kind == TraceKind::SsInfoApiSearch || site.kind == TraceKind::SsInfoParserExit;
     const u64 dense_capture_limit =
         site.kind == TraceKind::ActionFlags || site.kind == TraceKind::GoodsParamLookup ? 2048
+        : site.kind == TraceKind::BloodMessFlow                                         ? 512
         : ss_info_step                                                                  ? 256
                                                                                         : 64;
     if (site.kind != TraceKind::MaintenanceSource && hit > dense_capture_limit && hit % 300 != 0) {
@@ -5343,6 +5763,9 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             ss_info_parser_trace.active = false;
             break;
         }
+        case TraceKind::BloodMessFlow:
+            WriteBloodMessFlow(capture_file, site, *registers);
+            break;
         case TraceKind::MaintenanceSource: {
             const auto& record = *maintenance_source;
             capture_file << ",\"maintenance_source\":{";
@@ -6424,3 +6847,4 @@ void InstallReverseEngineeringTrace() {
 }
 
 } // namespace Core::Bloodborne
+
