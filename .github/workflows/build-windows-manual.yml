@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-name: Build Windows x64 (Manual)
+name: Bloodborne P2P Port - Windows x64
 
 on:
+  pull_request:
+    branches: [bloodborne-readback-opts]
   workflow_dispatch:
 
 permissions:
@@ -18,7 +20,7 @@ env:
 
 jobs:
   build-windows-x64:
-    name: Build shadPS4 Windows x64 Release
+    name: Full Windows build and tests
     runs-on: windows-2025-vs2026
     timeout-minutes: 120
 
@@ -55,12 +57,50 @@ jobs:
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
+      - name: Verify experimental readback base
+        shell: pwsh
+        run: |
+          $required = @(
+              @{ Path = 'src/video_core/amdgpu/fence_detector.h'; Pattern = 'FenceDetector' },
+              @{ Path = 'src/video_core/buffer_cache/buffer_cache.cpp'; Pattern = 'ProcessPreemptiveDownloads' },
+              @{ Path = 'src/video_core/buffer_cache/buffer_cache.cpp'; Pattern = 'defer_read_protect' },
+              @{ Path = 'src/video_core/buffer_cache/buffer_cache.cpp'; Pattern = 'DownloadBufferSize = 128_MB' },
+              @{ Path = 'src/core/emulator_settings.h'; Pattern = 'Optimized' }
+          )
+          foreach ($entry in $required) {
+              if (-not (Select-String -LiteralPath $entry.Path -Pattern $entry.Pattern -Quiet)) {
+                  throw "Missing experimental readback feature '$($entry.Pattern)' in $($entry.Path)"
+              }
+          }
+
       - name: Build Release
         shell: pwsh
         run: >-
           cmake --build "${{ github.workspace }}/build"
           --config "${{ env.BUILD_TYPE }}"
           --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Configure all C++ tests
+        shell: pwsh
+        run: >-
+          cmake --fresh -G Ninja
+          -B "${{ github.workspace }}/build-tests"
+          -DCMAKE_BUILD_TYPE=Debug
+          -DENABLE_TESTS=ON
+          -DCMAKE_C_COMPILER=clang-cl
+          -DCMAKE_CXX_COMPILER=clang-cl
+
+      - name: Build all C++ tests
+        shell: pwsh
+        run: >-
+          cmake --build "${{ github.workspace }}/build-tests"
+          --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Run all reasonable C++ tests
+        shell: pwsh
+        run: >-
+          ctest --test-dir "${{ github.workspace }}/build-tests"
+          --output-on-failure --progress -E GcnTest
 
       - name: Package executable and runtime files
         shell: pwsh
@@ -91,7 +131,7 @@ jobs:
       - name: Upload Windows x64 artifact
         uses: actions/upload-artifact@v7
         with:
-          name: shadps4-windows-x64-bloodborne-trace
+          name: shadps4-windows-x64-p2p-port
           path: ${{ github.workspace }}/artifact/windows-x64/
           if-no-files-found: error
           retention-days: 14

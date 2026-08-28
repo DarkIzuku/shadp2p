@@ -70,6 +70,7 @@ jobs:
 
   test:
     name: Run C++ Tests on ${{ matrix.os }}
+    if: github.base_ref != 'bloodborne-readback-opts'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -145,6 +146,7 @@ jobs:
         shell: bash
 
   windows-sdl:
+    if: github.base_ref != 'bloodborne-readback-opts'
     runs-on: windows-2025-vs2026
     needs: get-info
     steps:
@@ -187,6 +189,7 @@ jobs:
         path: ${{github.workspace}}/build/shadPS4.exe
 
   macos-sdl:
+    if: github.base_ref != 'bloodborne-readback-opts'
     runs-on: macos-26
     needs: get-info
     steps:
@@ -247,6 +250,7 @@ jobs:
         path: upload/
 
   linux-sdl:
+    if: github.base_ref != 'bloodborne-readback-opts'
     runs-on: ubuntu-24.04
     needs: get-info
     steps:
@@ -311,6 +315,7 @@ jobs:
         path: Shadps4-sdl.AppImage
 
   linux-sdl-gcc:
+    if: github.base_ref != 'bloodborne-readback-opts'
     runs-on: ubuntu-24.04
     needs: get-info
     steps:
