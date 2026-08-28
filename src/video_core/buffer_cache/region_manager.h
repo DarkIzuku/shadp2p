@@ -100,8 +100,7 @@ public:
         if constexpr (type == Type::CPU) {
             UpdateProtection<!enable, false>();
         } else {
-            const auto mode =
-                static_cast<GpuReadbacksMode>(EmulatorSettings.GetReadbacksMode());
+            const auto mode = static_cast<GpuReadbacksMode>(EmulatorSettings.GetReadbacksMode());
             if (mode == GpuReadbacksMode::Precise || mode == GpuReadbacksMode::Optimized) {
                 UpdateProtection<enable, true>();
             }

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+SPDX-License-Identifier: GPL-2.0-or-later
+-->
+
 # Bloodborne readback optimizations (experimental)
 
 This branch ports the readback optimization path from upstream shadPS4 pull request

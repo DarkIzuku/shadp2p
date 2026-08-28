@@ -119,13 +119,13 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         size != 0 && PageManager::GetPageAddr(device_addr + size - 1) == page_addr;
     if (UseReadbackOptimizations() && fits_single_page &&
         preemptive_downloads.Intersects(page_addr, TRACKER_BYTES_PER_PAGE)) {
-        preemptive_downloads.ForEachInRange(
-            page_addr, TRACKER_BYTES_PER_PAGE,
-            [&](VAddr, VAddr, const PreemptiveDownload& download) {
-                scheduler.Wait(download.done_tick);
-                memory->TryWriteBacking(std::bit_cast<u8*>(download.device_addr), download.staging,
-                                        download.size);
-            });
+        preemptive_downloads.ForEachInRange(page_addr, TRACKER_BYTES_PER_PAGE,
+                                            [&](VAddr, VAddr, const PreemptiveDownload& download) {
+                                                scheduler.Wait(download.done_tick);
+                                                memory->TryWriteBacking(
+                                                    std::bit_cast<u8*>(download.device_addr),
+                                                    download.staging, download.size);
+                                            });
         preemptive_downloads.Subtract(page_addr, TRACKER_BYTES_PER_PAGE);
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, is_write);
     } else {
@@ -142,8 +142,8 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             for (const auto& copy : copies) {
                 const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
                 const u64 dst_offset = copy.dstOffset - offset;
-                memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr),
-                                        download + dst_offset, copy.size);
+                memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
+                                        copy.size);
             }
             memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, is_write);
         };
@@ -623,15 +623,14 @@ void BufferCache::ProcessPreemptiveDownloads() {
     if (!UseReadbackOptimizations()) {
         return;
     }
-    preemptive_downloads.ForEach(
-        [this](VAddr, VAddr, const PreemptiveDownload& download) {
-            if (!scheduler.IsFree(download.done_tick)) {
-                return false;
-            }
-            memory->TryWriteBacking(std::bit_cast<u8*>(download.device_addr), download.staging,
-                                    download.size);
-            return true;
-        });
+    preemptive_downloads.ForEach([this](VAddr, VAddr, const PreemptiveDownload& download) {
+        if (!scheduler.IsFree(download.done_tick)) {
+            return false;
+        }
+        memory->TryWriteBacking(std::bit_cast<u8*>(download.device_addr), download.staging,
+                                download.size);
+        return true;
+    });
 }
 
 void BufferCache::Register(BufferId buffer_id) {
@@ -839,7 +838,7 @@ void BufferCache::CommitPendingGpuRanges() {
             }
             const Buffer& buffer = slot_buffers[buffer_id];
             const VAddr start_addr = std::max(page_addr, begin);
-            const VAddr end_addr = std::min(page_addr + TRACKER_BYTES_PER_PAGE, end);
+            const VAddr end_addr = std::min<VAddr>(page_addr + TRACKER_BYTES_PER_PAGE, end);
             const u32 size = static_cast<u32>(end_addr - start_addr);
             preemptive_copies[buffer_id].emplace_back(buffer.Offset(start_addr), total_size_bytes,
                                                       size);
@@ -863,8 +862,8 @@ void BufferCache::CommitPendingGpuRanges() {
     download_buffer.Commit();
     const u64 done_tick = scheduler.CurrentTick();
     for (auto it = preemptive_copies.begin(); it != preemptive_copies.end(); ++it) {
-        const BufferId buffer_id = it.key();
-        auto& copies = it.value();
+        const BufferId buffer_id = it->first;
+        auto& copies = it->second;
         const Buffer& buffer = slot_buffers[buffer_id];
         for (auto& copy : copies) {
             const VAddr start_addr = buffer.CpuAddr() + copy.srcOffset;

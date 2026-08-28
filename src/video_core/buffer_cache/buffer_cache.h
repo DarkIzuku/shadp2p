@@ -3,8 +3,8 @@
 
 #pragma once
 
+#include <boost/container/flat_map.hpp>
 #include <boost/container/small_vector.hpp>
-#include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
@@ -243,7 +243,7 @@ private:
     };
     SplitRangeMap<PreemptiveDownload> preemptive_downloads;
     using BufferCopies = boost::container::small_vector<vk::BufferCopy, 8>;
-    tsl::robin_map<BufferId, BufferCopies> preemptive_copies;
+    boost::container::flat_map<BufferId, BufferCopies> preemptive_copies;
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
 };
