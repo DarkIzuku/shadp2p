@@ -398,7 +398,12 @@ void Rasterizer::OnSubmit() {
     }
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
+    buffer_cache.ProcessPreemptiveDownloads();
     buffer_cache.RunGarbageCollector();
+}
+
+void Rasterizer::CommitPendingGpuRanges() {
+    buffer_cache.CommitPendingGpuRanges();
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
