@@ -1060,6 +1060,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
 )
 
 set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
+               src/video_core/amdgpu/fence_detector.h
                src/video_core/amdgpu/liverpool.cpp
                src/video_core/amdgpu/liverpool.h
                src/video_core/amdgpu/pixel_format.cpp

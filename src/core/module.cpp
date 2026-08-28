@@ -216,11 +216,6 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             if (elf_pheader[i].p_flags & PF_EXEC) {
                 PrePatchInstructions(segment_addr, segment_file_size);
                 executable_segments.emplace_back(segment_addr, segment_file_size);
-                if (name == "eboot.bin") {
-                    Bloodborne::RecordReverseEngineeringImageStage("after_prepatch_instructions",
-                                                                   base_virtual_addr, base_size,
-                                                                   segment_addr, segment_file_size);
-                }
             }
 #endif
             break;
@@ -338,15 +333,6 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
     }
 #endif
 
-#ifdef ARCH_X86_64
-    if (name == "eboot.bin") {
-        for (const auto& [segment_addr, segment_size] : executable_segments) {
-            Bloodborne::RecordReverseEngineeringImageStage(
-                "after_static_red_zone", base_virtual_addr, base_size, segment_addr, segment_size);
-        }
-    }
-#endif
-
     const VAddr entry_addr = base_virtual_addr + elf.GetElfEntry();
     LOG_INFO(Core_Linker, "program entry addr ..........: {:#018x}", entry_addr);
 
@@ -356,18 +342,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             MemoryPatcher::g_eboot_image_size = base_size;
             MemoryPatcher::OnGameLoaded();
 #ifdef ARCH_X86_64
-            for (const auto& [segment_addr, segment_size] : executable_segments) {
-                Bloodborne::RecordReverseEngineeringImageStage("after_memory_patcher",
-                                                               base_virtual_addr, base_size,
-                                                               segment_addr, segment_size);
-            }
             Bloodborne::InstallSeamlessCoopPatches();
-            for (const auto& [segment_addr, segment_size] : executable_segments) {
-                Bloodborne::RecordReverseEngineeringImageStage("before_trace_install",
-                                                               base_virtual_addr, base_size,
-                                                               segment_addr, segment_size);
-            }
-            Bloodborne::InstallReverseEngineeringTrace();
 #endif
         }
     }

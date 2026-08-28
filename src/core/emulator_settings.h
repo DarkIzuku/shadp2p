@@ -36,6 +36,9 @@ enum GpuReadbacksMode : int {
     Disabled,
     Relaxed,
     Precise,
+    // Uses fence-delayed page protection and preemptive downloads. Keep this value appended so
+    // existing per-game settings retain their Disabled/Relaxed/Precise meaning.
+    Optimized,
 };
 
 // Windows static guest red-zone protection

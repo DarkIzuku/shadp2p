@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <boost/container/flat_map.hpp>
 #include <boost/container/small_vector.hpp>
+
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
@@ -90,6 +92,11 @@ public:
         return slot_buffers[id];
     }
 
+    /// Retrieves GPU-modified ranges not yet committed at a detected guest CPU fence.
+    [[nodiscard]] RangeSet& GetPendingGpuModifiedRanges() {
+        return gpu_modified_ranges_pending;
+    }
+
     /// Retrieves a utility buffer optimized for specified memory usage.
     StreamBuffer& GetUtilityBuffer(MemoryUsage usage) noexcept {
         if (usage == MemoryUsage::Stream) {
@@ -146,14 +153,20 @@ public:
     /// Processes the fault buffer.
     void ProcessFaultBuffer();
 
+    /// Processes ready preemptive downloads not consumed by the guest.
+    void ProcessPreemptiveDownloads();
+
     /// Synchronizes all buffers in the specified range.
-    void SynchronizeBuffersInRange(VAddr device_addr, u64 size);
+    void SynchronizeBuffersInRange(VAddr device_addr, u64 size, bool is_written = false);
 
     /// Synchronizes all buffers neede for DMA.
     void SynchronizeDmaBuffers();
 
     /// Runs the garbage collector.
     void RunGarbageCollector();
+
+    /// Commits GPU-modified ranges accumulated before a detected guest CPU fence.
+    void CommitPendingGpuRanges();
 
 private:
     template <typename Func>
@@ -219,6 +232,18 @@ private:
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
+    RangeSet gpu_modified_ranges_pending;
+    struct PreemptiveDownload {
+        VAddr device_addr;
+        u64 size;
+        u8* staging;
+        u64 done_tick;
+
+        auto operator<=>(const PreemptiveDownload&) const = default;
+    };
+    SplitRangeMap<PreemptiveDownload> preemptive_downloads;
+    using BufferCopies = boost::container::small_vector<vk::BufferCopy, 8>;
+    boost::container::flat_map<BufferId, BufferCopies> preemptive_copies;
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
 };
