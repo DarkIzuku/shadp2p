@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -245,10 +246,24 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
     }
     while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
         auto& watch = previous_watches[wait_cursor];
-        if (!scheduler->IsFree(watch.tick) && !allow_wait) {
+        const bool blocked = !scheduler->IsFree(watch.tick);
+        if (blocked && !allow_wait) {
             return false;
         }
+        auto wait_begin = std::chrono::steady_clock::time_point{};
+        if (measure_reuse_waits) {
+            wait_begin = std::chrono::steady_clock::now();
+        }
         scheduler->Wait(watch.tick);
+        const u64 wait_us = measure_reuse_waits
+                                ? static_cast<u64>(
+                                      std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - wait_begin)
+                                          .count())
+                                : 0;
+        if (reuse_callback) {
+            reuse_callback(watch.tick, blocked, wait_us);
+        }
         wait_bound = watch.upper_bound;
         ++wait_cursor;
     }

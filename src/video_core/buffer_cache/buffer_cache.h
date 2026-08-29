@@ -12,6 +12,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/buffer_cache/readback_performance.h"
 #include "video_core/multi_level_page_table.h"
 
 namespace AmdGpu {
@@ -154,7 +155,7 @@ public:
     void ProcessFaultBuffer();
 
     /// Processes ready preemptive downloads not consumed by the guest.
-    void ProcessPreemptiveDownloads();
+    void ProcessPreemptiveDownloads(u64 completed_through_tick = 0);
 
     /// Synchronizes all buffers in the specified range.
     void SynchronizeBuffersInRange(VAddr device_addr, u64 size, bool is_written = false);
@@ -166,7 +167,7 @@ public:
     void RunGarbageCollector();
 
     /// Commits GPU-modified ranges accumulated before a detected guest CPU fence.
-    void CommitPendingGpuRanges();
+    void CommitPendingGpuRanges(bool detected_fence = false);
 
 private:
     template <typename Func>
@@ -184,6 +185,9 @@ private:
 
     template <bool async>
     void DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write);
+
+    bool CommitPendingGpuRangesLegacy();
+    void ReportReadbackState();
 
     [[nodiscard]] OverlapResult ResolveOverlaps(VAddr device_addr, u32 wanted_size);
 
@@ -246,6 +250,7 @@ private:
     boost::container::flat_map<BufferId, BufferCopies> preemptive_copies;
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
+    ReadbackPerformance readback_performance;
 };
 
 } // namespace VideoCore

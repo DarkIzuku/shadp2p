@@ -402,8 +402,8 @@ void Rasterizer::OnSubmit() {
     buffer_cache.RunGarbageCollector();
 }
 
-void Rasterizer::CommitPendingGpuRanges() {
-    buffer_cache.CommitPendingGpuRanges();
+void Rasterizer::CommitPendingGpuRanges(bool detected_fence) {
+    buffer_cache.CommitPendingGpuRanges(detected_fence);
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {

@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-name: Bloodborne P2P Port - Windows x64
+name: Bloodborne Optimized v2 - Windows x64
 
 on:
   pull_request:
-    branches: [bloodborne-readback-opts]
+    branches: [bloodborne-readback-p2p-port]
   workflow_dispatch:
 
 permissions:
@@ -65,7 +65,11 @@ jobs:
               @{ Path = 'src/video_core/buffer_cache/buffer_cache.cpp'; Pattern = 'ProcessPreemptiveDownloads' },
               @{ Path = 'src/video_core/buffer_cache/buffer_cache.cpp'; Pattern = 'defer_read_protect' },
               @{ Path = 'src/video_core/buffer_cache/buffer_cache.cpp'; Pattern = 'DownloadBufferSize = 128_MB' },
-              @{ Path = 'src/core/emulator_settings.h'; Pattern = 'Optimized' }
+              @{ Path = 'src/core/emulator_settings.h'; Pattern = 'Optimized' },
+              @{ Path = 'src/video_core/buffer_cache/readback_optimizer.h'; Pattern = 'PreemptivePagePolicy' },
+              @{ Path = 'src/video_core/buffer_cache/readback_performance.cpp'; Pattern = 'SHADPS4_READBACK_PERF_TRACE' },
+              @{ Path = 'src/video_core/buffer_cache/buffer_cache.cpp'; Pattern = 'UseOptimizedReadbacksV2' },
+              @{ Path = 'src/core/libraries/network/p2p_port_config.cpp'; Pattern = 'P2PPort' }
           )
           foreach ($entry in $required) {
               if (-not (Select-String -LiteralPath $entry.Path -Pattern $entry.Pattern -Quiet)) {
@@ -131,7 +135,7 @@ jobs:
       - name: Upload Windows x64 artifact
         uses: actions/upload-artifact@v7
         with:
-          name: shadps4-windows-x64-p2p-port
+          name: shadps4-windows-x64-optimized-v2
           path: ${{ github.workspace }}/artifact/windows-x64/
           if-no-files-found: error
           retention-days: 14

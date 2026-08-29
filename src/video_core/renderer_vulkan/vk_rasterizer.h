@@ -69,7 +69,7 @@ public:
     u64 Flush();
     void Finish();
     void OnSubmit();
-    void CommitPendingGpuRanges();
+    void CommitPendingGpuRanges(bool detected_fence = false);
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
