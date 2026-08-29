@@ -13,6 +13,12 @@ set(TEST_TARGETS
     shadps4_settings_test
     shadps4_ngs2_test
     shadps4_gcn_test
+    shadps4_p2p_test
+)
+
+set(P2P_TEST_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/network/p2p_port_config.cpp
+    network/test_p2p_port_config.cpp
 )
 
 set(SETTINGS_TEST_SOURCES
@@ -35,6 +41,7 @@ set(SETTINGS_TEST_SOURCES
 
     # Tests
     test_emulator_settings.cpp
+    test_p2p_settings.cpp
     # Windows static guest red-zone protection
     test_windows_guest_red_zone_protection_settings.cpp
 )
@@ -160,6 +167,7 @@ set(GCN_TEST_SOURCES
 add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})
 add_executable(shadps4_ngs2_test ${NGS2_TEST_SOURCES})
 add_executable(shadps4_gcn_test ${GCN_TEST_SOURCES})
+add_executable(shadps4_p2p_test ${P2P_TEST_SOURCES})
 
 foreach(t ${TEST_TARGETS})
     target_include_directories(${t} PRIVATE
@@ -198,6 +206,10 @@ target_link_libraries(shadps4_gcn_test PRIVATE
     SDL3::SDL3
     spdlog::spdlog
     half::half
+)
+target_link_libraries(shadps4_p2p_test PRIVATE
+    GTest::gtest_main
+    fmt::fmt
 )
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR

@@ -217,6 +217,8 @@ struct GeneralSettings {
     Setting<std::string> shadnet_webapi_server{"http://srv.shadps4.net:31315"};
     Setting<std::string> signaling_info{};
     Setting<bool> enable_upnp{true};
+    Setting<u32> p2p_port{0};
+    Setting<u32> p2p_port_range_end{0};
 
     // return a vector of override descriptors (runtime, but tiny)
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -241,7 +243,10 @@ struct GeneralSettings {
             make_override<GeneralSettings>("shadnet_webapi_server",
                                            &GeneralSettings::shadnet_webapi_server),
             make_override<GeneralSettings>("signaling_info", &GeneralSettings::signaling_info),
-            make_override<GeneralSettings>("enable_upnp", &GeneralSettings::enable_upnp)};
+            make_override<GeneralSettings>("enable_upnp", &GeneralSettings::enable_upnp),
+            make_override<GeneralSettings>("p2p_port", &GeneralSettings::p2p_port),
+            make_override<GeneralSettings>("p2p_port_range_end",
+                                           &GeneralSettings::p2p_port_range_end)};
     }
 };
 
@@ -252,7 +257,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_
                                    trophy_notification_side, connected_to_network,
                                    discord_rpc_enabled, show_fps_counter, console_language,
                                    big_picture_scale, shadnet_server, shadnet_webapi_server,
-                                   signaling_info, enable_upnp)
+                                   signaling_info, enable_upnp, p2p_port, p2p_port_range_end)
 
 // -------------------------------
 // Log settings
@@ -688,6 +693,8 @@ public:
     SETTING_FORWARD(m_general, ShadNetWebApiServer, shadnet_webapi_server)
     SETTING_FORWARD(m_general, SignalingInfo, signaling_info)
     SETTING_FORWARD_BOOL(m_general, UPnPEnabled, enable_upnp)
+    SETTING_FORWARD(m_general, P2PPort, p2p_port)
+    SETTING_FORWARD(m_general, P2PPortRangeEnd, p2p_port_range_end)
 
     // Log settings
     SETTING_FORWARD_BOOL(m_log, LogAppend, append)

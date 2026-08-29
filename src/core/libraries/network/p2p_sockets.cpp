@@ -9,7 +9,6 @@
 #include <deque>
 #include <limits>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 #ifdef __linux__
@@ -22,10 +21,12 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/network/net_util.h"
 #include "net.h"
 #include "net_error.h"
+#include "p2p_port_config.h"
 
 namespace Libraries::Net {
 
@@ -76,6 +77,14 @@ bool IsRetryableSocketError(int error) {
     return error == WSAEWOULDBLOCK || error == WSAEINTR;
 #else
     return error == EAGAIN || error == EWOULDBLOCK || error == EINTR;
+#endif
+}
+
+bool IsPortUnavailableSocketError(int error) {
+#ifdef _WIN32
+    return error == WSAEADDRINUSE;
+#else
+    return error == EADDRINUSE;
 #endif
 }
 
@@ -162,61 +171,75 @@ public:
             return true;
         }
 
-        host_socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (!IsValidSocket(host_socket)) {
-            LOG_ERROR(Lib_Net, "P2P transport socket() failed error={}", LastSocketError());
+        const char* legacy_environment = std::getenv("SHADPS4_P2P_PORT");
+        P2PPortConfig port_config{};
+        std::string config_error;
+        if (!ResolveP2PPortConfig(EmulatorSettings.GetP2PPort(),
+                                  EmulatorSettings.GetP2PPortRangeEnd(),
+                                  legacy_environment != nullptr ? legacy_environment : "",
+                                  &port_config, &config_error)) {
+            LOG_ERROR(Lib_Net, "[P2P] {}", config_error);
             return false;
         }
 
-        int one = 1;
-        (void)::setsockopt(host_socket, SOL_SOCKET, SO_REUSEADDR,
-                           reinterpret_cast<const char*>(&one), sizeof(one));
-        if (!SetSocketNonBlocking(host_socket)) {
-            LOG_ERROR(Lib_Net, "P2P transport failed to make socket nonblocking error={}",
-                      LastSocketError());
-            CloseSocket(host_socket);
-            return false;
+        if (port_config.IsAutomatic()) {
+            LOG_INFO(Lib_Net, "[P2P] configured port=auto");
+        } else if (port_config.IsRange()) {
+            LOG_INFO(Lib_Net, "[P2P] configured range={}-{}", port_config.first, port_config.last);
+        } else {
+            LOG_INFO(Lib_Net, "[P2P] configured port={}", port_config.first);
         }
 
-        u16 requested_port = 0;
-        if (const char* env = std::getenv("SHADPS4_P2P_PORT"); env != nullptr && *env != '\0') {
-            char* end = nullptr;
-            const long parsed = std::strtol(env, &end, 10);
-            if (end == env || *end != '\0' || parsed < 1 || parsed > 65535) {
-                LOG_ERROR(Lib_Net, "Invalid SHADPS4_P2P_PORT='{}'", env);
-                CloseSocket(host_socket);
-                return false;
+        const auto bind_port = [this](u16 requested_port) -> P2PBindAttempt {
+            net_socket candidate = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (!IsValidSocket(candidate)) {
+                return {P2PBindStatus::FatalError, 0, LastSocketError()};
             }
-            requested_port = static_cast<u16>(parsed);
-        }
 
-        sockaddr_in bind_addr{};
-        bind_addr.sin_family = AF_INET;
-        bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-        bind_addr.sin_port = htons(requested_port);
+            if (!SetSocketNonBlocking(candidate)) {
+                const int error = LastSocketError();
+                CloseSocket(candidate);
+                return {P2PBindStatus::FatalError, 0, error};
+            }
 
-        if (::bind(host_socket, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) < 0) {
-            LOG_ERROR(Lib_Net, "P2P transport bind(port={}) failed error={}", requested_port,
-                      LastSocketError());
-            CloseSocket(host_socket);
+            sockaddr_in bind_addr{};
+            bind_addr.sin_family = AF_INET;
+            bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            bind_addr.sin_port = htons(requested_port);
+            if (::bind(candidate, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) < 0) {
+                const int error = LastSocketError();
+                CloseSocket(candidate);
+                return {IsPortUnavailableSocketError(error) ? P2PBindStatus::PortUnavailable
+                                                            : P2PBindStatus::FatalError,
+                        0, error};
+            }
+
+            sockaddr_in actual{};
+            socklen_t actual_len = sizeof(actual);
+            if (::getsockname(candidate, reinterpret_cast<sockaddr*>(&actual), &actual_len) < 0) {
+                const int error = LastSocketError();
+                CloseSocket(candidate);
+                return {P2PBindStatus::FatalError, 0, error};
+            }
+
+            host_socket = candidate;
+            return {P2PBindStatus::Success, ntohs(actual.sin_port), 0};
+        };
+
+        const auto selection =
+            SelectP2PPhysicalPort(port_config, bind_port, [](u16 busy_port, u16 next_port) {
+                LOG_WARNING(Lib_Net, "[P2P] port {} busy, trying {}", busy_port, next_port);
+            });
+        if (!selection.success) {
+            LOG_ERROR(Lib_Net, "[P2P] {}", selection.message);
             return false;
         }
 
-        sockaddr_in actual{};
-        socklen_t actual_len = sizeof(actual);
-        if (::getsockname(host_socket, reinterpret_cast<sockaddr*>(&actual), &actual_len) < 0) {
-            LOG_ERROR(Lib_Net, "P2P transport getsockname() failed error={}", LastSocketError());
-            CloseSocket(host_socket);
-            return false;
-        }
-
-        physical_port = ntohs(actual.sin_port);
+        physical_port = selection.selected_port;
         running.store(true, std::memory_order_release);
         receive_thread = std::thread(&P2PTransport::ReceiveMain, this);
 
-        LOG_INFO(Lib_Net,
-                 "P2P transport ready: UDP physical_port={} (set SHADPS4_P2P_PORT to pin it)",
-                 physical_port);
+        LOG_INFO(Lib_Net, "[P2P] selected physical_port={}", physical_port);
         return true;
 #endif
     }
@@ -251,39 +274,17 @@ public:
         }
 
         std::lock_guard lock(registry_mutex);
-        u16 vport = requested_vport_nbo;
-
-        // vport 0 acts as an ephemeral request in this PoC.
-        if (vport == 0) {
-            for (u32 attempt = 0; attempt < 35000; ++attempt) {
-                if (next_ephemeral_vport >= 65535) {
-                    next_ephemeral_vport = 30000;
-                }
-                const u16 candidate_host = next_ephemeral_vport++;
-                const u16 candidate_nbo = htons(candidate_host);
-                if (candidate_nbo == kSignalingVPortNbo || game_sockets.contains(candidate_nbo)) {
-                    continue;
-                }
-                vport = candidate_nbo;
-                break;
-            }
-        }
-
-        if (vport == 0 || vport == kSignalingVPortNbo || game_sockets.contains(vport)) {
+        u16 actual_vport = 0;
+        if (!virtual_ports.Register(socket, ntohs(requested_vport_nbo), &actual_vport)) {
             return false;
         }
-
-        game_sockets.emplace(vport, socket);
-        *actual_vport_nbo = vport;
+        *actual_vport_nbo = htons(actual_vport);
         return true;
     }
 
     void UnregisterSocket(P2PSocket* socket, u16 vport_nbo) {
         std::lock_guard lock(registry_mutex);
-        const auto it = game_sockets.find(vport_nbo);
-        if (it != game_sockets.end() && it->second == socket) {
-            game_sockets.erase(it);
-        }
+        virtual_ports.Unregister(socket, ntohs(vport_nbo));
     }
 
     int SendFrame(u16 source_vport_nbo, u16 dest_vport_nbo, const void* data, u32 len,
@@ -440,8 +441,8 @@ private:
             }
 
             std::lock_guard lock(registry_mutex);
-            const auto it = game_sockets.find(dest_vport_nbo);
-            if (it == game_sockets.end() || it->second == nullptr) {
+            auto* socket = static_cast<P2PSocket*>(virtual_ports.Find(ntohs(dest_vport_nbo)));
+            if (socket == nullptr) {
                 LOG_TRACE(Lib_Net, "P2P RX no socket for dst_vport={}", ntohs(dest_vport_nbo));
                 continue;
             }
@@ -451,7 +452,7 @@ private:
             packet.source_port = from.sin_port;
             packet.source_vport = source_vport_nbo;
             packet.payload.assign(payload, payload + payload_size);
-            it->second->EnqueuePacket(std::move(packet));
+            socket->EnqueuePacket(std::move(packet));
         }
 #endif
     }
@@ -464,8 +465,7 @@ private:
     u16 physical_port{0};
 
     std::mutex registry_mutex;
-    std::unordered_map<u16, P2PSocket*> game_sockets;
-    u16 next_ephemeral_vport{30000};
+    P2PVirtualPortRegistry virtual_ports;
 
     std::mutex internal_mutex;
     std::deque<QueuedPacket> signaling_queue;
@@ -653,7 +653,7 @@ int P2PSocket::Bind(const OrbisNetSockaddr* addr, u32 addrlen) {
     local_addr.sin_vport = actual_vport;
     bound = true;
 
-    LOG_INFO(Lib_Net, "P2P bind: physical_port={} virtual_port={}",
+    LOG_INFO(Lib_Net, "[P2P] bind physical_port={} virtual_port={}",
              P2PTransport::Instance().PhysicalPort(), ntohs(local_addr.sin_vport));
     return 0;
 }
