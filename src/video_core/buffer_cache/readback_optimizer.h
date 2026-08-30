@@ -29,7 +29,9 @@ struct PreemptivePolicyConfig {
 
 class PreemptivePagePolicy {
 public:
-    explicit PreemptivePagePolicy(PreemptivePolicyConfig config_ = {}) : config{config_} {}
+    PreemptivePagePolicy() = default;
+
+    explicit PreemptivePagePolicy(PreemptivePolicyConfig config_) : config{config_} {}
 
     [[nodiscard]] PreemptiveTransition RecordFlush(u64 epoch) {
         const bool was_preemptive = preemptive;
@@ -80,7 +82,7 @@ public:
     }
 
 private:
-    PreemptivePolicyConfig config;
+    PreemptivePolicyConfig config{};
     u64 last_activity_epoch = 0;
     u64 last_decay_step = 0;
     u16 score = 0;
