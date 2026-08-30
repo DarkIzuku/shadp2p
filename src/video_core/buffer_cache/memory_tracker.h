@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <mutex>
 #include <type_traits>
@@ -22,6 +23,13 @@ public:
     static constexpr size_t NUM_HIGH_PAGES = 1ULL << (MAX_CPU_PAGE_BITS - TRACKER_HIGHER_PAGE_BITS);
     static constexpr size_t MANAGER_POOL_SIZE = 32;
     static constexpr size_t PREEMPTIVE_FLUSH_THRESHOLD = 16;
+    static constexpr u64 PREEMPTIVE_SWEEP_INTERVAL = 60;
+
+    struct PreemptiveTransitionStats {
+        u64 promoted = 0;
+        u64 retained = 0;
+        u64 revoked = 0;
+    };
 
 public:
     explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
@@ -56,31 +64,102 @@ public:
     }
 
     /// Unmark region as modified from the host GPU
-    void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size, bool is_write) noexcept {
-        IteratePages<false>(dirty_cpu_addr, query_size,
-                            [is_write](RegionManager* manager, u64 offset, size_t size) {
-                                std::scoped_lock lk{manager->lock};
-                                manager->template ChangeRegionState<Type::GPU, false>(
-                                    manager->GetCpuAddr() + offset, size);
-                                if (is_write) {
-                                    manager->template ChangeRegionState<Type::CPU, true>(
-                                        manager->GetCpuAddr() + offset, size);
-                                }
-                            });
+    void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size, bool is_write,
+                                   bool record_flush = true) noexcept {
+        const u64 epoch = preemptive_epoch.load(std::memory_order_relaxed);
+        IteratePages<false>(
+            dirty_cpu_addr, query_size,
+            [this, is_write, record_flush, epoch](RegionManager* manager, u64 offset, size_t size) {
+                std::scoped_lock lk{manager->lock};
+                manager->template ChangeRegionState<Type::GPU, false>(
+                    manager->GetCpuAddr() + offset, size);
+                if (is_write) {
+                    manager->template ChangeRegionState<Type::CPU, true>(
+                        manager->GetCpuAddr() + offset, size);
+                }
+                const auto mode =
+                    static_cast<GpuReadbacksMode>(EmulatorSettings.GetReadbacksMode());
+                const size_t start_page = offset / TRACKER_BYTES_PER_PAGE;
+                const size_t end_page = Common::DivCeil(offset + size, TRACKER_BYTES_PER_PAGE);
+                if (mode == GpuReadbacksMode::Relaxed) {
+                    for (size_t page = start_page; page != end_page; ++page) {
+                        if (manager->NumFlushes(page) == PREEMPTIVE_FLUSH_THRESHOLD) {
+                            legacy_preemptive_page_count.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    return;
+                }
+                if (!record_flush || mode != GpuReadbacksMode::Optimized) {
+                    return;
+                }
+                for (size_t page = start_page; page != end_page; ++page) {
+                    RecordTransition(manager->RecordFlush(page, epoch));
+                }
+            });
     }
 
     /// Call 'func' for each page that has repeatedly required a GPU-to-CPU flush.
     void ForEachPreemptiveFlushPage(VAddr cpu_addr, u64 size, auto&& func) {
+        const u64 epoch = preemptive_epoch.load(std::memory_order_relaxed);
+        const auto mode = static_cast<GpuReadbacksMode>(EmulatorSettings.GetReadbacksMode());
         IteratePages<false>(
-            cpu_addr, size, [&func](RegionManager* manager, u64 offset, size_t size) {
+            cpu_addr, size, [&func, epoch, mode](RegionManager* manager, u64 offset, size_t size) {
+                std::scoped_lock lk{manager->lock};
                 const size_t start_page = offset / TRACKER_BYTES_PER_PAGE;
                 const size_t end_page = Common::DivCeil(offset + size, TRACKER_BYTES_PER_PAGE);
                 for (u64 page = start_page; page != end_page; ++page) {
-                    if (manager->NumFlushes(page) >= PREEMPTIVE_FLUSH_THRESHOLD) {
+                    const bool is_preemptive =
+                        mode == GpuReadbacksMode::Relaxed
+                            ? manager->NumFlushes(page) >= PREEMPTIVE_FLUSH_THRESHOLD
+                            : manager->IsPagePreemptive(page, epoch);
+                    if (is_preemptive) {
                         func(manager->GetCpuAddr() + page * TRACKER_BYTES_PER_PAGE);
                     }
                 }
             });
+    }
+
+    void AdvancePreemptiveEpoch() {
+        if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Optimized) {
+            return;
+        }
+        const u64 epoch = preemptive_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (epoch % PREEMPTIVE_SWEEP_INTERVAL != 0) {
+            return;
+        }
+        for (auto& pool : manager_pool) {
+            for (RegionManager& manager : pool) {
+                std::scoped_lock lk{manager.lock};
+                for (u32 page = 0; page < NUM_PAGES_PER_REGION; ++page) {
+                    RecordTransition(manager.AdvancePreemptivePage(page, epoch));
+                }
+            }
+        }
+    }
+
+    [[nodiscard]] bool IsPagePreemptive(VAddr cpu_addr) {
+        bool preemptive = false;
+        const u64 epoch = preemptive_epoch.load(std::memory_order_relaxed);
+        IteratePages<false>(cpu_addr, 1, [&](RegionManager* manager, u64 offset, size_t) {
+            std::scoped_lock lk{manager->lock};
+            preemptive = manager->IsPagePreemptive(offset / TRACKER_BYTES_PER_PAGE, epoch);
+        });
+        return preemptive;
+    }
+
+    [[nodiscard]] u64 NumPreemptivePages() const {
+        if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Relaxed) {
+            return legacy_preemptive_page_count.load(std::memory_order_relaxed);
+        }
+        return preemptive_page_count.load(std::memory_order_relaxed);
+    }
+
+    PreemptiveTransitionStats TakePreemptiveTransitionStats() {
+        return {
+            .promoted = promoted_pages.exchange(0, std::memory_order_relaxed),
+            .retained = retained_pages.exchange(0, std::memory_order_relaxed),
+            .revoked = revoked_pages.exchange(0, std::memory_order_relaxed),
+        };
     }
 
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
@@ -143,6 +222,24 @@ public:
     }
 
 private:
+    void RecordTransition(PreemptiveTransition transition) {
+        switch (transition) {
+        case PreemptiveTransition::Promoted:
+            promoted_pages.fetch_add(1, std::memory_order_relaxed);
+            preemptive_page_count.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case PreemptiveTransition::Retained:
+            retained_pages.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case PreemptiveTransition::Revoked:
+            revoked_pages.fetch_add(1, std::memory_order_relaxed);
+            preemptive_page_count.fetch_sub(1, std::memory_order_relaxed);
+            break;
+        case PreemptiveTransition::None:
+            break;
+        }
+    }
+
     /**
      * @brief IteratePages Iterates L2 word manager page table.
      * @param cpu_address Start byte cpu address
@@ -209,6 +306,12 @@ private:
     std::deque<std::array<RegionManager, MANAGER_POOL_SIZE>> manager_pool;
     std::vector<RegionManager*> free_managers;
     std::array<RegionManager*, NUM_HIGH_PAGES> top_tier{};
+    std::atomic<u64> preemptive_epoch = 0;
+    std::atomic<u64> legacy_preemptive_page_count = 0;
+    std::atomic<u64> preemptive_page_count = 0;
+    std::atomic<u64> promoted_pages = 0;
+    std::atomic<u64> retained_pages = 0;
+    std::atomic<u64> revoked_pages = 0;
 };
 
 } // namespace VideoCore

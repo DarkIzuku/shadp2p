@@ -14,11 +14,16 @@ set(TEST_TARGETS
     shadps4_ngs2_test
     shadps4_gcn_test
     shadps4_p2p_test
+    shadps4_readback_optimizer_test
 )
 
 set(P2P_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/core/libraries/network/p2p_port_config.cpp
     network/test_p2p_port_config.cpp
+)
+
+set(READBACK_OPTIMIZER_TEST_SOURCES
+    video_core/test_readback_optimizer.cpp
 )
 
 set(SETTINGS_TEST_SOURCES
@@ -168,6 +173,7 @@ add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})
 add_executable(shadps4_ngs2_test ${NGS2_TEST_SOURCES})
 add_executable(shadps4_gcn_test ${GCN_TEST_SOURCES})
 add_executable(shadps4_p2p_test ${P2P_TEST_SOURCES})
+add_executable(shadps4_readback_optimizer_test ${READBACK_OPTIMIZER_TEST_SOURCES})
 
 foreach(t ${TEST_TARGETS})
     target_include_directories(${t} PRIVATE
@@ -210,6 +216,9 @@ target_link_libraries(shadps4_gcn_test PRIVATE
 target_link_libraries(shadps4_p2p_test PRIVATE
     GTest::gtest_main
     fmt::fmt
+)
+target_link_libraries(shadps4_readback_optimizer_test PRIVATE
+    GTest::gtest_main
 )
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR

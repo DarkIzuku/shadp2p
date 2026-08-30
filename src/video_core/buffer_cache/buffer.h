@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -171,6 +172,8 @@ public:
 
 class StreamBuffer : public Buffer {
 public:
+    using ReuseCallback = std::function<void(u64 completed_tick, bool blocked, u64 wait_us)>;
+
     explicit StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                           MemoryUsage usage, u64 size_bytes_);
 
@@ -179,6 +182,12 @@ public:
 
     /// Ensures that reserved bytes of memory are available to the GPU.
     void Commit();
+
+    /// Runs after a watched GPU tick completes and before that ring region can be reused.
+    void SetReuseCallback(ReuseCallback callback, bool measure_waits = false) {
+        reuse_callback = std::move(callback);
+        measure_reuse_waits = measure_waits;
+    }
 
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
@@ -215,6 +224,8 @@ private:
     std::vector<Watch> previous_watches;
     std::size_t wait_cursor{};
     u64 wait_bound{};
+    ReuseCallback reuse_callback;
+    bool measure_reuse_waits = false;
 };
 
 } // namespace VideoCore

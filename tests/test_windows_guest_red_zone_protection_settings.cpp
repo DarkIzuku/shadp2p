@@ -91,6 +91,22 @@ TEST(WindowsGuestRedZoneProtectionSettingsTest, JsonUsesTheExistingPerGameKey) {
               WindowsGuestRedZoneProtectionMode::StaticPatching);
 }
 
+TEST(GpuReadbacksModeSettingsTest, ExistingNumericValuesRemainCompatible) {
+    EXPECT_EQ(static_cast<int>(GpuReadbacksMode::Disabled), 0);
+    EXPECT_EQ(static_cast<int>(GpuReadbacksMode::Relaxed), 1);
+    EXPECT_EQ(static_cast<int>(GpuReadbacksMode::Precise), 2);
+    EXPECT_EQ(static_cast<int>(GpuReadbacksMode::Optimized), 3);
+}
+
+TEST_F(WindowsGuestRedZoneProtectionProfileTest, OptimizedV2UsesTheExistingStoredValue) {
+    json profile;
+    profile["GPU"]["readbacks_mode"] = 3;
+    WriteGameConfig("CUSA00900", profile);
+
+    ASSERT_TRUE(settings->Load("CUSA00900"));
+    EXPECT_EQ(settings->GetReadbacksMode(), GpuReadbacksMode::Optimized);
+}
+
 TEST_F(WindowsGuestRedZoneProtectionProfileTest, MissingProfileClearsExperimentalOverrides) {
     settings->SetWindowsGuestRedZoneProtectionMode(
         WindowsGuestRedZoneProtectionMode::StaticPatching, true);

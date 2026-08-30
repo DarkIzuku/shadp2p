@@ -14,6 +14,7 @@
 #endif
 #include "common/debug.h"
 #include "common/types.h"
+#include "video_core/buffer_cache/readback_optimizer.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
 
@@ -50,6 +51,18 @@ public:
 
     u16& NumFlushes(u32 page) {
         return flushes[page];
+    }
+
+    PreemptiveTransition RecordFlush(u32 page, u64 epoch) {
+        return preemptive_pages[page].RecordFlush(epoch);
+    }
+
+    PreemptiveTransition AdvancePreemptivePage(u32 page, u64 epoch) {
+        return preemptive_pages[page].Advance(epoch);
+    }
+
+    bool IsPagePreemptive(u32 page, u64 epoch) {
+        return preemptive_pages[page].IsPreemptive(epoch);
     }
 
     static constexpr size_t SanitizeAddress(size_t address) {
@@ -105,7 +118,9 @@ public:
                 UpdateProtection<enable, true>();
             }
             if constexpr (!enable) {
-                if (mode == GpuReadbacksMode::Relaxed || mode == GpuReadbacksMode::Optimized) {
+                // Keep the established Relaxed behavior byte-for-byte: its counters neither
+                // decay nor use the Optimized v2 policy.
+                if (mode == GpuReadbacksMode::Relaxed) {
                     for (size_t page = start_page; page != end_page; ++page) {
                         ++flushes[page];
                     }
@@ -205,6 +220,7 @@ private:
     RegionBits writeable;
     RegionBits readable;
     RegionWords flushes{};
+    std::array<PreemptivePagePolicy, NUM_PAGES_PER_REGION> preemptive_pages{};
 };
 
 } // namespace VideoCore

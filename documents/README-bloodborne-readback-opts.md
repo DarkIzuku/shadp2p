@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# Bloodborne readback optimizations (experimental)
+# Bloodborne readback optimizations v2 (experimental)
 
 This branch ports the readback optimization path from upstream shadPS4 pull request
 [#3404](https://github.com/shadps4-emu/shadPS4/pull/3404) onto the newer video architecture used
@@ -22,7 +22,7 @@ Included:
 - Preemptive GPU-to-CPU downloads for pages that have repeatedly required readback.
 - The upstream PM4 address conversion cleanup required by the fence detector.
 - A larger 128 MiB download staging buffer.
-- A new `Optimized (Experimental)` readback mode.
+- A new `Optimized v2 (Experimental)` readback mode.
 
 Not included:
 
@@ -42,8 +42,10 @@ Not included:
   downloads. **Try this first for Bloodborne.**
 - `Precise`: unchanged accurate/heavier fallback. It deliberately bypasses the experimental
   optimizations.
-- `Optimized (Experimental)`: enables fence deferral, preemptive downloads, and read protection.
-  Try this only if `Relaxed` still shows vertex explosions.
+- `Optimized v2 (Experimental)`: preserves the existing numeric value for `Optimized` and adds an
+  adaptive preemptive-page score, decay/revocation, safe overlap/adjacent range merging, duplicate
+  suppression, one fence batch submit, and ready-prefetch retention. Completed data is copied out
+  of the 128 MiB staging ring before reuse, but a required GPU wait is never skipped.
 
 The new value is appended after the existing three values so old per-game configuration files keep
 their original meaning.
@@ -59,7 +61,7 @@ their original meaning.
    armor changes, death/respawn, Hunter's Dream, and an area transition with many assets.
 6. Record whether vertex explosions occur, whether area/asset loads stutter, and whether the game
    freezes or crashes.
-7. If vertex explosions remain, repeat with `Optimized (Experimental)`. If it freezes or regresses,
+7. If vertex explosions remain, repeat with `Optimized v2 (Experimental)`. If it freezes or regresses,
    return to `Precise` or to the backed-up build.
 8. Finally, verify co-op, Blood Messages, Wandering Ghosts, and Chair Messenger with the same server
    setup used by the normal build.
@@ -67,3 +69,22 @@ their original meaning.
 Successful compilation and automated tests do not prove the visual or frame-time improvement. The
 final decision requires an A/B test on the same machine, game files, save, area route, and graphics
 settings.
+
+## Optional readback performance trace
+
+The trace is disabled by default and produces no periodic readback log. To enable it on Windows,
+set the environment variable below before starting BBLauncher or shadPS4:
+
+```text
+SHADPS4_READBACK_PERF_TRACE=1
+```
+
+The log then emits one aggregated `[READBACK PERF]` line about once per second and a
+`[READBACK PERF SUMMARY]` line when the emulator closes. These show wait count/time, largest wait,
+download ranges/bytes, staging usage, detected fences, batch submits, merged/duplicate ranges, and
+preemptive pages promoted/retained/revoked. They are intended for identical-route A/B runs of
+`Relaxed`, `Optimized v2`, and `Precise`.
+
+`Relaxed` and `Precise` retain their previous behavior. The adaptive policy and ready-prefetch
+retirement are scoped to `Optimized v2`; this keeps both modes useful as honest comparison points.
+The fence detector remains heuristic, so visual gameplay testing is still required.

@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
+#include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/buffer_cache/readback_optimizer.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -26,6 +29,10 @@ static constexpr size_t DeviceBufferSize = 128_MB;
 static bool UseReadbackOptimizations() {
     const auto mode = static_cast<GpuReadbacksMode>(EmulatorSettings.GetReadbacksMode());
     return mode == GpuReadbacksMode::Relaxed || mode == GpuReadbacksMode::Optimized;
+}
+
+static bool UseOptimizedReadbacksV2() {
+    return EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Optimized;
 }
 
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -46,6 +53,17 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                           "BDA Page Table Buffer");
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
+    download_buffer.SetReuseCallback(
+        [this](u64 completed_tick, bool blocked, u64 wait_us) {
+            if (blocked) {
+                readback_performance.RecordGpuWait(wait_us);
+            }
+            if (UseOptimizedReadbacksV2()) {
+                // Drain completed copies before their 128 MiB ring allocation can be overwritten.
+                ProcessPreemptiveDownloads(completed_tick);
+            }
+        },
+        readback_performance.Enabled());
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 
@@ -113,19 +131,38 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     if (total_size_bytes == 0) {
         return;
     }
+    readback_performance.RecordFlushRequest();
 
     const VAddr page_addr = PageManager::GetPageAddr(device_addr);
     const bool fits_single_page =
         size != 0 && PageManager::GetPageAddr(device_addr + size - 1) == page_addr;
     if (UseReadbackOptimizations() && fits_single_page &&
         preemptive_downloads.Intersects(page_addr, TRACKER_BYTES_PER_PAGE)) {
-        preemptive_downloads.ForEachInRange(page_addr, TRACKER_BYTES_PER_PAGE,
-                                            [&](VAddr, VAddr, const PreemptiveDownload& download) {
-                                                scheduler.Wait(download.done_tick);
-                                                memory->TryWriteBacking(
-                                                    std::bit_cast<u8*>(download.device_addr),
-                                                    download.staging, download.size);
-                                            });
+        preemptive_downloads.ForEachInRange(
+            page_addr, TRACKER_BYTES_PER_PAGE,
+            [&](VAddr, VAddr, const PreemptiveDownload& download) {
+                // Optimized v2 keeps a ready marker after the
+                // background copy is moved out of staging. A real
+                // CPU access then consumes it without another copy
+                // or GPU wait. Relaxed never creates ready markers.
+                if (download.staging != nullptr) {
+                    const bool blocked = !scheduler.IsFree(download.done_tick);
+                    const bool measure_wait = blocked && readback_performance.Enabled();
+                    auto wait_begin = std::chrono::steady_clock::time_point{};
+                    if (measure_wait) {
+                        wait_begin = std::chrono::steady_clock::now();
+                    }
+                    scheduler.Wait(download.done_tick);
+                    if (measure_wait) {
+                        const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                                 std::chrono::steady_clock::now() - wait_begin)
+                                                 .count();
+                        readback_performance.RecordGpuWait(static_cast<u64>(wait_us));
+                    }
+                    memory->TryWriteBacking(std::bit_cast<u8*>(download.device_addr),
+                                            download.staging, download.size);
+                }
+            });
         preemptive_downloads.Subtract(page_addr, TRACKER_BYTES_PER_PAGE);
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, is_write);
     } else {
@@ -138,6 +175,12 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         scheduler.EndRendering();
         const auto cmdbuf = scheduler.CommandBuffer();
         cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
+        u64 copied_bytes = 0;
+        for (const auto& copy : copies) {
+            copied_bytes += copy.size;
+        }
+        readback_performance.RecordDownload(copies.size(), copied_bytes, total_size_bytes);
+        readback_performance.RecordSubmit();
         const auto write_data = [&]() {
             for (const auto& copy : copies) {
                 const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
@@ -150,7 +193,18 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         if constexpr (async) {
             scheduler.DeferOperation(write_data);
         } else {
+            const bool measure_wait = readback_performance.Enabled();
+            auto wait_begin = std::chrono::steady_clock::time_point{};
+            if (measure_wait) {
+                wait_begin = std::chrono::steady_clock::now();
+            }
             scheduler.Finish();
+            if (measure_wait) {
+                const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - wait_begin)
+                                         .count();
+                readback_performance.RecordGpuWait(static_cast<u64>(wait_us));
+            }
             write_data();
         }
     }
@@ -411,6 +465,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                       is_texel_buffer);
     if (is_written) {
         if (defer_read_protect) {
+            if (UseOptimizedReadbacksV2()) {
+                // Never let a CPU fault consume a ready prefetch after a newer GPU write began.
+                preemptive_downloads.Subtract(device_addr, size);
+            }
             gpu_modified_ranges_pending.Add(device_addr, size);
         } else {
             gpu_modified_ranges.Add(device_addr, size);
@@ -619,18 +677,150 @@ void BufferCache::ProcessFaultBuffer() {
     fault_manager.ProcessFaultBuffer();
 }
 
-void BufferCache::ProcessPreemptiveDownloads() {
+void BufferCache::ProcessPreemptiveDownloads(u64 completed_through_tick) {
     if (!UseReadbackOptimizations()) {
+        readback_performance.MaybeLog(DebugState.GetFrameNum(), 0);
         return;
     }
-    preemptive_downloads.ForEach([this](VAddr, VAddr, const PreemptiveDownload& download) {
-        if (!scheduler.IsFree(download.done_tick)) {
+    if (!UseOptimizedReadbacksV2()) {
+        // Preserve the PR #1 Relaxed path as the A/B performance reference.
+        preemptive_downloads.ForEach([this](VAddr, VAddr, const PreemptiveDownload& download) {
+            if (download.staging == nullptr) {
+                return true;
+            }
+            if (!scheduler.IsFree(download.done_tick)) {
+                return false;
+            }
+            memory->TryWriteBacking(std::bit_cast<u8*>(download.device_addr), download.staging,
+                                    download.size);
+            return true;
+        });
+        ReportReadbackState();
+        return;
+    }
+
+    std::vector<PreemptiveDownload> completed;
+    std::vector<std::pair<VAddr, u64>> retired;
+    preemptive_downloads.ForEach([this, completed_through_tick, &completed, &retired](
+                                     VAddr begin, VAddr end, const PreemptiveDownload& download) {
+        if (download.staging == nullptr) {
+            if (memory_tracker->IsPagePreemptive(begin)) {
+                return false;
+            }
+            retired.emplace_back(begin, end - begin);
+            return true;
+        }
+        const bool scheduler_free = scheduler.IsFree(download.done_tick);
+        if (!IsPreemptiveDownloadReady(download.done_tick, completed_through_tick,
+                                       scheduler_free)) {
             return false;
         }
         memory->TryWriteBacking(std::bit_cast<u8*>(download.device_addr), download.staging,
                                 download.size);
+        completed.push_back(PreemptiveDownload{
+            .device_addr = begin,
+            .size = end - begin,
+            .staging = nullptr,
+            .done_tick = 0,
+        });
+        if (!memory_tracker->IsPagePreemptive(begin)) {
+            retired.emplace_back(begin, end - begin);
+        }
         return true;
     });
+
+    for (const auto& download : completed) {
+        const bool was_retired = std::ranges::any_of(retired, [&](const auto& range) {
+            return range.first == download.device_addr && range.second == download.size;
+        });
+        if (!was_retired) {
+            preemptive_downloads.Add(download.device_addr, download.size, download);
+        }
+    }
+    for (const auto& [begin, size] : retired) {
+        if (gpu_modified_ranges_pending.Intersects(begin, size)) {
+            // A newer GPU write superseded this completed prefetch. Drop the stale marker but
+            // keep the new write protected until its own fence is committed.
+            continue;
+        }
+        gpu_modified_ranges.Subtract(begin, size);
+        memory_tracker->UnmarkRegionAsGpuModified(begin, size, false, false);
+    }
+    ReportReadbackState();
+}
+
+void BufferCache::ReportReadbackState() {
+    const auto transitions = memory_tracker->TakePreemptiveTransitionStats();
+    readback_performance.RecordTransitions(transitions.promoted, transitions.retained,
+                                           transitions.revoked);
+    readback_performance.MaybeLog(DebugState.GetFrameNum(), memory_tracker->NumPreemptivePages());
+}
+
+bool BufferCache::CommitPendingGpuRangesLegacy() {
+    if (gpu_modified_ranges_pending.m_ranges_set.empty()) {
+        return false;
+    }
+
+    size_t total_size_bytes = 0;
+    gpu_modified_ranges_pending.ForEach([&](VAddr begin, VAddr end) {
+        memory_tracker->ForEachPreemptiveFlushPage(begin, end - begin, [&](VAddr page_addr) {
+            const BufferId buffer_id = page_table[page_addr >> CACHING_PAGEBITS].buffer_id;
+            if (!buffer_id || IsBufferInvalid(buffer_id)) {
+                return;
+            }
+            const Buffer& buffer = slot_buffers[buffer_id];
+            const VAddr start_addr = std::max(page_addr, begin);
+            const VAddr end_addr = std::min<VAddr>(page_addr + TRACKER_BYTES_PER_PAGE, end);
+            const u32 size = static_cast<u32>(end_addr - start_addr);
+            preemptive_copies[buffer_id].emplace_back(buffer.Offset(start_addr), total_size_bytes,
+                                                      size);
+            total_size_bytes += size;
+        });
+        SynchronizeBuffersInRange(begin, end - begin, true);
+    });
+
+    gpu_modified_ranges.m_ranges_set += gpu_modified_ranges_pending.m_ranges_set;
+    gpu_modified_ranges_pending.Clear();
+
+    if (preemptive_copies.empty()) {
+        return false;
+    }
+
+    const auto [staging, offset] = download_buffer.Map(total_size_bytes);
+    if (!staging) {
+        preemptive_copies.clear();
+        return false;
+    }
+    download_buffer.Commit();
+    const u64 done_tick = scheduler.CurrentTick();
+    u64 copy_count = 0;
+    u64 copied_bytes = 0;
+    for (auto it = preemptive_copies.begin(); it != preemptive_copies.end(); ++it) {
+        const BufferId buffer_id = it->first;
+        auto& copies = it->second;
+        const Buffer& buffer = slot_buffers[buffer_id];
+        for (auto& copy : copies) {
+            const VAddr start_addr = buffer.CpuAddr() + copy.srcOffset;
+            preemptive_downloads.Add(start_addr, copy.size,
+                                     PreemptiveDownload{
+                                         .device_addr = start_addr,
+                                         .size = copy.size,
+                                         .staging = staging + copy.dstOffset,
+                                         .done_tick = done_tick,
+                                     });
+            copy.dstOffset += offset;
+            ++copy_count;
+            copied_bytes += copy.size;
+        }
+        scheduler.EndRendering();
+        const auto cmdbuf = scheduler.CommandBuffer();
+        cmdbuf.copyBuffer(buffer.Handle(), download_buffer.Handle(), copies);
+    }
+    preemptive_copies.clear();
+    scheduler.Flush();
+    readback_performance.RecordDownload(copy_count, copied_bytes, total_size_bytes);
+    readback_performance.RecordSubmit();
+    return true;
 }
 
 void BufferCache::Register(BufferId buffer_id) {
@@ -824,13 +1014,34 @@ void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size, bool is
     });
 }
 
-void BufferCache::CommitPendingGpuRanges() {
-    if (!UseReadbackOptimizations() || gpu_modified_ranges_pending.m_ranges_set.empty()) {
+void BufferCache::CommitPendingGpuRanges(bool detected_fence) {
+    if (!UseReadbackOptimizations()) {
+        return;
+    }
+    if (!UseOptimizedReadbacksV2()) {
+        const bool triggered_downloads = CommitPendingGpuRangesLegacy();
+        if (detected_fence) {
+            readback_performance.RecordFence(triggered_downloads);
+        }
+        ReportReadbackState();
         return;
     }
 
-    size_t total_size_bytes = 0;
+    if (detected_fence) {
+        memory_tracker->AdvancePreemptiveEpoch();
+    }
+    if (gpu_modified_ranges_pending.m_ranges_set.empty()) {
+        if (detected_fence) {
+            readback_performance.RecordFence(false);
+        }
+        ReportReadbackState();
+        return;
+    }
+
+    std::vector<ReadbackRange> candidates;
     gpu_modified_ranges_pending.ForEach([&](VAddr begin, VAddr end) {
+        // A newer GPU write invalidates either an in-flight or a ready prefetch for this range.
+        preemptive_downloads.Subtract(begin, end - begin);
         memory_tracker->ForEachPreemptiveFlushPage(begin, end - begin, [&](VAddr page_addr) {
             const BufferId buffer_id = page_table[page_addr >> CACHING_PAGEBITS].buffer_id;
             if (!buffer_id || IsBufferInvalid(buffer_id)) {
@@ -839,10 +1050,11 @@ void BufferCache::CommitPendingGpuRanges() {
             const Buffer& buffer = slot_buffers[buffer_id];
             const VAddr start_addr = std::max(page_addr, begin);
             const VAddr end_addr = std::min<VAddr>(page_addr + TRACKER_BYTES_PER_PAGE, end);
-            const u32 size = static_cast<u32>(end_addr - start_addr);
-            preemptive_copies[buffer_id].emplace_back(buffer.Offset(start_addr), total_size_bytes,
-                                                      size);
-            total_size_bytes += size;
+            candidates.push_back(ReadbackRange{
+                .resource = buffer_id.index,
+                .begin = start_addr,
+                .end = end_addr,
+            });
         });
         SynchronizeBuffersInRange(begin, end - begin, true);
     });
@@ -850,38 +1062,79 @@ void BufferCache::CommitPendingGpuRanges() {
     gpu_modified_ranges.m_ranges_set += gpu_modified_ranges_pending.m_ranges_set;
     gpu_modified_ranges_pending.Clear();
 
-    if (preemptive_copies.empty()) {
+    const auto normalized = NormalizeReadbackRanges(candidates);
+    readback_performance.RecordRangeOptimization(normalized.stats.merged_ranges,
+                                                 normalized.stats.deduplicated_ranges,
+                                                 normalized.stats.duplicate_bytes_avoided);
+    if (normalized.ranges.empty()) {
+        if (detected_fence) {
+            readback_performance.RecordFence(false);
+        }
+        ReportReadbackState();
         return;
+    }
+
+    u64 total_size_bytes = 0;
+    for (const auto& range : normalized.ranges) {
+        total_size_bytes += range.end - range.begin;
     }
 
     const auto [staging, offset] = download_buffer.Map(total_size_bytes);
     if (!staging) {
-        preemptive_copies.clear();
+        if (detected_fence) {
+            readback_performance.RecordFence(false);
+        }
+        ReportReadbackState();
         return;
     }
     download_buffer.Commit();
     const u64 done_tick = scheduler.CurrentTick();
+
+    u64 destination_offset = 0;
+    for (const auto& range : normalized.ranges) {
+        const BufferId buffer_id{range.resource};
+        const Buffer& buffer = slot_buffers[buffer_id];
+        const u64 range_size = range.end - range.begin;
+        preemptive_copies[buffer_id].emplace_back(buffer.Offset(range.begin),
+                                                  destination_offset + offset, range_size);
+
+        // Keep page-sized lookup records even when adjacent GPU copies were merged. CPU faults
+        // and decay remain page-local, while the GPU still benefits from the larger copy.
+        VAddr segment_begin = range.begin;
+        while (segment_begin < range.end) {
+            const VAddr page_end = PageManager::GetPageAddr(segment_begin) + TRACKER_BYTES_PER_PAGE;
+            const VAddr segment_end = std::min(page_end, range.end);
+            const u64 segment_size = segment_end - segment_begin;
+            preemptive_downloads.Subtract(segment_begin, segment_size);
+            preemptive_downloads.Add(
+                segment_begin, segment_size,
+                PreemptiveDownload{
+                    .device_addr = segment_begin,
+                    .size = segment_size,
+                    .staging = staging + destination_offset + (segment_begin - range.begin),
+                    .done_tick = done_tick,
+                });
+            segment_begin = segment_end;
+        }
+        destination_offset += range_size;
+    }
+
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
     for (auto it = preemptive_copies.begin(); it != preemptive_copies.end(); ++it) {
         const BufferId buffer_id = it->first;
-        auto& copies = it->second;
         const Buffer& buffer = slot_buffers[buffer_id];
-        for (auto& copy : copies) {
-            const VAddr start_addr = buffer.CpuAddr() + copy.srcOffset;
-            preemptive_downloads.Add(start_addr, copy.size,
-                                     PreemptiveDownload{
-                                         .device_addr = start_addr,
-                                         .size = copy.size,
-                                         .staging = staging + copy.dstOffset,
-                                         .done_tick = done_tick,
-                                     });
-            copy.dstOffset += offset;
-        }
-        scheduler.EndRendering();
-        const auto cmdbuf = scheduler.CommandBuffer();
-        cmdbuf.copyBuffer(buffer.Handle(), download_buffer.Handle(), copies);
+        cmdbuf.copyBuffer(buffer.Handle(), download_buffer.Handle(), it->second);
     }
     preemptive_copies.clear();
     scheduler.Flush();
+    readback_performance.RecordDownload(normalized.ranges.size(), total_size_bytes,
+                                        total_size_bytes);
+    readback_performance.RecordSubmit();
+    if (detected_fence) {
+        readback_performance.RecordFence(true);
+    }
+    ReportReadbackState();
 }
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes) {
