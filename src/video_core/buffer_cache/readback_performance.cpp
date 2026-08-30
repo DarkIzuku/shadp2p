@@ -149,9 +149,9 @@ void ReadbackPerformance::LogInterval(u64 frame, u64 preemptive_pages) {
              interval.gpu_wait_us_total, interval.largest_wait_us, interval.download_requests,
              interval.download_ranges, interval.download_bytes, preemptive_pages,
              interval.promoted_pages, interval.retained_pages, interval.revoked_pages,
-             interval.merged_ranges, interval.deduplicated_ranges,
-             interval.duplicate_bytes_avoided, interval.staging_bytes, interval.fences_detected,
-             interval.fences_triggering_downloads, interval.submits);
+             interval.merged_ranges, interval.deduplicated_ranges, interval.duplicate_bytes_avoided,
+             interval.staging_bytes, interval.fences_detected, interval.fences_triggering_downloads,
+             interval.submits);
     Add(total, interval);
     interval = {};
 }

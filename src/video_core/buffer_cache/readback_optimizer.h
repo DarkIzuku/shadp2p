@@ -115,7 +115,7 @@ struct NormalizedReadbackRanges {
 };
 
 inline NormalizedReadbackRanges NormalizeReadbackRanges(std::span<const ReadbackRange> input,
-                                                         u64 maximum_adjacent_span = 64_KB) {
+                                                        u64 maximum_adjacent_span = 64_KB) {
     NormalizedReadbackRanges result;
     result.ranges.reserve(input.size());
     for (const auto& range : input) {

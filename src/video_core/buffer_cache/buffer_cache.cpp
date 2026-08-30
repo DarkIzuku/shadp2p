@@ -138,39 +138,31 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         size != 0 && PageManager::GetPageAddr(device_addr + size - 1) == page_addr;
     if (UseReadbackOptimizations() && fits_single_page &&
         preemptive_downloads.Intersects(page_addr, TRACKER_BYTES_PER_PAGE)) {
-        preemptive_downloads.ForEachInRange(page_addr, TRACKER_BYTES_PER_PAGE,
-                                            [&](VAddr, VAddr, const PreemptiveDownload& download) {
-                                                // Optimized v2 keeps a ready marker after the
-                                                // background copy is moved out of staging. A real
-                                                // CPU access then consumes it without another copy
-                                                // or GPU wait. Relaxed never creates ready markers.
-                                                if (download.staging != nullptr) {
-                                                    const bool blocked =
-                                                        !scheduler.IsFree(download.done_tick);
-                                                    const bool measure_wait =
-                                                        blocked && readback_performance.Enabled();
-                                                    auto wait_begin =
-                                                        std::chrono::steady_clock::time_point{};
-                                                    if (measure_wait) {
-                                                        wait_begin =
-                                                            std::chrono::steady_clock::now();
-                                                    }
-                                                    scheduler.Wait(download.done_tick);
-                                                    if (measure_wait) {
-                                                        const auto wait_us =
-                                                            std::chrono::duration_cast<
-                                                                std::chrono::microseconds>(
-                                                                std::chrono::steady_clock::now() -
-                                                                wait_begin)
-                                                                .count();
-                                                        readback_performance.RecordGpuWait(
-                                                            static_cast<u64>(wait_us));
-                                                    }
-                                                    memory->TryWriteBacking(
-                                                        std::bit_cast<u8*>(download.device_addr),
-                                                        download.staging, download.size);
-                                                }
-                                            });
+        preemptive_downloads.ForEachInRange(
+            page_addr, TRACKER_BYTES_PER_PAGE,
+            [&](VAddr, VAddr, const PreemptiveDownload& download) {
+                // Optimized v2 keeps a ready marker after the
+                // background copy is moved out of staging. A real
+                // CPU access then consumes it without another copy
+                // or GPU wait. Relaxed never creates ready markers.
+                if (download.staging != nullptr) {
+                    const bool blocked = !scheduler.IsFree(download.done_tick);
+                    const bool measure_wait = blocked && readback_performance.Enabled();
+                    auto wait_begin = std::chrono::steady_clock::time_point{};
+                    if (measure_wait) {
+                        wait_begin = std::chrono::steady_clock::now();
+                    }
+                    scheduler.Wait(download.done_tick);
+                    if (measure_wait) {
+                        const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                                 std::chrono::steady_clock::now() - wait_begin)
+                                                 .count();
+                        readback_performance.RecordGpuWait(static_cast<u64>(wait_us));
+                    }
+                    memory->TryWriteBacking(std::bit_cast<u8*>(download.device_addr),
+                                            download.staging, download.size);
+                }
+            });
         preemptive_downloads.Subtract(page_addr, TRACKER_BYTES_PER_PAGE);
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, is_write);
     } else {
@@ -709,34 +701,33 @@ void BufferCache::ProcessPreemptiveDownloads(u64 completed_through_tick) {
 
     std::vector<PreemptiveDownload> completed;
     std::vector<std::pair<VAddr, u64>> retired;
-    preemptive_downloads.ForEach(
-        [this, completed_through_tick, &completed,
-         &retired](VAddr begin, VAddr end, const PreemptiveDownload& download) {
-            if (download.staging == nullptr) {
-                if (memory_tracker->IsPagePreemptive(begin)) {
-                    return false;
-                }
-                retired.emplace_back(begin, end - begin);
-                return true;
-            }
-            const bool scheduler_free = scheduler.IsFree(download.done_tick);
-            if (!IsPreemptiveDownloadReady(download.done_tick, completed_through_tick,
-                                            scheduler_free)) {
+    preemptive_downloads.ForEach([this, completed_through_tick, &completed, &retired](
+                                     VAddr begin, VAddr end, const PreemptiveDownload& download) {
+        if (download.staging == nullptr) {
+            if (memory_tracker->IsPagePreemptive(begin)) {
                 return false;
             }
-            memory->TryWriteBacking(std::bit_cast<u8*>(download.device_addr), download.staging,
-                                    download.size);
-            completed.push_back(PreemptiveDownload{
-                .device_addr = begin,
-                .size = end - begin,
-                .staging = nullptr,
-                .done_tick = 0,
-            });
-            if (!memory_tracker->IsPagePreemptive(begin)) {
-                retired.emplace_back(begin, end - begin);
-            }
+            retired.emplace_back(begin, end - begin);
             return true;
+        }
+        const bool scheduler_free = scheduler.IsFree(download.done_tick);
+        if (!IsPreemptiveDownloadReady(download.done_tick, completed_through_tick,
+                                       scheduler_free)) {
+            return false;
+        }
+        memory->TryWriteBacking(std::bit_cast<u8*>(download.device_addr), download.staging,
+                                download.size);
+        completed.push_back(PreemptiveDownload{
+            .device_addr = begin,
+            .size = end - begin,
+            .staging = nullptr,
+            .done_tick = 0,
         });
+        if (!memory_tracker->IsPagePreemptive(begin)) {
+            retired.emplace_back(begin, end - begin);
+        }
+        return true;
+    });
 
     for (const auto& download : completed) {
         const bool was_retired = std::ranges::any_of(retired, [&](const auto& range) {
@@ -1072,9 +1063,9 @@ void BufferCache::CommitPendingGpuRanges(bool detected_fence) {
     gpu_modified_ranges_pending.Clear();
 
     const auto normalized = NormalizeReadbackRanges(candidates);
-    readback_performance.RecordRangeOptimization(
-        normalized.stats.merged_ranges, normalized.stats.deduplicated_ranges,
-        normalized.stats.duplicate_bytes_avoided);
+    readback_performance.RecordRangeOptimization(normalized.stats.merged_ranges,
+                                                 normalized.stats.deduplicated_ranges,
+                                                 normalized.stats.duplicate_bytes_avoided);
     if (normalized.ranges.empty()) {
         if (detected_fence) {
             readback_performance.RecordFence(false);
@@ -1111,8 +1102,7 @@ void BufferCache::CommitPendingGpuRanges(bool detected_fence) {
         // and decay remain page-local, while the GPU still benefits from the larger copy.
         VAddr segment_begin = range.begin;
         while (segment_begin < range.end) {
-            const VAddr page_end =
-                PageManager::GetPageAddr(segment_begin) + TRACKER_BYTES_PER_PAGE;
+            const VAddr page_end = PageManager::GetPageAddr(segment_begin) + TRACKER_BYTES_PER_PAGE;
             const VAddr segment_end = std::min(page_end, range.end);
             const u64 segment_size = segment_end - segment_begin;
             preemptive_downloads.Subtract(segment_begin, segment_size);

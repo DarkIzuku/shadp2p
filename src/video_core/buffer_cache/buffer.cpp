@@ -255,12 +255,12 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
             wait_begin = std::chrono::steady_clock::now();
         }
         scheduler->Wait(watch.tick);
-        const u64 wait_us = measure_reuse_waits
-                                ? static_cast<u64>(
-                                      std::chrono::duration_cast<std::chrono::microseconds>(
-                                          std::chrono::steady_clock::now() - wait_begin)
-                                          .count())
-                                : 0;
+        const u64 wait_us =
+            measure_reuse_waits
+                ? static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - wait_begin)
+                                       .count())
+                : 0;
         if (reuse_callback) {
             reuse_callback(watch.tick, blocked, wait_us);
         }

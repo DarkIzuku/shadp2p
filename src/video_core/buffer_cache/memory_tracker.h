@@ -67,38 +67,35 @@ public:
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size, bool is_write,
                                    bool record_flush = true) noexcept {
         const u64 epoch = preemptive_epoch.load(std::memory_order_relaxed);
-        IteratePages<false>(dirty_cpu_addr, query_size,
-                            [this, is_write, record_flush,
-                             epoch](RegionManager* manager, u64 offset, size_t size) {
-                                std::scoped_lock lk{manager->lock};
-                                manager->template ChangeRegionState<Type::GPU, false>(
-                                    manager->GetCpuAddr() + offset, size);
-                                if (is_write) {
-                                    manager->template ChangeRegionState<Type::CPU, true>(
-                                        manager->GetCpuAddr() + offset, size);
-                                }
-                                const auto mode = static_cast<GpuReadbacksMode>(
-                                    EmulatorSettings.GetReadbacksMode());
-                                const size_t start_page = offset / TRACKER_BYTES_PER_PAGE;
-                                const size_t end_page =
-                                    Common::DivCeil(offset + size, TRACKER_BYTES_PER_PAGE);
-                                if (mode == GpuReadbacksMode::Relaxed) {
-                                    for (size_t page = start_page; page != end_page; ++page) {
-                                        if (manager->NumFlushes(page) ==
-                                            PREEMPTIVE_FLUSH_THRESHOLD) {
-                                            legacy_preemptive_page_count.fetch_add(
-                                                1, std::memory_order_relaxed);
-                                        }
-                                    }
-                                    return;
-                                }
-                                if (!record_flush || mode != GpuReadbacksMode::Optimized) {
-                                    return;
-                                }
-                                for (size_t page = start_page; page != end_page; ++page) {
-                                    RecordTransition(manager->RecordFlush(page, epoch));
-                                }
-                            });
+        IteratePages<false>(
+            dirty_cpu_addr, query_size,
+            [this, is_write, record_flush, epoch](RegionManager* manager, u64 offset, size_t size) {
+                std::scoped_lock lk{manager->lock};
+                manager->template ChangeRegionState<Type::GPU, false>(
+                    manager->GetCpuAddr() + offset, size);
+                if (is_write) {
+                    manager->template ChangeRegionState<Type::CPU, true>(
+                        manager->GetCpuAddr() + offset, size);
+                }
+                const auto mode =
+                    static_cast<GpuReadbacksMode>(EmulatorSettings.GetReadbacksMode());
+                const size_t start_page = offset / TRACKER_BYTES_PER_PAGE;
+                const size_t end_page = Common::DivCeil(offset + size, TRACKER_BYTES_PER_PAGE);
+                if (mode == GpuReadbacksMode::Relaxed) {
+                    for (size_t page = start_page; page != end_page; ++page) {
+                        if (manager->NumFlushes(page) == PREEMPTIVE_FLUSH_THRESHOLD) {
+                            legacy_preemptive_page_count.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    return;
+                }
+                if (!record_flush || mode != GpuReadbacksMode::Optimized) {
+                    return;
+                }
+                for (size_t page = start_page; page != end_page; ++page) {
+                    RecordTransition(manager->RecordFlush(page, epoch));
+                }
+            });
     }
 
     /// Call 'func' for each page that has repeatedly required a GPU-to-CPU flush.
@@ -111,10 +108,10 @@ public:
                 const size_t start_page = offset / TRACKER_BYTES_PER_PAGE;
                 const size_t end_page = Common::DivCeil(offset + size, TRACKER_BYTES_PER_PAGE);
                 for (u64 page = start_page; page != end_page; ++page) {
-                    const bool is_preemptive = mode == GpuReadbacksMode::Relaxed
-                                                   ? manager->NumFlushes(page) >=
-                                                         PREEMPTIVE_FLUSH_THRESHOLD
-                                                   : manager->IsPagePreemptive(page, epoch);
+                    const bool is_preemptive =
+                        mode == GpuReadbacksMode::Relaxed
+                            ? manager->NumFlushes(page) >= PREEMPTIVE_FLUSH_THRESHOLD
+                            : manager->IsPagePreemptive(page, epoch);
                     if (is_preemptive) {
                         func(manager->GetCpuAddr() + page * TRACKER_BYTES_PER_PAGE);
                     }
