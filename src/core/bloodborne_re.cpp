@@ -58,6 +58,7 @@ enum class TraceKind : u8 {
     UseItemExecution,
     GoodsActionSubmit,
     GoodsParamLookup,
+    InsightDebit,
     BellAvailability,
     ResponderBellAvailability,
     NetworkAreaRegion,
@@ -198,6 +199,9 @@ constexpr u64 SummonedMapReloadOffset = 0x01336B90;
 constexpr u64 StageTransitionOffset = 0x013CDE30;
 constexpr u64 SetSummonReloadStateOffset = 0x0178D9A0;
 constexpr u64 UseItemNativeApplyOffset = 0x018F9720;
+// CUSA03173 01.09: the only direct subtraction from PlayerGameData::san_value (+0x84).
+// This observer is deliberately read-only until the Beckoning Bell caller is proven at runtime.
+constexpr u64 InsightDebitOffset = 0x01B63F89;
 constexpr s32 SmallResonantBellGoodsId = 205;
 constexpr s32 SmallResonantBellEffectId = 9005;
 constexpr s32 BellUseArgument = 17;
@@ -823,6 +827,11 @@ constexpr auto Sites = std::to_array<TraceSite>({
     {"ChrAction.UseItem.ActionSubmit", 0x01FF0FA0, TraceKind::GoodsActionSubmit,
      StandardR15Prologue, 6},
     {"GameParam.Goods.Lookup", 0x01F1E3D0, TraceKind::GoodsParamLookup, StandardR15Prologue, 6},
+    {"PlayerGameData.InsightDebit",
+     InsightDebitOffset,
+     TraceKind::InsightDebit,
+     {0x29, 0x81, 0x84, 0x00, 0x00, 0x00},
+     6},
     {"Beckoning.Availability.Area",
      0x0157F8BA,
      TraceKind::BellAvailability,
@@ -1199,6 +1208,9 @@ std::atomic<u32> latest_ss_info_request_id{};
 std::atomic<u32> latest_ss_info_api_index{std::numeric_limits<u32>::max()};
 std::atomic<u32> latest_ss_info_res_kind{};
 std::atomic<u64> latest_ss_info_frpg_net_man{};
+std::atomic<s32> latest_tracked_goods{-1};
+std::atomic<s64> latest_tracked_goods_time_ms{};
+std::atomic<s64> latest_summon_success_time_ms{};
 std::mutex capture_mutex;
 std::ofstream capture_file;
 std::filesystem::path capture_path;
@@ -3480,6 +3492,73 @@ void WriteGoodsParamLookup(std::ostream& out, const GuestRegisterSnapshot& regis
     out << '}';
 }
 
+void WriteInsightDebit(std::ostream& out, const GuestRegisterSnapshot& registers,
+                       s64 timestamp_ms) {
+    const u64 player_game_data = registers.rcx;
+    const u64 cost = registers.rdi;
+    const s32 amount = static_cast<s32>(registers.rax);
+    const s32 old_value = player_game_data >= 0x10000 ? ReadValue<s32>(player_game_data, 0x84)
+                                                      : std::numeric_limits<s32>::min();
+    const s64 goods_time = latest_tracked_goods_time_ms.load(std::memory_order_relaxed);
+    const s64 success_time = latest_summon_success_time_ms.load(std::memory_order_relaxed);
+
+    out << ",\"insight_debit\":{";
+    out << "\"mode\":\"observe_only\"";
+    out << ",\"player_game_data\":";
+    WriteHex(out, player_game_data);
+    out << ",\"field_offset\":\"0x84\"";
+    out << ",\"amount\":" << amount;
+    out << ",\"old_value\":";
+    if (old_value == std::numeric_limits<s32>::min()) {
+        out << "null";
+    } else {
+        out << old_value;
+    }
+    out << ",\"predicted_new_value\":";
+    if (old_value == std::numeric_limits<s32>::min()) {
+        out << "null";
+    } else {
+        out << static_cast<s64>(old_value) - amount;
+    }
+    out << ",\"cost\":";
+    WriteHex(out, cost);
+    if (cost >= 0x10000) {
+        out << ",\"cost_fields\":{\"field_0\":" << ReadValue<s32>(cost, 0)
+            << ",\"insight\":" << ReadValue<s32>(cost, 4)
+            << ",\"field_8\":" << ReadValue<s32>(cost, 8) << '}';
+    }
+    out << ",\"recent_goods_id\":" << latest_tracked_goods.load(std::memory_order_relaxed);
+    out << ",\"ms_since_tracked_goods\":";
+    if (goods_time <= 0 || timestamp_ms < goods_time) {
+        out << "null";
+    } else {
+        out << timestamp_ms - goods_time;
+    }
+    out << ",\"ms_since_summon_success\":";
+    if (success_time <= 0 || timestamp_ms < success_time) {
+        out << "null";
+    } else {
+        out << timestamp_ms - success_time;
+    }
+    out << ",\"frame_chain\":[";
+    u64 frame = registers.rbp;
+    for (size_t index = 0; index < 8 && frame >= 0x10000 &&
+                           HasMemoryAccess(frame, 2 * sizeof(u64), MemoryProt::CpuRead);
+         ++index) {
+        if (index != 0) {
+            out << ',';
+        }
+        const u64 return_address = ReadValue<u64>(frame, sizeof(u64));
+        WriteHex(out, return_address);
+        const u64 next = ReadValue<u64>(frame, 0);
+        if (next <= frame || next - frame > 0x100000) {
+            break;
+        }
+        frame = next;
+    }
+    out << "]}";
+}
+
 void WriteBellAvailability(std::ostream& out, const TraceSite& site,
                            const GuestRegisterSnapshot& registers) {
     const bool is_native_result = site.offset == 0x0157F962;
@@ -3871,6 +3950,19 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     }
 
     const auto& site = RuntimeSites[tag];
+    const auto observation_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::system_clock::now().time_since_epoch())
+                                         .count();
+    if (site.kind == TraceKind::UseItemExecution) {
+        const s32 goods_id = GetUseItemExecutionGoods(site, *registers);
+        if (IsTrackedGoods(goods_id)) {
+            latest_tracked_goods.store(goods_id, std::memory_order_relaxed);
+            latest_tracked_goods_time_ms.store(observation_time_ms, std::memory_order_relaxed);
+        }
+    }
+    if (site.name == "ForceSummonSuccess") {
+        latest_summon_success_time_ms.store(observation_time_ms, std::memory_order_relaxed);
+    }
     if (summon_build_host_placement_hook_installed && site.offset == SummonBuildEntryOffset) {
         ApplyCrossMapSummonHostPlacement(*registers);
     }
@@ -4025,9 +4117,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     }
 
     const u64 sequence = event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-    const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::system_clock::now().time_since_epoch())
-                               .count();
+    const auto timestamp = observation_time_ms;
     try {
         std::scoped_lock lock{capture_mutex};
         if (!capture_file) {
@@ -4338,6 +4428,9 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             break;
         case TraceKind::GoodsParamLookup:
             WriteGoodsParamLookup(capture_file, *registers);
+            break;
+        case TraceKind::InsightDebit:
+            WriteInsightDebit(capture_file, *registers, timestamp);
             break;
         case TraceKind::BellAvailability:
             WriteBellAvailability(capture_file, site, *registers);
@@ -5422,6 +5515,15 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
                          record.frpg.maintenance_flag, record.frpg.config, record.frpg.ss,
                          record.return_address, record.caller_offset);
             }
+        } else if (site.kind == TraceKind::InsightDebit) {
+            const s32 amount = static_cast<s32>(registers->rax);
+            const s32 old_value = registers->rcx >= 0x10000 ? ReadValue<s32>(registers->rcx, 0x84)
+                                                            : std::numeric_limits<s32>::min();
+            LOG_INFO(Debug,
+                     "[BLOODBORNE INSIGHT TRACE] mode=observe_only amount={} old_value={} "
+                     "recent_goods_id={} capture={}",
+                     amount, old_value, latest_tracked_goods.load(std::memory_order_relaxed),
+                     Common::FS::PathToUTF8String(capture_path));
         } else if (hit <= 8 || hit % 300 == 0) {
             LOG_INFO(Debug,
                      "Bloodborne RE entry {} hit={} rdi={:#x} rsi={:#x} rdx={:#x} capture={}",

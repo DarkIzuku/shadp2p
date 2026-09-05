@@ -5,7 +5,7 @@ name: Bloodborne Optimized v2 - Windows x64
 
 on:
   pull_request:
-    branches: [bloodborne-readback-p2p-port]
+    branches: [bloodborne-readback-optimized-v2]
   workflow_dispatch:
 
 permissions:
@@ -77,6 +77,10 @@ jobs:
               }
           }
 
+      - name: Check Bloodborne trace formatting
+        shell: pwsh
+        run: clang-format --dry-run --Werror src/core/bloodborne_re.cpp
+
       - name: Build Release
         shell: pwsh
         run: >-
@@ -120,6 +124,10 @@ jobs:
 
           New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
           Copy-Item -LiteralPath $executable -Destination $packagedExecutable
+          Copy-Item -LiteralPath 'scripts/bloodborne_re/run-insight-trace.cmd' `
+              -Destination (Join-Path $packageDir 'Run Bloodborne Insight Trace.cmd')
+          Copy-Item -LiteralPath 'documentation/bloodborne-insight-trace.md' `
+              -Destination (Join-Path $packageDir 'Bloodborne Insight Trace.md')
 
           $runtimeExtensions = '.dll', '.json', '.pak', '.dat'
           Get-ChildItem -LiteralPath $buildDir -File |
