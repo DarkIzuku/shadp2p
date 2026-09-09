@@ -1693,3 +1693,83 @@ Remaining general runtime locators retain their existing behavior, but console
 and JSONL diagnostics store at most the first five ambiguous candidates plus
 the total match count and selected candidate. Parser instrumentation produces
 no executable-wide candidate array.
+
+## Established-session travel iteration 1
+
+This iteration starts from client commit
+`f6bad6292aad40404413363cf40dd860356f3336` and server commit
+`79a5fe74ef4ec524530aa22cbc7e59280fa330cb`. It deliberately predates the
+discarded matchmaking-regression builds. The Wozzardman implementations remain
+reference material; this work extends the native cross-map summon path already
+present in these cumulative bases.
+
+### Audit result
+
+The existing seamless code handles initial cross-map placement before a guest
+joins. It transports the host placement, selects the summoned placement, and
+uses Bloodborne's native stage-transition functions. It did not have a durable
+party independent of a vanilla advertisement, an established-session travel
+protocol, or protection for the later `CSMultiPlayMan::Stop` issued by
+`SprjSessionManager::OnMatchingCheck` while `WorldChrMan` is rebuilding the
+remote character. The already-known stage-destructor bypass alone therefore
+cannot preserve a session through a later lantern or headstone warp.
+
+### Private control protocol and states
+
+shadNet command 116 and notification 18 carry a versioned private control
+message outside Bloodborne's vanilla room-message callback. The phases are
+`TravelBegin`, `TravelReady`, `TravelCommit`, `TravelArrived`, and
+`TravelFailed`, with heartbeat and explicit leave reserved for party lifetime.
+Every travel carries a server-issued party id, party generation, monotonic
+sequence id, leader identity, active room id, source and destination packed
+maps, the exact signed `WarpParam` id, mode, finite placement, and timestamp.
+
+The client state machine is explicit: `Connected`, `TravelPreparing`,
+`Traveling`, `WorldLoading`, `Rebinding`, `RecoveringRoom`, `RecoveringPeer`,
+and `Disconnected`. Old sequences, mismatched parties/generations, invalid
+destinations, non-finite placements, and events outside the bounded time window
+are rejected. The server derives membership only from the real Matching2 room;
+it does not accept client-invented members. A vanilla leave or temporary room
+loss does not delete the control party or cancel an in-flight travel.
+
+### Native travel and byte-verified guard
+
+The host observes the native `WarpParam` request and the following native
+`StageTransition`, then sends the actual destination and `WarpParam` selected
+by Bloodborne. After all connected guests acknowledge readiness, the guest
+calls the same native `WarpParam` path on the periodic game thread. No position
+`memcpy`, artificial sleep, or global Precise-style fallback is used.
+
+Two exact CUSA03173 01.09 profiles are accepted. The reference profile keeps
+the documented offsets. The user's tested eboot
+`SHA-256 6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80`
+uses:
+
+```text
+WarpParam                     0x013CE320
+StageTransition               0x013CE220
+periodic game-thread tick     0x01872870
+stage Stop call               0x019475F1  E8 2A 94 58 00
+OnMatchingCheck Stop call     0x01380D57  E8 C4 FC B4 00
+```
+
+All hook installation requires CUSA03173, app version 01.09, the full expected
+function prologues, and the exact call bytes. An unknown executable fails
+closed. The conditional call trampoline preserves guest GPRs, flags, MXCSR,
+YMM registers, stack and original call/return semantics. It suppresses a Stop
+only while seamless is enabled, a validated travel is active, shadNet control
+is connected, no explicit disconnect exists, and the transition deadline has
+not expired. Traditional mode never installs these hooks.
+
+### First-build boundary
+
+This build is specifically for an already-connected host and guest traveling
+from Great Bridge to Hunter's Dream, followed by the reverse/headstone cases.
+It attempts to keep the existing Matching2 room alive through the scoped Stop
+guard. Arrival currently treats a stable in-room multiplayer state as the
+first-build rebind signal; it does not yet claim a separately verified
+`WorldChrMan` remote-entity insertion. Automatic room recreation, explicit
+remote insertion, lantern prompt restoration, death/respawn continuity, and
+boss continuity remain later phases. If Bloodborne destroys the room through
+another path, the server keeps the SeamlessParty and logs recovery state, but
+automatic room reconstruction is not part of this iteration.

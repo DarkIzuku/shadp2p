@@ -141,6 +141,10 @@ bool ShadNetClient::IsMatching2Enabled() const {
     return m_matching2_enabled.load();
 }
 
+bool ShadNetClient::IsBloodborneSeamlessControlEnabled() const {
+    return m_bloodborne_seamless_control_enabled.load();
+}
+
 u32 ShadNetClient::GetNumFriends() const {
     std::lock_guard lock(m_mutex_friends);
     return static_cast<u32>(m_friends.size());
@@ -698,6 +702,7 @@ void ShadNetClient::HandleGetTokenReply(const std::vector<u8>& payload) {
 
 void ShadNetClient::HandleServerFeaturesReply(const std::vector<u8>& payload) {
     bool matching2_enabled = false;
+    bool seamless_control_enabled = false;
     bool parsed = false;
 
     if (!payload.empty()) {
@@ -707,6 +712,7 @@ void ShadNetClient::HandleServerFeaturesReply(const std::vector<u8>& payload) {
             const std::string blob = ExtractBlob(payload, 1);
             if (!blob.empty() && pb.ParseFromString(blob)) {
                 matching2_enabled = pb.matching2_enabled();
+                seamless_control_enabled = pb.bloodborne_seamless_control_enabled();
                 parsed = true;
             }
         } else {
@@ -717,9 +723,11 @@ void ShadNetClient::HandleServerFeaturesReply(const std::vector<u8>& payload) {
     }
 
     m_matching2_enabled.store(matching2_enabled);
+    m_bloodborne_seamless_control_enabled.store(seamless_control_enabled);
     m_server_features_received.store(parsed);
-    LOG_INFO(ShadNet, "Server features: matching2_enabled={}{}",
-             matching2_enabled ? "true" : "false", parsed ? "" : " (defaulted)");
+    LOG_INFO(ShadNet, "Server features: matching2_enabled={} seamless_control_enabled={}{}",
+             matching2_enabled ? "true" : "false", seamless_control_enabled ? "true" : "false",
+             parsed ? "" : " (defaulted)");
     m_sem_authenticated.release();
 }
 
@@ -864,6 +872,39 @@ void ShadNetClient::HandleNotification(u16 cmd_raw, const std::vector<u8>& paylo
         n.msg.assign(pb.msg().begin(), pb.msg().end());
         if (onRoomMessage)
             onRoomMessage(n);
+        break;
+    }
+    case NotificationType::SeamlessControl: {
+        shadnet::NotifySeamlessControl pb;
+        if (!pb.ParseFromString(blob) || !pb.has_event()) {
+            LOG_WARNING(ShadNet, "SeamlessControl parse error");
+            break;
+        }
+        const auto& source = pb.event();
+        NotifySeamlessControl notification;
+        notification.sourceUserId = pb.source_user_id();
+        notification.sourceNpid = pb.source_npid();
+        auto& event = notification.event;
+        event.protocolVersion = source.protocol_version();
+        event.phase = source.phase();
+        event.partyId = source.party_id();
+        event.generation = source.generation();
+        event.sequenceId = source.travel_sequence_id();
+        event.leaderUserId = source.leader_user_id();
+        event.leaderNpid = source.leader_npid();
+        event.activeRoomId = source.active_room_id();
+        event.sourceMap = source.source_map();
+        event.destinationMap = source.destination_map();
+        event.warpParamId = source.warp_param_id();
+        event.mode = source.mode();
+        event.positionX = source.position_x();
+        event.positionY = source.position_y();
+        event.positionZ = source.position_z();
+        event.orientation = source.orientation();
+        event.timestampMs = source.timestamp_ms();
+        event.failureReason = source.failure_reason();
+        if (onSeamlessControl)
+            onSeamlessControl(notification);
         break;
     }
     case NotificationType::WebApiPushEvent: {

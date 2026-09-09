@@ -31,6 +31,7 @@ message SetAppearOfflineRequest {
 
 message ServerFeaturesReply {
     bool matching2_enabled = 1;
+    bool bloodborne_seamless_control_enabled = 2;
 }
 
 message FriendEntry {
@@ -527,6 +528,47 @@ message SendRoomMessageRequest {
 }
 
 message SendRoomMessageReply { uint64 room_id = 1; }
+
+// Private shadPS4 <-> shadNet control plane for an already-established
+// Bloodborne seamless party. These packets never enter Bloodborne's vanilla
+// Matching2 room-message callback.
+message SeamlessTravelEvent {
+    uint32 protocol_version = 1;
+    uint32 phase = 2;
+    string party_id = 3;
+    uint64 generation = 4;
+    uint64 travel_sequence_id = 5;
+    uint64 leader_user_id = 6;
+    string leader_npid = 7;
+    uint64 active_room_id = 8;
+    uint32 source_map = 9;
+    uint32 destination_map = 10;
+    sint32 warp_param_id = 11;
+    uint32 mode = 12;
+    float position_x = 13;
+    float position_y = 14;
+    float position_z = 15;
+    float orientation = 16;
+    int64 timestamp_ms = 17;
+    string failure_reason = 18;
+}
+
+message SeamlessControlRequest { SeamlessTravelEvent event = 1; }
+
+message SeamlessControlReply {
+    bool accepted = 1;
+    string reason = 2;
+    string party_id = 3;
+    uint64 generation = 4;
+    uint64 travel_sequence_id = 5;
+    uint32 state = 6;
+}
+
+message NotifySeamlessControl {
+    SeamlessTravelEvent event = 1;
+    uint64 source_user_id = 2;
+    string source_npid = 3;
+}
 
 // Notification payloads
 // Every notification carries ctx_id so the client can route it to the owning

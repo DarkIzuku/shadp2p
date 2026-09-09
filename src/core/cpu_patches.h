@@ -54,6 +54,7 @@ struct alignas(16) GuestRegisterSnapshot {
 };
 
 using GuestCodeHook = void PS4_SYSV_ABI (*)(u64 tag, const GuestRegisterSnapshot* registers);
+using GuestCallGuard = bool PS4_SYSV_ABI (*)(u64 tag);
 
 // Windows static guest red-zone protection
 struct RedZonePatchResult {
@@ -81,6 +82,13 @@ void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_are
 /// addressing.
 bool InstallGuestCodeHook(void* address, std::span<const u8> expected_instructions, u64 tag,
                           GuestCodeHook hook);
+
+/// Replaces one byte-verified guest CALL with a guarded trampoline. The original target is called
+/// normally unless guard(tag) returns true. A suppressed call returns suppressed_return in RAX.
+/// This is intended for narrow policy bypasses where every unguarded execution must retain the
+/// exact original guest behavior.
+bool InstallGuestConditionalCallHook(void* address, std::span<const u8, 5> expected_call, u64 tag,
+                                     GuestCallGuard guard, u64 suppressed_return = 1);
 
 /// Applies CPU patches that need to be done before beginning executions.
 void PrePatchInstructions(u64 segment_addr, u64 segment_size);
