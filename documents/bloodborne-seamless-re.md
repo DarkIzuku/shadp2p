@@ -1773,3 +1773,69 @@ remote insertion, lantern prompt restoration, death/respawn continuity, and
 boss continuity remain later phases. If Bloodborne destroys the room through
 another path, the server keeps the SeamlessParty and logs recovery state, but
 automatic room reconstruction is not part of this iteration.
+
+## Profile-aware initial summon and PvP iteration
+
+The initial cross-map path is now selected independently from established
+travel. `cusa03173-109-reference` and
+`cusa03173-109-user-eboot-6764938b` each carry their own patch sites, native
+call targets, global pointers, and original bytes. A profile is never enabled
+by assuming a uniform delta from the reference executable: every site below
+was checked in the user's CUSA03173 01.09 eboot, whose complete SHA-256 is
+`6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80`.
+
+Initial bell/candidate/build sites in the user eboot:
+
+```text
+Beckoning area comparison          0x0157FAE8  0F 87 90 00 00 00
+Beckoning area result              0x0157FB80  34 01
+Responder bell area result         0x0157F8F1  88 C3
+Responder bell common result       0x0157F8F3  4C 89 F7 E8 E5 A2 34 00
+Active bell area comparison        0x01506B6B  77 4A
+Active bell area result            0x01506BAC  88 C3 80 F3 01
+Responder search area range        0x0191AD03  18 C9 20 C1 EB 02
+SOS status area restriction        0x018705E3  84 C0 41 BD FF FF FF FF ...
+Summon candidate area restriction  0x014B755A  0F 85 C0 03 00 00
+Summon build entry                 0x01874C20  55 48 89 E5 41 57
+Summon build world restriction     0x01874EF8  0F 85 48 01 00 00
+Summon build negative restriction  0x01874F00  0F 88 40 01 00 00
+Summon build area restriction      0x01875089  74 0D
+Healing-fountain availability      0x012F870E  41 80 7D 48 00
+```
+
+Host-placement handoff and native reload sites:
+
+```text
+Cross-map guest/invader handoff    0x01E5012A  48 8D 83 ED 00 00 00
+Deferred summon reload tick        0x01872870  55 48 89 E5 41 57
+Stage descriptor finalize          0x01945363  B8 00 00 00 FF
+SetForcedSummonMap                 0x0156D130
+SetForcedSummonPosition            0x0156D140
+SetForcedSummonOrientation         0x0156D160
+SetForcedSummonWarp                0x0156D180
+SelectSummonedPlacement            0x01332F60
+SummonedMapReload                  0x01336F30
+SetSummonReloadState               0x0178DBC0
+UseItemNativeApply                 0x018F9B50
+role metadata table                0x0553D720
+summon build role table            0x0556E530
+```
+
+The same native builder and handoff are used for the captured cooperative and
+Sinister paths. The contract evidence is explicit: Small Resonant advertises
+`SummonType=0`, while Sinister Resonant advertises `SummonType=2`. The client
+does not overwrite that field or a role table. It detects an active Sinister
+effect (`9025`) before the pre-match warp and resumes goods `225` after the
+world is ready; cooperative responders resume effect `9005`/goods `205`.
+Consequently the game-owned builder remains responsible for red-phantom
+faction and native invasion placement.
+
+The server keeps search/claim intents separated by the requested summon type.
+It models host, cooperator, and invader explicitly, excludes a known invader
+from the persistent cooperative party, and consumes the PvP advertisement on
+the normal invasion-end removal path. This lets a cooperative party survive
+PvP cleanup. Unknown summon values are never guessed into either role.
+
+These changes are byte-verified and build-tested, but cross-map co-op, Hunter's
+Dream bell use, red-phantom creation, and runtime invasion cleanup still require
+the Izuku/Hiryu game tests before they can be described as runtime confirmed.

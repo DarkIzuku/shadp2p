@@ -40,6 +40,20 @@ TEST(BloodborneSeamlessState, TraditionalModeDoesNothing) {
     EXPECT_FALSE(machine.ShouldGuardMatchingStop(HostMatching(), 100));
 }
 
+TEST(BloodborneSeamlessState, ResponderRolesPreserveCapturedBellSemantics) {
+    const auto cooperator = SelectSeamlessResponderPolicy(false);
+    EXPECT_EQ(cooperator.role, SeamlessPeerRole::Cooperator);
+    EXPECT_EQ(cooperator.summonType, 0);
+    EXPECT_EQ(cooperator.goodsId, 205);
+    EXPECT_EQ(cooperator.effectId, 9005);
+
+    const auto invader = SelectSeamlessResponderPolicy(true);
+    EXPECT_EQ(invader.role, SeamlessPeerRole::Invader);
+    EXPECT_EQ(invader.summonType, 2);
+    EXPECT_EQ(invader.goodsId, 225);
+    EXPECT_EQ(invader.effectId, 9025);
+}
+
 TEST(BloodborneSeamlessState, HostBeginsAndCommitsValidatedTravel) {
     SeamlessTravelStateMachine machine;
     machine.SetEnabled(true);

@@ -834,6 +834,9 @@ bool ApplyBloodborneSeamlessRoute(SendRequestPlan& plan) {
     if (IsBloodborneSummonRequestPath(plan.path) || IsBloodborneSummonSearchPath(plan.path)) {
         if (const auto placement = Core::Bloodborne::GetSeamlessHostPlacementHeader()) {
             plan.headers.emplace_back(BloodborneHostPlacementHeader, *placement);
+            LOG_INFO(Lib_Http,
+                     "[BLOODBORNE SEAMLESS SUMMON] state=HostPlacementAttached path={} bytes={}",
+                     plan.path, placement->size());
         }
     }
 

@@ -8,6 +8,27 @@
 
 namespace Core::Bloodborne {
 
+enum class SeamlessPeerRole : u32 {
+    Unknown = 0,
+    Host = 1,
+    Cooperator = 2,
+    Invader = 3,
+};
+
+struct SeamlessResponderPolicy {
+    SeamlessPeerRole role = SeamlessPeerRole::Cooperator;
+    s32 summonType = 0;
+    s32 goodsId = 205;
+    s32 effectId = 9005;
+};
+
+constexpr SeamlessResponderPolicy SelectSeamlessResponderPolicy(bool sinisterBellActive) {
+    // Captured Bloodborne 1.09 contracts: Small Resonant is SummonType 0 and
+    // Sinister Resonant is SummonType 2. No unobserved summon values are guessed.
+    return sinisterBellActive ? SeamlessResponderPolicy{SeamlessPeerRole::Invader, 2, 225, 9025}
+                              : SeamlessResponderPolicy{SeamlessPeerRole::Cooperator, 0, 205, 9005};
+}
+
 enum class SeamlessTravelPhase : u32 {
     TravelBegin = 1,
     TravelReady = 2,
