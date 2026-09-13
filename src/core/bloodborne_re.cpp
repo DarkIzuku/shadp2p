@@ -1508,6 +1508,8 @@ std::mutex seamless_placement_mutex;
 std::optional<SummonPlacementDescriptor> seamless_host_placement;
 std::optional<SummonPlacementDescriptor> seamless_received_host_placement;
 bool seamless_received_host_placement_consumed{};
+PendingCrossMapSummonStateMachine pending_cross_map_summon;
+u64 duplicate_reload_logged_generation{};
 std::atomic<u32> pending_summon_reload_map{};
 std::atomic<u32> pending_summon_reload_state_map{};
 
@@ -2748,13 +2750,84 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot& registers) {
         record.result = "placement_copy_pending";
         return;
     }
-    if (record.current_map == record.received_map) {
-        record.result = "same_map";
-        return;
-    }
     const auto responder = SelectSeamlessResponderPolicy(
         HasPlayerEffect(GetLocalPlayer(), SinisterResonantBellEffectId));
     const bool invader = responder.role == SeamlessPeerRole::Invader;
+    PendingCrossMapSummonDecision handoff_decision{};
+    u64 summon_generation = 0;
+    {
+        std::scoped_lock lock{seamless_placement_mutex};
+        const auto snapshot = pending_cross_map_summon.Snapshot();
+        summon_generation = snapshot.generation;
+        pending_cross_map_summon.BindRole(responder.role, summon_generation);
+        handoff_decision = pending_cross_map_summon.EvaluateNativeHandoff(
+            record.current_map, record.received_map, EstablishedTravelNowMs());
+    }
+    if (handoff_decision == PendingCrossMapSummonDecision::SameMap) {
+        record.result = "same_map";
+        bool completed_cross_map = false;
+        {
+            std::scoped_lock lock{seamless_placement_mutex};
+            const auto snapshot = pending_cross_map_summon.Snapshot();
+            completed_cross_map = snapshot.reloadCount == 1;
+            seamless_received_host_placement_consumed = true;
+            if (completed_cross_map) {
+                pending_cross_map_summon.MarkRemoteInserted(summon_generation);
+            }
+        }
+        if (completed_cross_map) {
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SEAMLESS SUMMON] generation={} state=WorldReady "
+                     "target_map={:#x}",
+                     summon_generation, record.received_map);
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SEAMLESS SUMMON] generation={} state=RemoteInserted "
+                     "target_map={:#x}",
+                     summon_generation, record.received_map);
+            LOG_INFO(Debug, "[BLOODBORNE SEAMLESS SUMMON] generation={} state=Complete reloads=1",
+                     summon_generation);
+        } else {
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SEAMLESS SUMMON] generation={} state=Complete "
+                     "reloads=0 reason=same_map",
+                     summon_generation);
+        }
+        return;
+    }
+    if (handoff_decision == PendingCrossMapSummonDecision::DuplicateReload) {
+        record.result = "duplicate_reload_suppressed";
+        bool should_log = false;
+        {
+            std::scoped_lock lock{seamless_placement_mutex};
+            if (duplicate_reload_logged_generation != summon_generation) {
+                duplicate_reload_logged_generation = summon_generation;
+                should_log = true;
+            }
+        }
+        if (should_log) {
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SEAMLESS SUMMON] generation={} "
+                     "state=DuplicateReloadSuppressed target_map={:#x}",
+                     summon_generation, record.received_map);
+        }
+        return;
+    }
+    if (handoff_decision != PendingCrossMapSummonDecision::Commit) {
+        record.result =
+            handoff_decision == PendingCrossMapSummonDecision::WaitForClaim  ? "waiting_for_claim"
+            : handoff_decision == PendingCrossMapSummonDecision::WaitForRoom ? "waiting_for_room"
+            : handoff_decision == PendingCrossMapSummonDecision::WaitForSignaling
+                ? "waiting_for_signaling"
+            : handoff_decision == PendingCrossMapSummonDecision::StaleTarget
+                ? "stale_target"
+                : "pending_summon_unavailable";
+        return;
+    }
+    LOG_INFO(Debug,
+             "[BLOODBORNE SEAMLESS {}] generation={} state=CrossMapCommit "
+             "current_map={:#x} target_map={:#x} role={}",
+             invader ? "PVP" : "SUMMON", summon_generation, record.current_map, record.received_map,
+             invader ? "Invader" : "Cooperator");
     LOG_INFO(Debug, "[BLOODBORNE SEAMLESS {}] state={} current_map={:#x} target_map={:#x} role={}",
              invader ? "PVP" : "SUMMON", invader ? "InvaderHandoffBegin" : "GuestHandoffBegin",
              record.current_map, record.received_map, invader ? "Invader" : "Cooperator");
@@ -2823,6 +2896,18 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot& registers) {
         return;
     }
 
+    {
+        std::scoped_lock lock{seamless_placement_mutex};
+        if (!pending_cross_map_summon.MarkReloadStarted(summon_generation)) {
+            record.result = "duplicate_reload_suppressed";
+            return;
+        }
+    }
+    LOG_INFO(Debug,
+             "[BLOODBORNE SEAMLESS {}] generation={} state=ForcedPlacementApplied "
+             "target_map={:#x}",
+             invader ? "PVP" : "SUMMON", summon_generation, record.received_map);
+
     pending_summon_reload_map.store(record.received_map, std::memory_order_release);
     pending_summon_reload_state_map.store(record.received_map, std::memory_order_release);
     record.summon_reload_armed = true;
@@ -2831,14 +2916,19 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot& registers) {
         pending_summon_reload_map.store(0, std::memory_order_release);
         pending_summon_reload_state_map.store(0, std::memory_order_release);
         record.summon_reload_armed = false;
+        {
+            std::scoped_lock lock{seamless_placement_mutex};
+            pending_cross_map_summon.MarkReloadFailed(summon_generation);
+        }
         record.result = "stage_transition_failed";
         return;
     }
     record.result = "applied";
     LOG_INFO(Debug,
-             "[BLOODBORNE SEAMLESS {}] state=PlacementSelected target_map={:#x} role={} "
-             "native_select=true",
-             invader ? "PVP" : "SUMMON", record.received_map, invader ? "Invader" : "Cooperator");
+             "[BLOODBORNE SEAMLESS {}] generation={} state=SingleReloadStarted "
+             "target_map={:#x} role={} native_select=true reloads=1",
+             invader ? "PVP" : "SUMMON", summon_generation, record.received_map,
+             invader ? "Invader" : "Cooperator");
 }
 
 void ApplySummonReloadStateAtDescriptor(const GuestRegisterSnapshot& registers) {
@@ -2968,7 +3058,7 @@ void ApplyDeferredSummonReload() {
     record.result = "applied";
 }
 
-void ApplyPreMatchCrossMapGuestWarp() {
+[[maybe_unused]] void ApplyPreMatchCrossMapGuestWarp() {
     pre_match_guest_warp = {};
     auto& record = pre_match_guest_warp;
 
@@ -3101,7 +3191,7 @@ void ApplyPreMatchCrossMapGuestWarp() {
     }
 }
 
-void ResumePreMatchCrossMapResponder() {
+[[maybe_unused]] void ResumePreMatchCrossMapResponder() {
     auto& pending = pending_responder_resume;
     if (!IsUsablePackedMap(pending.target_map)) {
         return;
@@ -4440,9 +4530,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     }
     if (deferred_summon_reload_hook_installed && site.offset == SosStatusUpdateOffset) {
         RefreshSeamlessLocalPlacement();
-        ApplyPreMatchCrossMapGuestWarp();
         ApplyDeferredSummonReload();
-        ResumePreMatchCrossMapResponder();
         ProcessEstablishedTravelTick();
     }
     if (healing_fountain_host_availability_hook_installed &&
@@ -6180,6 +6268,7 @@ bool SetSeamlessHostPlacementHeader(std::string_view value) {
     }
 
     bool changed = false;
+    u64 generation = 0;
     {
         std::scoped_lock lock{seamless_placement_mutex};
         if (!seamless_received_host_placement.has_value() ||
@@ -6188,27 +6277,65 @@ bool SetSeamlessHostPlacementHeader(std::string_view value) {
             changed = true;
         }
         seamless_received_host_placement = placement;
+        generation = pending_cross_map_summon.OnPlacementDeferred(placement.packed_region,
+                                                                  EstablishedTravelNowMs());
     }
     if (changed) {
-        if (HasPlayerEffect(GetLocalPlayer(), SinisterResonantBellEffectId)) {
-            LOG_INFO(Debug,
-                     "[BLOODBORNE SEAMLESS PVP] state=HostPlacementReceived map={:#x} area={} "
-                     "bytes={} role=Invader SummonType=2",
-                     placement.packed_region, placement.area, value.size());
-        } else {
-            LOG_INFO(Debug,
-                     "[BLOODBORNE SEAMLESS SUMMON] state=GuestPlacementReceived map={:#x} "
-                     "area={} bytes={} role=Cooperator SummonType=0",
-                     placement.packed_region, placement.area, value.size());
-        }
+        // This callback runs on the HTTP worker. It only queues immutable placement data; all
+        // Bloodborne memory reads and native calls remain on the game-thread hooks.
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS SUMMON] generation={} "
+                 "state=CrossMapPlacementDeferred map={:#x} area={} bytes={}",
+                 generation, placement.packed_region, placement.area, value.size());
     }
     return true;
 }
 
 void ClearSeamlessHostPlacementHeader() {
     std::scoped_lock lock{seamless_placement_mutex};
+    if (pending_cross_map_summon.ShouldRetainPlacementOnMissingCreate(EstablishedTravelNowMs())) {
+        return;
+    }
     seamless_received_host_placement.reset();
     seamless_received_host_placement_consumed = false;
+    pending_cross_map_summon.Reset();
+}
+
+void NotifySeamlessSummonClaimAccepted() {
+    std::scoped_lock lock{seamless_placement_mutex};
+    if (pending_cross_map_summon.OnClaimAccepted(EstablishedTravelNowMs())) {
+        const auto snapshot = pending_cross_map_summon.Snapshot();
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS SUMMON] generation={} state=ClaimAccepted",
+                 snapshot.generation);
+    }
+}
+
+void NotifySeamlessSummonRoomJoinStarted(std::uint64_t room_id) {
+    std::scoped_lock lock{seamless_placement_mutex};
+    if (pending_cross_map_summon.OnRoomJoinStarted(EstablishedTravelNowMs(), room_id)) {
+        const auto snapshot = pending_cross_map_summon.Snapshot();
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS SUMMON] generation={} state=RoomJoinStarted room={}",
+                 snapshot.generation, room_id);
+    }
+}
+
+void NotifySeamlessSummonRoomJoined(std::uint64_t room_id) {
+    std::scoped_lock lock{seamless_placement_mutex};
+    if (pending_cross_map_summon.OnRoomJoined(EstablishedTravelNowMs(), room_id)) {
+        const auto snapshot = pending_cross_map_summon.Snapshot();
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS SUMMON] generation={} state=RoomJoined room={}",
+                 snapshot.generation, snapshot.roomId);
+    }
+}
+
+void NotifySeamlessSummonSignalingEstablished(std::uint64_t room_id) {
+    std::scoped_lock lock{seamless_placement_mutex};
+    if (pending_cross_map_summon.OnSignalingEstablished(EstablishedTravelNowMs(), room_id)) {
+        const auto snapshot = pending_cross_map_summon.Snapshot();
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS SUMMON] generation={} state=SignalingEstablished room={}",
+                 snapshot.generation, snapshot.roomId);
+    }
 }
 
 void TraceMatching2LeaveRoom(std::uintptr_t return_address, std::uint64_t room_id) {
@@ -6946,6 +7073,11 @@ void InstallSeamlessCoopPatches() {
         pending_guest_travel.reset();
         established_rebind_ready_observations = 0;
         established_stop_guard_log_valid.fill(false);
+    }
+    {
+        std::scoped_lock lock{seamless_placement_mutex};
+        pending_cross_map_summon.SetEnabled(hooks_ready && InitialSeamlessPatchesReady());
+        duplicate_reload_logged_generation = 0;
     }
     if (!hooks_ready) {
         LOG_ERROR(Debug,

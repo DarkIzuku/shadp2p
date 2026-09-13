@@ -684,6 +684,7 @@ bool IsBloodborneSummonPath(std::string_view path) {
 }
 
 constexpr std::string_view BloodborneHostPlacementHeader = "X-ShadPS4-Bloodborne-Host-Placement";
+constexpr std::string_view BloodborneClaimAcceptedHeader = "X-ShadPS4-Bloodborne-Claim-Accepted";
 
 bool IsBloodborneSummonRequestPath(std::string_view path) {
     return path.find("/summon_messenger/request") != std::string_view::npos;
@@ -1807,6 +1808,13 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
                 LOG_WARNING(Lib_Http, "Ignored invalid Bloodborne host-placement header");
             } else if (!placement.has_value() && IsBloodborneSummonCreatePath(plan.path)) {
                 Core::Bloodborne::ClearSeamlessHostPlacementHeader();
+            }
+            if (IsBloodborneSummonCreatePath(plan.path)) {
+                const auto claim =
+                    FindResponseHeader(local_res.all_headers_blob, BloodborneClaimAcceptedHeader);
+                if (claim.has_value() && *claim == "1") {
+                    Core::Bloodborne::NotifySeamlessSummonClaimAccepted();
+                }
             }
         }
 

@@ -29,6 +29,89 @@ constexpr SeamlessResponderPolicy SelectSeamlessResponderPolicy(bool sinisterBel
                               : SeamlessResponderPolicy{SeamlessPeerRole::Cooperator, 0, 205, 9005};
 }
 
+constexpr bool ShouldNormalizeSeamlessAppearance(SeamlessPeerRole role) {
+    // Appearance policy is intentionally separate from team/faction/network role. Invaders keep
+    // Bloodborne's hostile presentation and are never folded into the cooperative party.
+    return role == SeamlessPeerRole::Cooperator;
+}
+
+enum class PendingCrossMapSummonPhase : u32 {
+    Idle = 0,
+    PlacementDeferred,
+    ClaimAccepted,
+    RoomJoinStarted,
+    RoomJoined,
+    SignalingEstablished,
+    CrossMapCommit,
+    ReloadStarted,
+    WorldReady,
+    RemoteInserted,
+    Complete,
+    Failed,
+};
+
+enum class PendingCrossMapSummonDecision : u32 {
+    None = 0,
+    WaitForClaim,
+    WaitForRoom,
+    WaitForSignaling,
+    SameMap,
+    Commit,
+    DuplicateReload,
+    StaleTarget,
+};
+
+struct PendingCrossMapSummonSnapshot {
+    PendingCrossMapSummonPhase phase = PendingCrossMapSummonPhase::Idle;
+    SeamlessPeerRole role = SeamlessPeerRole::Unknown;
+    u64 generation = 0;
+    u64 roomId = 0;
+    u32 targetMap = 0;
+    u32 reloadCount = 0;
+    bool claimAccepted = false;
+    bool roomJoinStarted = false;
+    bool roomJoined = false;
+    bool signalingEstablished = false;
+};
+
+class PendingCrossMapSummonStateMachine {
+public:
+    struct Options {
+        s64 timeoutMs = 120'000;
+    };
+
+    PendingCrossMapSummonStateMachine();
+    explicit PendingCrossMapSummonStateMachine(Options options);
+
+    void SetEnabled(bool enabled);
+    u64 OnPlacementDeferred(u32 targetMap, s64 nowMs);
+    bool BindRole(SeamlessPeerRole role, u64 generation = 0);
+    bool OnClaimAccepted(s64 nowMs, u64 generation = 0);
+    bool OnRoomJoinStarted(s64 nowMs, u64 roomId = 0, u64 generation = 0);
+    bool OnRoomJoined(s64 nowMs, u64 roomId, u64 generation = 0);
+    bool OnSignalingEstablished(s64 nowMs, u64 roomId, u64 generation = 0);
+    PendingCrossMapSummonDecision EvaluateNativeHandoff(u32 currentMap, u32 targetMap, s64 nowMs);
+    bool MarkReloadStarted(u64 generation);
+    bool MarkReloadFailed(u64 generation);
+    bool MarkWorldReady(u32 currentMap, u64 generation);
+    bool MarkRemoteInserted(u64 generation);
+    bool ShouldRetainPlacementOnMissingCreate(s64 nowMs) const;
+    PendingCrossMapSummonSnapshot Snapshot() const;
+    void Reset();
+
+private:
+    bool MatchesGeneration(u64 generation) const;
+    bool IsExpired(s64 nowMs) const;
+    void RefreshDeadline(s64 nowMs);
+    void AdvanceReadyPhase();
+
+    Options m_options;
+    bool m_enabled = false;
+    PendingCrossMapSummonSnapshot m_pending;
+    u64 m_nextGeneration = 0;
+    s64 m_deadlineMs = 0;
+};
+
 enum class SeamlessTravelPhase : u32 {
     TravelBegin = 1,
     TravelReady = 2,

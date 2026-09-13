@@ -52,6 +52,70 @@ TEST(BloodborneSeamlessState, ResponderRolesPreserveCapturedBellSemantics) {
     EXPECT_EQ(invader.summonType, 2);
     EXPECT_EQ(invader.goodsId, 225);
     EXPECT_EQ(invader.effectId, 9025);
+    EXPECT_TRUE(ShouldNormalizeSeamlessAppearance(cooperator.role));
+    EXPECT_FALSE(ShouldNormalizeSeamlessAppearance(invader.role));
+}
+
+TEST(BloodborneSeamlessState, CrossMapSummonCommitsOnceAfterSignaling) {
+    PendingCrossMapSummonStateMachine machine;
+    machine.SetEnabled(true);
+    const u64 generation = machine.OnPlacementDeferred(0x15000000, 100);
+    ASSERT_NE(generation, 0);
+    EXPECT_TRUE(machine.BindRole(SeamlessPeerRole::Cooperator, generation));
+    EXPECT_FALSE(machine.OnRoomJoinStarted(105, 17, generation));
+    EXPECT_FALSE(machine.OnSignalingEstablished(106, 17, generation));
+    EXPECT_TRUE(machine.OnClaimAccepted(110, generation));
+    EXPECT_TRUE(machine.OnRoomJoinStarted(120, 0, generation));
+    EXPECT_TRUE(machine.OnRoomJoined(130, 17, generation));
+    EXPECT_EQ(machine.EvaluateNativeHandoff(0x18010000, 0x15000000, 131),
+              PendingCrossMapSummonDecision::WaitForSignaling);
+    EXPECT_FALSE(machine.OnSignalingEstablished(139, 16, generation));
+    EXPECT_TRUE(machine.OnSignalingEstablished(140, 17, generation));
+    EXPECT_EQ(machine.EvaluateNativeHandoff(0x18010000, 0x15000000, 141),
+              PendingCrossMapSummonDecision::Commit);
+    EXPECT_TRUE(machine.MarkReloadStarted(generation));
+    EXPECT_FALSE(machine.MarkReloadStarted(generation));
+    EXPECT_EQ(machine.EvaluateNativeHandoff(0x18010000, 0x15000000, 142),
+              PendingCrossMapSummonDecision::DuplicateReload);
+    EXPECT_TRUE(machine.MarkWorldReady(0x15000000, generation));
+    EXPECT_TRUE(machine.MarkRemoteInserted(generation));
+    const auto result = machine.Snapshot();
+    EXPECT_EQ(result.phase, PendingCrossMapSummonPhase::Complete);
+    EXPECT_EQ(result.roomId, 17);
+    EXPECT_EQ(result.reloadCount, 1);
+}
+
+TEST(BloodborneSeamlessState, SameMapSummonNeverRequestsArtificialReload) {
+    PendingCrossMapSummonStateMachine machine;
+    machine.SetEnabled(true);
+    const u64 generation = machine.OnPlacementDeferred(0x18010000, 100);
+    ASSERT_NE(generation, 0);
+    EXPECT_EQ(machine.EvaluateNativeHandoff(0x18010000, 0x18010000, 101),
+              PendingCrossMapSummonDecision::SameMap);
+    EXPECT_EQ(machine.Snapshot().reloadCount, 0);
+}
+
+TEST(BloodborneSeamlessState, StaleSummonGenerationCannotCommitOrReload) {
+    PendingCrossMapSummonStateMachine machine;
+    machine.SetEnabled(true);
+    const u64 oldGeneration = machine.OnPlacementDeferred(0x15000000, 100);
+    const u64 currentGeneration = machine.OnPlacementDeferred(0x18010000, 110);
+    ASSERT_GT(currentGeneration, oldGeneration);
+    EXPECT_FALSE(machine.OnClaimAccepted(120, oldGeneration));
+    EXPECT_TRUE(machine.OnClaimAccepted(121, currentGeneration));
+    EXPECT_FALSE(machine.MarkReloadStarted(oldGeneration));
+    EXPECT_EQ(machine.EvaluateNativeHandoff(0x17000000, 0x15000000, 122),
+              PendingCrossMapSummonDecision::StaleTarget);
+}
+
+TEST(BloodborneSeamlessState, MissingCreateHeaderRetainsOnlyAcceptedInFlightPlacement) {
+    PendingCrossMapSummonStateMachine machine;
+    machine.SetEnabled(true);
+    const u64 generation = machine.OnPlacementDeferred(0x15000000, 100);
+    EXPECT_FALSE(machine.ShouldRetainPlacementOnMissingCreate(101));
+    ASSERT_TRUE(machine.OnClaimAccepted(102, generation));
+    EXPECT_TRUE(machine.ShouldRetainPlacementOnMissingCreate(103));
+    EXPECT_FALSE(machine.ShouldRetainPlacementOnMissingCreate(120'103));
 }
 
 TEST(BloodborneSeamlessState, HostBeginsAndCommitsValidatedTravel) {

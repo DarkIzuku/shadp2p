@@ -7,11 +7,12 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 ## Scope and executable identity
 
-The current analysis targets the European GOTY executable CUSA03173, app
-version 01.09. The analyzed `eboot.bin` SHA-256 is:
+The current implementation targets the European GOTY executable CUSA03173,
+app version 01.09. The user executable used to validate every active profile
+offset has SHA-256:
 
 ```text
-d65f0b4f01d59166aed16f8604196d8b7dd805abbf0758b356e8f1354c9429f9
+6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80
 ```
 
 Runtime hooks are additionally protected by exact instruction signatures. A
@@ -55,10 +56,14 @@ shadPS4 adds a bounded version-1 `X-ShadPS4-Bloodborne-Host-Placement` header
 to the native `/summon_messenger/request`; shadNet stores it with the claim and
 returns it on the responder's native `/summon_messenger/create` response. The
 header contains a packed map, four IEEE-754 bit patterns, and signed SOS area;
-it does not alter the game's JSON schema. The guest validates and caches the
-header, then the post-copy game hook supplies it to the native placement
-setters. An independent create/request/create probe confirmed byte-for-byte
-header relay through shadNet.
+it does not alter the game's JSON schema. The same response carries the private
+`X-ShadPS4-Bloodborne-Claim-Accepted: 1` acknowledgement. The guest validates
+and caches the destination but does not move yet. Matching2 room creation/join
+and signaling advance an emulator-owned pending-summon state machine. Only the
+game-thread insertion hook may commit the cached descriptor to the native
+forced-placement and stage-transition path. An independent
+create/request/create probe confirmed byte-for-byte placement relay through
+shadNet.
 
 ## Confirmed native paths
 
@@ -1693,6 +1698,72 @@ Remaining general runtime locators retain their existing behavior, but console
 and JSONL diagnostics store at most the first five ambiguous candidates plus
 the total match count and selected candidate. Parser instrumentation produces
 no executable-wide candidate array.
+
+## Single-load initial summon iteration
+
+The earlier runtime build used a two-stage cross-map sequence: shadNet hid an
+eligible candidate in `Preparing`, the responder received the host placement,
+warped before matchmaking, rang the bell again in the destination, and then
+entered Bloodborne's normal summon reload. That ordering explains the observed
+double loading screen. It also made a valid candidate temporarily disappear
+after the broker had already accepted every matchmaking filter.
+
+The replacement sequence keeps the responder in the source world:
+
+```text
+CandidateFound -> CrossMapPlacementDeferred -> ClaimAccepted
+  -> RoomJoinStarted -> RoomJoined -> SignalingEstablished
+  -> CrossMapCommit -> ForcedPlacementApplied -> SingleReloadStarted
+  -> WorldReady -> RemoteInserted -> Complete
+```
+
+`PendingCrossMapSummonStateMachine` owns a monotonically increasing generation,
+the target packed map, role, accepted-claim state, selected Matching2 room,
+signaling state, one reload counter, and a bounded deadline. A signaling event
+must belong to the room produced by the same join. A stale room, target, or
+generation cannot commit a warp. Once the counter reaches one, another native
+handoff for the same generation returns `DuplicateReload` and logs
+`DuplicateReloadSuppressed`; it cannot issue another stage transition. A
+same-map handoff completes with zero artificial reloads.
+
+shadNet now returns every eligible cross-map advertisement immediately. It
+stores the host placement as the final summon destination and delivers the
+claim plus placement to the responder while that responder is still in the
+source world. `Preparing`, pre-match `StageTransition`, automatic bell reuse,
+and destination-world re-advertisement are no longer part of the active path.
+The server trace records one textual reason for every candidate that is not
+returned, including filter mismatch, consumed/unavailable state, another
+requester's active claim, and `GetCount` truncation.
+
+All Bloodborne memory reads and native calls remain on the game thread. HTTP,
+Matching2, and signaling callbacks only advance the mutex-protected pending
+state. The existing profile-specific native functions and exact byte checks
+remain unchanged; this iteration adds no new executable patch and no global
+NOP.
+
+### Hunter's Dream interactions and guest appearance audit
+
+The exact CUSA03173 01.09 Healing Fountain update still proves that object
+byte `+0x49` is the multiplayer availability reason. In the user eboot the
+verified hook is `0x012F870E` with original bytes
+`41 80 7D 48 00`. The final update at `0x012F8F48` checks all four bytes
+`+0x48..+0x4B`, and `0x012F925F` publishes the result through native action
+state setter `0x0146E640`. Previous paired runtime evidence showed all four
+bytes zero after the scoped host override and still no prompt. Therefore a
+second selection/presentation gate exists downstream. No headstone, Doll,
+Workshop, shop, storage, or guest-role offset has yet been demonstrated with
+an exact byte signature. This build deliberately does not replace those
+unknown gates with a global multiplayer NOP.
+
+The role-state function at user-eboot `0x01507A70` selects SpEffect `9006`
+for a regular cooperative guest and `9026` for an invader. Public Bloodborne
+parameter names describe these as the active cooperative/invasion guest-play
+states, not as visual-only flags. Removing or substituting either effect could
+change team, damage, AI targeting, or network role. The appearance policy is
+therefore explicitly role-separated and tested (cooperator eligible, invader
+never eligible), but no runtime appearance mutation is enabled until the
+downstream material/VFX selector is identified. Effect `9005` and effect
+`9025` remain untouched.
 
 ## Established-session travel iteration 1
 

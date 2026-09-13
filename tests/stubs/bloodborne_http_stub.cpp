@@ -24,6 +24,14 @@ void ClearSeamlessHostPlacementHeader() {
     host_placement.reset();
 }
 
+void NotifySeamlessSummonClaimAccepted() {}
+
+void NotifySeamlessSummonRoomJoinStarted(std::uint64_t) {}
+
+void NotifySeamlessSummonRoomJoined(std::uint64_t) {}
+
+void NotifySeamlessSummonSignalingEstablished(std::uint64_t) {}
+
 } // namespace Core::Bloodborne
 
 namespace Core::Debugger {

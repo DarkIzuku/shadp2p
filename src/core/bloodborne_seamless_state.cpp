@@ -22,6 +22,192 @@ bool IsTransitionState(SeamlessTravelState state) {
 
 } // namespace
 
+PendingCrossMapSummonStateMachine::PendingCrossMapSummonStateMachine()
+    : PendingCrossMapSummonStateMachine(Options{}) {}
+
+PendingCrossMapSummonStateMachine::PendingCrossMapSummonStateMachine(Options options)
+    : m_options(options) {
+    m_options.timeoutMs = std::max<s64>(5'000, m_options.timeoutMs);
+}
+
+void PendingCrossMapSummonStateMachine::SetEnabled(bool enabled) {
+    m_enabled = enabled;
+    Reset();
+}
+
+void PendingCrossMapSummonStateMachine::Reset() {
+    m_pending = {};
+    m_deadlineMs = 0;
+}
+
+bool PendingCrossMapSummonStateMachine::MatchesGeneration(u64 generation) const {
+    return m_pending.generation != 0 && (generation == 0 || generation == m_pending.generation);
+}
+
+bool PendingCrossMapSummonStateMachine::IsExpired(s64 nowMs) const {
+    return m_deadlineMs != 0 && nowMs > m_deadlineMs;
+}
+
+void PendingCrossMapSummonStateMachine::RefreshDeadline(s64 nowMs) {
+    m_deadlineMs = nowMs + m_options.timeoutMs;
+}
+
+u64 PendingCrossMapSummonStateMachine::OnPlacementDeferred(u32 targetMap, s64 nowMs) {
+    if (!m_enabled || targetMap == 0)
+        return 0;
+    if (m_pending.targetMap == targetMap && m_pending.phase != PendingCrossMapSummonPhase::Idle &&
+        m_pending.phase != PendingCrossMapSummonPhase::Complete &&
+        m_pending.phase != PendingCrossMapSummonPhase::Failed && !IsExpired(nowMs)) {
+        RefreshDeadline(nowMs);
+        return m_pending.generation;
+    }
+    m_pending = {};
+    m_pending.phase = PendingCrossMapSummonPhase::PlacementDeferred;
+    m_pending.generation = ++m_nextGeneration;
+    m_pending.targetMap = targetMap;
+    RefreshDeadline(nowMs);
+    return m_pending.generation;
+}
+
+bool PendingCrossMapSummonStateMachine::BindRole(SeamlessPeerRole role, u64 generation) {
+    if (!m_enabled || role == SeamlessPeerRole::Unknown || !MatchesGeneration(generation))
+        return false;
+    m_pending.role = role;
+    return true;
+}
+
+bool PendingCrossMapSummonStateMachine::OnClaimAccepted(s64 nowMs, u64 generation) {
+    if (!m_enabled || !MatchesGeneration(generation) || IsExpired(nowMs))
+        return false;
+    m_pending.claimAccepted = true;
+    m_pending.phase = PendingCrossMapSummonPhase::ClaimAccepted;
+    RefreshDeadline(nowMs);
+    return true;
+}
+
+void PendingCrossMapSummonStateMachine::AdvanceReadyPhase() {
+    if (m_pending.signalingEstablished && m_pending.roomJoined)
+        m_pending.phase = PendingCrossMapSummonPhase::SignalingEstablished;
+    else if (m_pending.roomJoined)
+        m_pending.phase = PendingCrossMapSummonPhase::RoomJoined;
+    else if (m_pending.roomJoinStarted)
+        m_pending.phase = PendingCrossMapSummonPhase::RoomJoinStarted;
+}
+
+bool PendingCrossMapSummonStateMachine::OnRoomJoinStarted(s64 nowMs, u64 roomId, u64 generation) {
+    if (!m_enabled || !MatchesGeneration(generation) || !m_pending.claimAccepted ||
+        IsExpired(nowMs)) {
+        return false;
+    }
+    m_pending.roomJoinStarted = true;
+    m_pending.roomJoined = false;
+    m_pending.signalingEstablished = false;
+    m_pending.roomId = roomId;
+    AdvanceReadyPhase();
+    RefreshDeadline(nowMs);
+    return true;
+}
+
+bool PendingCrossMapSummonStateMachine::OnRoomJoined(s64 nowMs, u64 roomId, u64 generation) {
+    if (!m_enabled || !MatchesGeneration(generation) || !m_pending.claimAccepted || roomId == 0 ||
+        IsExpired(nowMs) || (m_pending.roomId != 0 && m_pending.roomId != roomId)) {
+        return false;
+    }
+    m_pending.roomJoinStarted = true;
+    m_pending.roomJoined = true;
+    m_pending.roomId = roomId;
+    AdvanceReadyPhase();
+    RefreshDeadline(nowMs);
+    return true;
+}
+
+bool PendingCrossMapSummonStateMachine::OnSignalingEstablished(s64 nowMs, u64 roomId,
+                                                               u64 generation) {
+    if (!m_enabled || !MatchesGeneration(generation) || !m_pending.claimAccepted ||
+        !m_pending.roomJoined || roomId == 0 || roomId != m_pending.roomId || IsExpired(nowMs)) {
+        return false;
+    }
+    m_pending.signalingEstablished = true;
+    AdvanceReadyPhase();
+    RefreshDeadline(nowMs);
+    return true;
+}
+
+PendingCrossMapSummonDecision PendingCrossMapSummonStateMachine::EvaluateNativeHandoff(
+    u32 currentMap, u32 targetMap, s64 nowMs) {
+    if (!m_enabled || m_pending.phase == PendingCrossMapSummonPhase::Idle || IsExpired(nowMs))
+        return PendingCrossMapSummonDecision::None;
+    if (m_pending.phase == PendingCrossMapSummonPhase::Complete)
+        return PendingCrossMapSummonDecision::None;
+    if (targetMap != m_pending.targetMap)
+        return PendingCrossMapSummonDecision::StaleTarget;
+    if (currentMap == targetMap) {
+        m_pending.phase = m_pending.reloadCount == 0 ? PendingCrossMapSummonPhase::Complete
+                                                     : PendingCrossMapSummonPhase::WorldReady;
+        return PendingCrossMapSummonDecision::SameMap;
+    }
+    if (m_pending.reloadCount != 0)
+        return PendingCrossMapSummonDecision::DuplicateReload;
+    if (!m_pending.claimAccepted)
+        return PendingCrossMapSummonDecision::WaitForClaim;
+    if (!m_pending.roomJoined)
+        return PendingCrossMapSummonDecision::WaitForRoom;
+    if (!m_pending.signalingEstablished)
+        return PendingCrossMapSummonDecision::WaitForSignaling;
+    m_pending.phase = PendingCrossMapSummonPhase::CrossMapCommit;
+    RefreshDeadline(nowMs);
+    return PendingCrossMapSummonDecision::Commit;
+}
+
+bool PendingCrossMapSummonStateMachine::MarkReloadStarted(u64 generation) {
+    if (!m_enabled || !MatchesGeneration(generation) || m_pending.reloadCount != 0 ||
+        m_pending.phase != PendingCrossMapSummonPhase::CrossMapCommit) {
+        return false;
+    }
+    m_pending.reloadCount = 1;
+    m_pending.phase = PendingCrossMapSummonPhase::ReloadStarted;
+    return true;
+}
+
+bool PendingCrossMapSummonStateMachine::MarkReloadFailed(u64 generation) {
+    if (!MatchesGeneration(generation) ||
+        m_pending.phase != PendingCrossMapSummonPhase::ReloadStarted)
+        return false;
+    m_pending.reloadCount = 0;
+    m_pending.phase = PendingCrossMapSummonPhase::SignalingEstablished;
+    return true;
+}
+
+bool PendingCrossMapSummonStateMachine::MarkWorldReady(u32 currentMap, u64 generation) {
+    if (!MatchesGeneration(generation) || currentMap != m_pending.targetMap ||
+        m_pending.phase != PendingCrossMapSummonPhase::ReloadStarted) {
+        return false;
+    }
+    m_pending.phase = PendingCrossMapSummonPhase::WorldReady;
+    return true;
+}
+
+bool PendingCrossMapSummonStateMachine::MarkRemoteInserted(u64 generation) {
+    if (!MatchesGeneration(generation) ||
+        (m_pending.phase != PendingCrossMapSummonPhase::WorldReady &&
+         m_pending.phase != PendingCrossMapSummonPhase::ReloadStarted)) {
+        return false;
+    }
+    m_pending.phase = PendingCrossMapSummonPhase::RemoteInserted;
+    m_pending.phase = PendingCrossMapSummonPhase::Complete;
+    return true;
+}
+
+bool PendingCrossMapSummonStateMachine::ShouldRetainPlacementOnMissingCreate(s64 nowMs) const {
+    return m_enabled && !IsExpired(nowMs) && m_pending.claimAccepted &&
+           m_pending.phase != PendingCrossMapSummonPhase::Complete &&
+           m_pending.phase != PendingCrossMapSummonPhase::Failed;
+}
+
+PendingCrossMapSummonSnapshot PendingCrossMapSummonStateMachine::Snapshot() const {
+    return m_pending;
+}
+
 SeamlessTravelStateMachine::SeamlessTravelStateMachine() : SeamlessTravelStateMachine(Options{}) {}
 
 SeamlessTravelStateMachine::SeamlessTravelStateMachine(Options options) : m_options(options) {
