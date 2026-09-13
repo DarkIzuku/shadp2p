@@ -2390,6 +2390,156 @@ bool InstallGuestCodeHook(void* address, std::span<const u8> expected_instructio
     return true;
 }
 
+bool InstallGuestConditionalCallHook(void* address, std::span<const u8, 5> expected_call, u64 tag,
+                                     GuestCallGuard guard, u64 suppressed_return) {
+    constexpr size_t CallBytes = 5;
+    constexpr size_t GuestRedZoneBytes = 128;
+    constexpr size_t SnapshotOffset = 0;
+    constexpr size_t ScratchR11Offset = sizeof(GuestRegisterSnapshot);
+    constexpr size_t ScratchRflagsOffset = ScratchR11Offset + sizeof(u64);
+    constexpr size_t GuardResultOffset = ScratchRflagsOffset + sizeof(u64);
+    constexpr size_t FrameReserve =
+        Common::AlignUp(GuardResultOffset + sizeof(u64) + GuestRedZoneBytes, 16);
+    static_assert(FrameReserve % 16 == 0);
+
+    auto* code = static_cast<u8*>(address);
+    auto* module = GetContainingModule(code);
+    if (module == nullptr || guard == nullptr || code[0] != 0xE8 || expected_call[0] != 0xE8 ||
+        CallBytes > static_cast<size_t>(module->end - code)) {
+        return false;
+    }
+
+    std::unique_lock lock{module->mutex};
+    if (!std::ranges::equal(expected_call, std::span<const u8, CallBytes>{code, CallBytes})) {
+        LOG_ERROR(Core, "Guest conditional call hook signature mismatch at {}", fmt::ptr(code));
+        return false;
+    }
+    if (std::ranges::any_of(module->patched, [code](const u8* patched) {
+            return patched >= code && patched < code + CallBytes;
+        })) {
+        LOG_ERROR(Core, "Guest conditional call hook overlaps an existing CPU patch at {}",
+                  fmt::ptr(code));
+        return false;
+    }
+    s32 displacement{};
+    std::memcpy(&displacement, code + 1, sizeof(displacement));
+    auto* original_target = code + CallBytes + displacement;
+
+    auto& trampoline = module->trampoline_gen;
+    const size_t trampoline_offset = trampoline.getSize();
+    const auto* trampoline_start = trampoline.getCurr();
+    const auto snapshot = [](size_t field_offset) {
+        return qword[rsp + SnapshotOffset + field_offset];
+    };
+
+    try {
+        Xbyak::Label call_original;
+        trampoline.lea(rsp, ptr[rsp - FrameReserve]);
+        trampoline.mov(qword[rsp + ScratchR11Offset], r11);
+        trampoline.pushfq();
+        trampoline.pop(r11);
+        trampoline.mov(qword[rsp + ScratchRflagsOffset], r11);
+        trampoline.mov(r11, rsp);
+        trampoline.and_(rsp, -16);
+
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, rax)), rax);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, rbx)), rbx);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, rcx)), rcx);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, rdx)), rdx);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, rsi)), rsi);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, rdi)), rdi);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, rbp)), rbp);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, r8)), r8);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, r9)), r9);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, r10)), r10);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, r12)), r12);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, r13)), r13);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, r14)), r14);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, r15)), r15);
+        trampoline.mov(rax, qword[r11 + ScratchR11Offset]);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, r11)), rax);
+        trampoline.mov(rax, qword[r11 + ScratchRflagsOffset]);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, rflags)), rax);
+        trampoline.lea(rax, ptr[r11 + FrameReserve]);
+        trampoline.mov(snapshot(offsetof(GuestRegisterSnapshot, rsp)), rax);
+        trampoline.stmxcsr(dword[rsp + SnapshotOffset + offsetof(GuestRegisterSnapshot, mxcsr)]);
+        for (size_t index = 0; index < 16; ++index) {
+            const size_t offset = SnapshotOffset + offsetof(GuestRegisterSnapshot, ymm) +
+                                  index * sizeof(std::array<u8, 32>);
+            trampoline.vmovdqu(yword[rsp + offset], Xbyak::Ymm(static_cast<int>(index)));
+        }
+
+        trampoline.mov(r12, rsp);
+        trampoline.mov(rdi, tag);
+        trampoline.mov(rax, reinterpret_cast<u64>(guard));
+        trampoline.call(rax);
+        trampoline.mov(rsp, r12);
+        trampoline.mov(qword[rsp + GuardResultOffset], rax);
+
+        for (size_t index = 0; index < 16; ++index) {
+            const size_t offset = SnapshotOffset + offsetof(GuestRegisterSnapshot, ymm) +
+                                  index * sizeof(std::array<u8, 32>);
+            trampoline.vmovdqu(Xbyak::Ymm(static_cast<int>(index)), yword[rsp + offset]);
+        }
+        trampoline.ldmxcsr(dword[rsp + SnapshotOffset + offsetof(GuestRegisterSnapshot, mxcsr)]);
+        trampoline.mov(rbx, snapshot(offsetof(GuestRegisterSnapshot, rbx)));
+        trampoline.mov(rcx, snapshot(offsetof(GuestRegisterSnapshot, rcx)));
+        trampoline.mov(rdx, snapshot(offsetof(GuestRegisterSnapshot, rdx)));
+        trampoline.mov(rsi, snapshot(offsetof(GuestRegisterSnapshot, rsi)));
+        trampoline.mov(rdi, snapshot(offsetof(GuestRegisterSnapshot, rdi)));
+        trampoline.mov(rbp, snapshot(offsetof(GuestRegisterSnapshot, rbp)));
+        trampoline.mov(r8, snapshot(offsetof(GuestRegisterSnapshot, r8)));
+        trampoline.mov(r9, snapshot(offsetof(GuestRegisterSnapshot, r9)));
+        trampoline.mov(r10, snapshot(offsetof(GuestRegisterSnapshot, r10)));
+        trampoline.mov(r12, snapshot(offsetof(GuestRegisterSnapshot, r12)));
+        trampoline.mov(r13, snapshot(offsetof(GuestRegisterSnapshot, r13)));
+        trampoline.mov(r14, snapshot(offsetof(GuestRegisterSnapshot, r14)));
+        trampoline.mov(r15, snapshot(offsetof(GuestRegisterSnapshot, r15)));
+        trampoline.mov(r11, qword[rsp + GuardResultOffset]);
+        trampoline.test(r11, r11);
+        trampoline.jz(call_original, Xbyak::CodeGenerator::LabelType::T_NEAR);
+
+        trampoline.mov(r11, snapshot(offsetof(GuestRegisterSnapshot, r11)));
+        trampoline.mov(rax, snapshot(offsetof(GuestRegisterSnapshot, rflags)));
+        trampoline.push(rax);
+        trampoline.popfq();
+        trampoline.mov(rax, suppressed_return);
+        trampoline.mov(rsp, snapshot(offsetof(GuestRegisterSnapshot, rsp)));
+        trampoline.jmp(code + CallBytes, Xbyak::CodeGenerator::LabelType::T_NEAR);
+
+        trampoline.L(call_original);
+        trampoline.mov(r11, snapshot(offsetof(GuestRegisterSnapshot, r11)));
+        trampoline.mov(rax, snapshot(offsetof(GuestRegisterSnapshot, rflags)));
+        trampoline.push(rax);
+        trampoline.popfq();
+        trampoline.mov(rax, snapshot(offsetof(GuestRegisterSnapshot, rax)));
+        trampoline.mov(rsp, snapshot(offsetof(GuestRegisterSnapshot, rsp)));
+        trampoline.call(original_target);
+        trampoline.jmp(code + CallBytes, Xbyak::CodeGenerator::LabelType::T_NEAR);
+    } catch (const Xbyak::Error& error) {
+        trampoline.setSize(trampoline_offset);
+        HandleTrampolineError(module, error);
+        LOG_ERROR(Core, "Could not generate guest conditional call hook at {}: {}", fmt::ptr(code),
+                  error.what());
+        return false;
+    }
+
+    try {
+        auto& patch = module->patch_gen;
+        patch.reset();
+        patch.setSize(code - patch.getCode());
+        patch.jmp(trampoline_start, Xbyak::CodeGenerator::LabelType::T_NEAR);
+    } catch (const Xbyak::Error& error) {
+        trampoline.setSize(trampoline_offset);
+        LOG_ERROR(Core, "Could not patch guest conditional call hook at {}: {}", fmt::ptr(code),
+                  error.what());
+        return false;
+    }
+
+    module->patched.insert(code);
+    return true;
+}
+
 void PrePatchInstructions(u64 segment_addr, u64 segment_size) {
 #if !defined(_WIN32) && !defined(__APPLE__)
     // Linux and others have an FS segment pointing to valid memory, so continue to do full

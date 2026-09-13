@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/bloodborne_re.h"
+#include "core/bloodborne_seamless_state.h"
 
 #include <algorithm>
 #include <array>
@@ -22,6 +23,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "common/logging/log.h"
@@ -31,7 +33,9 @@
 #include "core/cpu_patches.h"
 #include "core/debugger.h"
 #include "core/file_format/psf.h"
+#include "core/libraries/np/np_matching2/np_matching2_mm.h"
 #include "core/memory.h"
+#include "shadnet/client.h"
 
 namespace Core::Bloodborne {
 namespace {
@@ -196,10 +200,62 @@ constexpr u64 SetForcedSummonWarpOffset = 0x0156CF60;
 constexpr u64 SelectSummonedPlacementOffset = 0x01332BC0;
 constexpr u64 SummonedMapReloadOffset = 0x01336B90;
 constexpr u64 StageTransitionOffset = 0x013CDE30;
+
+struct EstablishedTravelProfile {
+    std::string_view name;
+    u64 global_state_pointer;
+    u64 candidate_local_state_pointer;
+    u64 summon_manager_root_pointer;
+    u64 current_map_list_pointer;
+    u64 matching_state_pointer;
+    u64 summon_session_rules_pointer;
+    u64 warp_param;
+    u64 stage_transition;
+    u64 periodic_tick;
+    u64 stage_stop_call;
+    std::array<u8, 5> stage_stop_expected;
+    std::array<u8, 5> stage_keep_expected;
+    u64 matching_check_stop_call;
+    std::array<u8, 5> matching_check_stop_expected;
+};
+
+constexpr EstablishedTravelProfile EstablishedTravelProfiles[] = {
+    {"cusa03173-109-reference",
+     GlobalStatePointerOffset,
+     CandidateLocalStatePointerOffset,
+     SummonManagerRootPointerOffset,
+     CurrentMapListPointerOffset,
+     MatchingStatePointerOffset,
+     SummonSessionRulesPointerOffset,
+     0x013CDF30,
+     0x013CDE30,
+     SosStatusUpdateOffset,
+     StageTransitionStopMatchingCallOffset,
+     StageTransitionStopMatchingCall,
+     StageTransitionKeepMatchingCall,
+     0x013809B7,
+     {0xE8, 0xE4, 0xFD, 0xB4, 0x00}},
+    {"cusa03173-109-user-eboot-6764938b",
+     0x05556648,
+     0x0553E848,
+     0x0553B0F0,
+     0x0553B118,
+     0x05540260,
+     0x0553D6A0,
+     0x013CE320,
+     0x013CE220,
+     0x01872870,
+     0x019475F1,
+     {0xE8, 0x2A, 0x94, 0x58, 0x00},
+     {0xE8, 0x2A, 0x8D, 0x58, 0x00},
+     0x01380D57,
+     {0xE8, 0xC4, 0xFC, 0xB4, 0x00}},
+};
 constexpr u64 SetSummonReloadStateOffset = 0x0178D9A0;
 constexpr u64 UseItemNativeApplyOffset = 0x018F9720;
 constexpr s32 SmallResonantBellGoodsId = 205;
 constexpr s32 SmallResonantBellEffectId = 9005;
+constexpr s32 SinisterResonantBellEffectId = 9025;
 constexpr s32 BellUseArgument = 17;
 constexpr u32 ResponderResumeStableObservations = 20;
 constexpr u32 ResponderResumeMaxAttempts = 2;
@@ -561,6 +617,144 @@ constexpr auto CrossMapNativeCalls = std::to_array<NativeCallSignature>({
       0xEC},
      16},
 });
+
+struct InitialSeamlessProfile {
+    std::string_view name;
+    u64 global_state_pointer;
+    u64 candidate_local_state_pointer;
+    u64 summon_manager_root_pointer;
+    u64 current_map_list_pointer;
+    u64 matching_state_pointer;
+    u64 summon_session_rules_pointer;
+    u64 role_metadata_table;
+    u64 summon_build_role_table;
+    u64 beckoning_area_comparison;
+    u64 beckoning_area_flag_result;
+    u64 responder_bell_area_result;
+    u64 responder_bell_common_result;
+    std::array<u8, 8> responder_bell_common_expected;
+    u64 active_bell_area_comparison;
+    u64 active_bell_area_flag_result;
+    u64 responder_search_area_range_result;
+    u64 sos_status_area_restriction;
+    u64 summon_candidate_area_restriction;
+    u64 summon_build_area_restriction;
+    u64 summon_build_world_state_restriction;
+    u64 summon_build_negative_event_restriction;
+    u64 stage_transition_stop_matching_call;
+    std::array<u8, 5> stage_transition_stop_expected;
+    std::array<u8, 5> stage_transition_keep_expected;
+    u64 summon_build_entry;
+    u64 sos_status_update;
+    u64 stage_warp_descriptor_finalize;
+    u64 cross_map_guest_handoff;
+    u64 healing_fountain_availability;
+    std::array<NativeCallSignature, 9> native_calls;
+};
+
+constexpr InitialSeamlessProfile InitialSeamlessProfiles[] = {
+    {"cusa03173-109-reference",
+     GlobalStatePointerOffset,
+     CandidateLocalStatePointerOffset,
+     SummonManagerRootPointerOffset,
+     CurrentMapListPointerOffset,
+     MatchingStatePointerOffset,
+     SummonSessionRulesPointerOffset,
+     RoleMetadataTableOffset,
+     SummonBuildRoleTableOffset,
+     BeckoningAreaComparisonOffset,
+     BeckoningAreaFlagResultOffset,
+     ResponderBellAreaResultOffset,
+     ResponderBellCommonResultOffset,
+     ResponderBellCommonResult,
+     ActiveBellAreaComparisonOffset,
+     ActiveBellAreaFlagResultOffset,
+     ResponderSearchAreaRangeResultOffset,
+     SosStatusAreaRestrictionOffset,
+     SummonCandidateAreaRestrictionOffset,
+     SummonBuildAreaRestrictionOffset,
+     SummonBuildWorldStateRestrictionOffset,
+     SummonBuildNegativeEventRestrictionOffset,
+     StageTransitionStopMatchingCallOffset,
+     StageTransitionStopMatchingCall,
+     StageTransitionKeepMatchingCall,
+     SummonBuildEntryOffset,
+     SosStatusUpdateOffset,
+     StageWarpDescriptorFinalizeOffset,
+     CrossMapGuestHandoffOffset,
+     HealingFountainAvailabilityOffset,
+     CrossMapNativeCalls},
+    {"cusa03173-109-user-eboot-6764938b",
+     0x05556648,
+     0x0553E848,
+     0x0553B0F0,
+     0x0553B118,
+     0x05540260,
+     0x0553D6A0,
+     0x0553D720,
+     0x0556E530,
+     0x0157FAE8,
+     0x0157FB80,
+     0x0157F8F1,
+     0x0157F8F3,
+     {0x4C, 0x89, 0xF7, 0xE8, 0xE5, 0xA2, 0x34, 0x00},
+     0x01506B6B,
+     0x01506BAC,
+     0x0191AD03,
+     0x018705E3,
+     0x014B755A,
+     0x01875089,
+     0x01874EF8,
+     0x01874F00,
+     0x019475F1,
+     {0xE8, 0x2A, 0x94, 0x58, 0x00},
+     {0xE8, 0x2A, 0x8D, 0x58, 0x00},
+     0x01874C20,
+     0x01872870,
+     0x01945363,
+     0x01E5012A,
+     0x012F870E,
+     {{{"SetForcedSummonMap",
+        0x0156D130,
+        {0x48, 0x8B, 0x05, 0x11, 0x95, 0xFE, 0x03, 0x8B, 0x0F, 0x89, 0x88, 0xF0, 0x14, 0x00, 0x00,
+         0xC3},
+        16},
+       {"SetForcedSummonPosition",
+        0x0156D140,
+        {0x48, 0x8B, 0x05, 0x01, 0x95, 0xFE, 0x03, 0xC5, 0xF8, 0x28, 0x07, 0xC5, 0xF8, 0x29, 0x80,
+         0x00},
+        16},
+       {"SetForcedSummonOrientation",
+        0x0156D160,
+        {0x48, 0x8B, 0x05, 0xE1, 0x94, 0xFE, 0x03, 0xC5, 0xF8, 0x28, 0x07, 0xC5, 0xF8, 0x29, 0x80,
+         0x10},
+        16},
+       {"SetForcedSummonWarp",
+        0x0156D180,
+        {0x48, 0x8B, 0x05, 0xC1, 0x94, 0xFE, 0x03, 0xC6, 0x80, 0x20, 0x15, 0x00, 0x00, 0x01, 0xC3},
+        15},
+       {"SelectSummonedPlacement",
+        0x01332F60,
+        {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x83, 0xEC, 0x18},
+        13},
+       {"SummonedMapReload",
+        0x01336F30,
+        {0x55, 0x48, 0x89, 0xE5, 0x48, 0x8D, 0x05, 0x5D, 0x41, 0x20, 0x04, 0x48, 0x83, 0x38, 0x00},
+        15},
+       {"StageTransition",
+        0x013CE220,
+        {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50},
+        14},
+       {"SetSummonReloadState",
+        0x0178DBC0,
+        {0xC7, 0x87, 0x84, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0xC3},
+        11},
+       {"UseItemNativeApply",
+        0x018F9B50,
+        {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83,
+         0xEC},
+        16}}}},
+};
 
 constexpr auto Sites = std::to_array<TraceSite>({
     {"IsValidSos.Update", 0x01308DC0, TraceKind::SosCondition, StandardR15Prologue, 6},
@@ -1203,6 +1397,38 @@ std::mutex capture_mutex;
 std::ofstream capture_file;
 std::filesystem::path capture_path;
 uintptr_t image_base{};
+const EstablishedTravelProfile* established_travel_profile{};
+const InitialSeamlessProfile* initial_seamless_profile{};
+u64 runtime_global_state_pointer_offset{GlobalStatePointerOffset};
+u64 runtime_candidate_local_state_pointer_offset{CandidateLocalStatePointerOffset};
+u64 runtime_summon_manager_root_pointer_offset{SummonManagerRootPointerOffset};
+u64 runtime_current_map_list_pointer_offset{CurrentMapListPointerOffset};
+u64 runtime_matching_state_pointer_offset{MatchingStatePointerOffset};
+u64 runtime_summon_session_rules_pointer_offset{SummonSessionRulesPointerOffset};
+u64 runtime_role_metadata_table_offset{RoleMetadataTableOffset};
+u64 runtime_summon_build_role_table_offset{SummonBuildRoleTableOffset};
+u64 runtime_set_forced_summon_map_offset{SetForcedSummonMapOffset};
+u64 runtime_set_forced_summon_position_offset{SetForcedSummonPositionOffset};
+u64 runtime_set_forced_summon_orientation_offset{SetForcedSummonOrientationOffset};
+u64 runtime_set_forced_summon_warp_offset{SetForcedSummonWarpOffset};
+u64 runtime_select_summoned_placement_offset{SelectSummonedPlacementOffset};
+u64 runtime_summoned_map_reload_offset{SummonedMapReloadOffset};
+u64 runtime_stage_transition_offset{StageTransitionOffset};
+u64 runtime_set_summon_reload_state_offset{SetSummonReloadStateOffset};
+u64 runtime_use_item_native_apply_offset{UseItemNativeApplyOffset};
+std::mutex established_travel_mutex;
+SeamlessTravelStateMachine established_travel_state;
+std::optional<SeamlessTravelEvent> pending_guest_travel;
+thread_local s32 observed_warp_param_id{-1};
+thread_local s64 observed_warp_param_time_ms{};
+bool established_warp_param_hook_installed{};
+bool established_stage_transition_hook_installed{};
+bool established_periodic_hook_installed{};
+bool established_stage_stop_guard_installed{};
+bool established_matching_stop_guard_installed{};
+u32 established_rebind_ready_observations{};
+std::array<u64, 3> established_stop_guard_logged_sequence{};
+std::array<bool, 3> established_stop_guard_log_valid{};
 u64 ss_info_parser_call_runtime_offset{};
 u64 ss_info_parser_target_runtime_offset{};
 bool installed{};
@@ -1282,6 +1508,8 @@ std::mutex seamless_placement_mutex;
 std::optional<SummonPlacementDescriptor> seamless_host_placement;
 std::optional<SummonPlacementDescriptor> seamless_received_host_placement;
 bool seamless_received_host_placement_consumed{};
+PendingCrossMapSummonStateMachine pending_cross_map_summon;
+u64 duplicate_reload_logged_generation{};
 std::atomic<u32> pending_summon_reload_map{};
 std::atomic<u32> pending_summon_reload_state_map{};
 
@@ -1342,6 +1570,9 @@ thread_local PreMatchGuestWarpRecord pre_match_guest_warp{};
 struct PendingResponderResume {
     u32 target_map{};
     s32 target_area{};
+    s32 goods_id{SmallResonantBellGoodsId};
+    s32 effect_id{SmallResonantBellEffectId};
+    bool invader{};
     u32 ready_observations{};
     u32 attempts{};
     bool dispatched{};
@@ -1361,6 +1592,9 @@ struct ResponderResumeRecord {
     s32 multi_play_state{-1};
     u64 matching_controller{};
     u64 player{};
+    s32 goods_id{};
+    s32 effect_id{};
+    bool invader{};
     u32 ready_observations{};
     u32 attempts{};
     bool effect_active{};
@@ -2040,7 +2274,9 @@ u64 GetMatchingState();
 
 u64 GetLocalPlayer() {
     const u64 local_state =
-        image_base != 0 ? ReadValue<u64>(image_base + CandidateLocalStatePointerOffset, 0) : 0;
+        image_base != 0
+            ? ReadValue<u64>(image_base + runtime_candidate_local_state_pointer_offset, 0)
+            : 0;
     return local_state >= 0x10000 ? ReadValue<u64>(local_state, 0x60) : 0;
 }
 
@@ -2069,7 +2305,8 @@ bool HasPlayerEffect(u64 player, s32 effect_id) {
 
 u32 GetCurrentPackedMap() {
     const u64 map_list =
-        image_base != 0 ? ReadValue<u64>(image_base + CurrentMapListPointerOffset, 0) : 0;
+        image_base != 0 ? ReadValue<u64>(image_base + runtime_current_map_list_pointer_offset, 0)
+                        : 0;
     if (map_list < 0x10000 || !HasMemoryAccess(map_list, 0x24, MemoryProt::CpuRead)) {
         return 0;
     }
@@ -2114,7 +2351,8 @@ bool ReadLocalSummonPlacement(SummonPlacementDescriptor& placement, std::string_
         return false;
     }
 
-    const u64 local_state = ReadValue<u64>(image_base + CandidateLocalStatePointerOffset, 0);
+    const u64 local_state =
+        ReadValue<u64>(image_base + runtime_candidate_local_state_pointer_offset, 0);
     const u64 local_world = local_state >= 0x10000 ? ReadValue<u64>(local_state, 0x60) : 0;
     const u64 character = local_world >= 0x10000 ? ReadValue<u64>(local_world, 0x58) : 0;
     const u64 character_state = character >= 0x10000 ? ReadValue<u64>(character, 0x08) : 0;
@@ -2147,6 +2385,280 @@ void RefreshSeamlessLocalPlacement() {
     }
     std::scoped_lock lock{seamless_placement_mutex};
     seamless_host_placement = placement;
+}
+
+enum class EstablishedTravelHook : u64 {
+    WarpParamEntry = 1,
+    StageTransitionEntry = 2,
+    PeriodicTick = 3,
+};
+
+s64 EstablishedTravelNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+void DispatchEstablishedTravelAction(SeamlessAction action) {
+    switch (action.type) {
+    case SeamlessActionType::SendTravelBegin:
+    case SeamlessActionType::SendTravelReady:
+    case SeamlessActionType::SendTravelCommit:
+    case SeamlessActionType::SendTravelArrived:
+    case SeamlessActionType::SendTravelFailed:
+        if (!Libraries::Np::NpMatching2::MmSendSeamlessControl(action.event)) {
+            LOG_WARNING(Debug,
+                        "[BLOODBORNE SEAMLESS MATCHING] party={} seq={} phase={} "
+                        "result=control_send_failed",
+                        action.event.partyId, action.event.sequenceId,
+                        static_cast<u32>(action.event.phase));
+        }
+        break;
+    case SeamlessActionType::StartGuestWarp: {
+        std::scoped_lock lock{established_travel_mutex};
+        if (!pending_guest_travel.has_value() ||
+            action.event.sequenceId > pending_guest_travel->sequenceId) {
+            pending_guest_travel = std::move(action.event);
+            established_rebind_ready_observations = 0;
+        }
+        break;
+    }
+    case SeamlessActionType::None:
+        break;
+    }
+}
+
+SeamlessTravelEvent FromControlNotification(const ShadNet::SeamlessTravelEvent& input) {
+    SeamlessTravelEvent event;
+    event.protocolVersion = input.protocolVersion;
+    event.phase = static_cast<SeamlessTravelPhase>(input.phase);
+    event.partyId = input.partyId;
+    event.generation = input.generation;
+    event.sequenceId = input.sequenceId;
+    event.leaderUserId = input.leaderUserId;
+    event.leaderNpid = input.leaderNpid;
+    event.activeRoomId = input.activeRoomId;
+    event.sourceMap = input.sourceMap;
+    event.destinationMap = input.destinationMap;
+    event.warpParamId = input.warpParamId;
+    event.mode = input.mode;
+    event.positionX = input.positionX;
+    event.positionY = input.positionY;
+    event.positionZ = input.positionZ;
+    event.orientation = input.orientation;
+    event.timestampMs = input.timestampMs;
+    event.failureReason = input.failureReason;
+    return event;
+}
+
+void OnEstablishedTravelNotification(const ShadNet::NotifySeamlessControl& notification) {
+    const s64 now_ms = EstablishedTravelNowMs();
+    const auto event = FromControlNotification(notification.event);
+    SeamlessAction action;
+    {
+        std::scoped_lock lock{established_travel_mutex};
+        action = established_travel_state.OnNotification(
+            event, notification.sourceUserId,
+            Libraries::Np::NpMatching2::GetSeamlessMatchingSnapshot(), now_ms);
+    }
+    LOG_INFO(Debug,
+             "[BLOODBORNE SEAMLESS TRAVEL] party={} seq={} leader={} source={} "
+             "source_map={:#x} destination_map={:#x} warp_param={} phase={} action={}",
+             event.partyId, event.sequenceId, event.leaderNpid, notification.sourceNpid,
+             event.sourceMap, event.destinationMap, event.warpParamId,
+             static_cast<u32>(event.phase), static_cast<u32>(action.type));
+    DispatchEstablishedTravelAction(std::move(action));
+}
+
+void OnEstablishedTravelReply(SeamlessTravelPhase requested_phase, bool accepted,
+                              const std::string& reason, const std::string& party_id,
+                              u64 generation, u64 sequence_id, SeamlessTravelState server_state) {
+    const s64 now_ms = EstablishedTravelNowMs();
+    {
+        std::scoped_lock lock{established_travel_mutex};
+        established_travel_state.OnControlReply(requested_phase, accepted, party_id, generation,
+                                                sequence_id, server_state, now_ms);
+    }
+    LOG_INFO(Debug,
+             "[BLOODBORNE SEAMLESS MATCHING] party={} seq={} phase={} accepted={} "
+             "server_state={} result={}",
+             party_id, sequence_id, static_cast<u32>(requested_phase), accepted,
+             static_cast<u32>(server_state), reason);
+}
+
+void ProcessEstablishedTravelTick() {
+    const auto* profile = established_travel_profile;
+    if (profile == nullptr)
+        return;
+
+    std::optional<SeamlessTravelEvent> guest_warp;
+    {
+        std::scoped_lock lock{established_travel_mutex};
+        guest_warp = std::exchange(pending_guest_travel, std::nullopt);
+    }
+    if (guest_warp.has_value()) {
+        using WarpParam = void PS4_SYSV_ABI (*)(s32);
+        const auto warp = reinterpret_cast<WarpParam>(image_base + profile->warp_param);
+        {
+            std::scoped_lock lock{established_travel_mutex};
+            established_travel_state.MarkGuestWarpStarted(EstablishedTravelNowMs());
+        }
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS TRAVEL] party={} seq={} destination_map={:#x} "
+                 "warp_param={} state=GuestWarpStarted",
+                 guest_warp->partyId, guest_warp->sequenceId, guest_warp->destinationMap,
+                 guest_warp->warpParamId);
+        warp(guest_warp->warpParamId);
+    }
+
+    const auto matching = Libraries::Np::NpMatching2::GetSeamlessMatchingSnapshot();
+    const u32 current_map = GetCurrentPackedMap();
+    const bool world_ready = current_map != 0 && GetLocalPlayer() >= 0x10000;
+    const u64 multiplayer = GetMatchingState();
+    const bool matching_ready =
+        matching.inRoom && multiplayer >= 0x10000 && ReadValue<s32>(multiplayer, 0x124) == 6;
+
+    SeamlessAction world_action;
+    SeamlessAction timeout_action;
+    std::optional<SeamlessTravelEvent> observed_travel;
+    bool log_world_ready = false;
+    bool log_remote_rebind = false;
+    bool log_travel_complete = false;
+    {
+        std::scoped_lock lock{established_travel_mutex};
+        const auto& active = established_travel_state.ActiveTravel();
+        if (active.has_value())
+            observed_travel = *active;
+        const bool at_destination = active.has_value() && current_map == active->destinationMap;
+        const u32 previous_ready_observations = established_rebind_ready_observations;
+        if (at_destination && world_ready && matching_ready) {
+            established_rebind_ready_observations =
+                std::min<u32>(established_rebind_ready_observations + 1, 3);
+        } else {
+            established_rebind_ready_observations = 0;
+        }
+        const bool remote_rebound = established_rebind_ready_observations >= 3;
+        const s64 now_ms = EstablishedTravelNowMs();
+        world_action = established_travel_state.ObserveWorld(current_map, world_ready,
+                                                             remote_rebound, matching, now_ms);
+        timeout_action = established_travel_state.CheckTimeout(matching, now_ms);
+        log_world_ready = world_action.type == SeamlessActionType::SendTravelArrived;
+        log_remote_rebind = previous_ready_observations < 3 && remote_rebound;
+        log_travel_complete = observed_travel.has_value() &&
+                              established_travel_state.State() == SeamlessTravelState::Connected &&
+                              !established_travel_state.ActiveTravel().has_value();
+    }
+    if (observed_travel.has_value() && log_world_ready) {
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS TRAVEL] party={} seq={} destination_map={:#x} "
+                 "state={}WorldReady",
+                 observed_travel->partyId, observed_travel->sequenceId,
+                 observed_travel->destinationMap, matching.roomOwner ? "Leader" : "Guest");
+    }
+    if (observed_travel.has_value() && log_remote_rebind) {
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS INSERT] party={} seq={} destination_map={:#x} "
+                 "state=RemoteRebindSignal matching_stable_observations=3",
+                 observed_travel->partyId, observed_travel->sequenceId,
+                 observed_travel->destinationMap);
+    }
+    if (observed_travel.has_value() && log_travel_complete) {
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS TRAVEL] party={} seq={} destination_map={:#x} "
+                 "state=TravelComplete",
+                 observed_travel->partyId, observed_travel->sequenceId,
+                 observed_travel->destinationMap);
+    }
+    DispatchEstablishedTravelAction(std::move(world_action));
+    DispatchEstablishedTravelAction(std::move(timeout_action));
+}
+
+void PS4_SYSV_ABI EstablishedTravelEntry(u64 tag, const GuestRegisterSnapshot* registers) {
+    if (registers == nullptr || established_travel_profile == nullptr)
+        return;
+
+    switch (static_cast<EstablishedTravelHook>(tag)) {
+    case EstablishedTravelHook::WarpParamEntry:
+        observed_warp_param_id = static_cast<s32>(registers->rdi);
+        observed_warp_param_time_ms = EstablishedTravelNowMs();
+        break;
+    case EstablishedTravelHook::StageTransitionEntry: {
+        const s64 now_ms = EstablishedTravelNowMs();
+        const s32 warp_param = observed_warp_param_id;
+        const bool recent_warp = warp_param >= 0 && now_ms - observed_warp_param_time_ms <= 5'000;
+        observed_warp_param_id = -1;
+        observed_warp_param_time_ms = 0;
+        if (!recent_warp)
+            break;
+
+        const u64 global_state = GetGlobalState();
+        if (global_state < 0x10000)
+            break;
+        SeamlessTravelEvent event;
+        event.sourceMap = GetCurrentPackedMap();
+        event.destinationMap = ReadValue<u32>(global_state, 0x0C);
+        event.warpParamId = warp_param;
+        event.mode = ReadValue<u32>(global_state, 0x1538);
+        SummonPlacementDescriptor placement;
+        std::string_view placement_result;
+        if (ReadLocalSummonPlacement(placement, placement_result)) {
+            event.positionX = placement.x;
+            event.positionY = placement.y;
+            event.positionZ = placement.z;
+            event.orientation = placement.heading;
+        }
+
+        SeamlessAction action;
+        {
+            std::scoped_lock lock{established_travel_mutex};
+            action = established_travel_state.OnHostTravelDetected(
+                event, Libraries::Np::NpMatching2::GetSeamlessMatchingSnapshot(), now_ms);
+        }
+        if (action.type != SeamlessActionType::None) {
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SEAMLESS TRAVEL] party=pending seq={} source_map={:#x} "
+                     "destination_map={:#x} warp_param={} state=TravelBegin",
+                     action.event.sequenceId, action.event.sourceMap, action.event.destinationMap,
+                     action.event.warpParamId);
+        }
+        DispatchEstablishedTravelAction(std::move(action));
+        break;
+    }
+    case EstablishedTravelHook::PeriodicTick:
+        ProcessEstablishedTravelTick();
+        break;
+    }
+}
+
+bool PS4_SYSV_ABI ShouldSuppressEstablishedTravelStop(u64 tag) {
+    const auto matching = Libraries::Np::NpMatching2::GetSeamlessMatchingSnapshot();
+    bool suppress = false;
+    bool log_suppression = false;
+    std::string party_id;
+    u64 sequence_id = 0;
+    {
+        std::scoped_lock lock{established_travel_mutex};
+        suppress =
+            established_travel_state.ShouldGuardMatchingStop(matching, EstablishedTravelNowMs());
+        if (const auto& active = established_travel_state.ActiveTravel(); active.has_value()) {
+            party_id = active->partyId;
+            sequence_id = active->sequenceId;
+        }
+        if (suppress && tag < established_stop_guard_log_valid.size() &&
+            (!established_stop_guard_log_valid[tag] ||
+             established_stop_guard_logged_sequence[tag] != sequence_id)) {
+            established_stop_guard_log_valid[tag] = true;
+            established_stop_guard_logged_sequence[tag] = sequence_id;
+            log_suppression = true;
+        }
+    }
+    if (log_suppression) {
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS MATCHING] party={} seq={} guard={} "
+                 "state=StopSuppressed",
+                 party_id.empty() ? "pending" : party_id, sequence_id, tag);
+    }
+    return suppress;
 }
 
 void ApplyCrossMapSummonHostPlacement(const GuestRegisterSnapshot& registers) {
@@ -2188,6 +2700,8 @@ void ApplyCrossMapSummonHostPlacement(const GuestRegisterSnapshot& registers) {
         seamless_host_placement = host;
     }
     host_placement_rewrite.result = "applied";
+    LOG_INFO(Debug, "[BLOODBORNE SEAMLESS SUMMON] state=HostPlacementCaptured map={:#x} area={}",
+             host.packed_region, host.area);
 }
 
 void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot& registers) {
@@ -2236,10 +2750,87 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot& registers) {
         record.result = "placement_copy_pending";
         return;
     }
-    if (record.current_map == record.received_map) {
+    const auto responder = SelectSeamlessResponderPolicy(
+        HasPlayerEffect(GetLocalPlayer(), SinisterResonantBellEffectId));
+    const bool invader = responder.role == SeamlessPeerRole::Invader;
+    PendingCrossMapSummonDecision handoff_decision{};
+    u64 summon_generation = 0;
+    {
+        std::scoped_lock lock{seamless_placement_mutex};
+        const auto snapshot = pending_cross_map_summon.Snapshot();
+        summon_generation = snapshot.generation;
+        pending_cross_map_summon.BindRole(responder.role, summon_generation);
+        handoff_decision = pending_cross_map_summon.EvaluateNativeHandoff(
+            record.current_map, record.received_map, EstablishedTravelNowMs());
+    }
+    if (handoff_decision == PendingCrossMapSummonDecision::SameMap) {
         record.result = "same_map";
+        bool completed_cross_map = false;
+        {
+            std::scoped_lock lock{seamless_placement_mutex};
+            const auto snapshot = pending_cross_map_summon.Snapshot();
+            completed_cross_map = snapshot.reloadCount == 1;
+            seamless_received_host_placement_consumed = true;
+            if (completed_cross_map) {
+                pending_cross_map_summon.MarkRemoteInserted(summon_generation);
+            }
+        }
+        if (completed_cross_map) {
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SEAMLESS SUMMON] generation={} state=WorldReady "
+                     "target_map={:#x}",
+                     summon_generation, record.received_map);
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SEAMLESS SUMMON] generation={} state=RemoteInserted "
+                     "target_map={:#x}",
+                     summon_generation, record.received_map);
+            LOG_INFO(Debug, "[BLOODBORNE SEAMLESS SUMMON] generation={} state=Complete reloads=1",
+                     summon_generation);
+        } else {
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SEAMLESS SUMMON] generation={} state=Complete "
+                     "reloads=0 reason=same_map",
+                     summon_generation);
+        }
         return;
     }
+    if (handoff_decision == PendingCrossMapSummonDecision::DuplicateReload) {
+        record.result = "duplicate_reload_suppressed";
+        bool should_log = false;
+        {
+            std::scoped_lock lock{seamless_placement_mutex};
+            if (duplicate_reload_logged_generation != summon_generation) {
+                duplicate_reload_logged_generation = summon_generation;
+                should_log = true;
+            }
+        }
+        if (should_log) {
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SEAMLESS SUMMON] generation={} "
+                     "state=DuplicateReloadSuppressed target_map={:#x}",
+                     summon_generation, record.received_map);
+        }
+        return;
+    }
+    if (handoff_decision != PendingCrossMapSummonDecision::Commit) {
+        record.result =
+            handoff_decision == PendingCrossMapSummonDecision::WaitForClaim  ? "waiting_for_claim"
+            : handoff_decision == PendingCrossMapSummonDecision::WaitForRoom ? "waiting_for_room"
+            : handoff_decision == PendingCrossMapSummonDecision::WaitForSignaling
+                ? "waiting_for_signaling"
+            : handoff_decision == PendingCrossMapSummonDecision::StaleTarget
+                ? "stale_target"
+                : "pending_summon_unavailable";
+        return;
+    }
+    LOG_INFO(Debug,
+             "[BLOODBORNE SEAMLESS {}] generation={} state=CrossMapCommit "
+             "current_map={:#x} target_map={:#x} role={}",
+             invader ? "PVP" : "SUMMON", summon_generation, record.current_map, record.received_map,
+             invader ? "Invader" : "Cooperator");
+    LOG_INFO(Debug, "[BLOODBORNE SEAMLESS {}] state={} current_map={:#x} target_map={:#x} role={}",
+             invader ? "PVP" : "SUMMON", invader ? "InvaderHandoffBegin" : "GuestHandoffBegin",
+             record.current_map, record.received_map, invader ? "Invader" : "Cooperator");
     if (!HasMemoryAccess(state, 0x1521, MemoryProt::CpuWrite)) {
         record.result = "state_not_writable";
         return;
@@ -2270,9 +2861,9 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot& registers) {
     }
 
     const u64 image_size = MemoryPatcher::g_eboot_image_size;
-    if (image_base == 0 || std::ranges::any_of(CrossMapNativeCalls, [image_size](const auto& site) {
-            return site.offset >= image_size;
-        })) {
+    if (image_base == 0 || initial_seamless_profile == nullptr ||
+        std::ranges::any_of(initial_seamless_profile->native_calls,
+                            [image_size](const auto& site) { return site.offset >= image_size; })) {
         record.result = "native_call_out_of_range";
         return;
     }
@@ -2281,15 +2872,18 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot& registers) {
     using FlagSetter = void PS4_SYSV_ABI (*)();
     using PlacementSelector = bool PS4_SYSV_ABI (*)(u64 context, s32 warp_info_id);
     using StageTransition = s32 PS4_SYSV_ABI (*)();
-    const auto set_map = reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonMapOffset);
+    const auto set_map =
+        reinterpret_cast<PlacementSetter>(image_base + runtime_set_forced_summon_map_offset);
     const auto set_position =
-        reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonPositionOffset);
-    const auto set_orientation =
-        reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonOrientationOffset);
-    const auto set_warp = reinterpret_cast<FlagSetter>(image_base + SetForcedSummonWarpOffset);
+        reinterpret_cast<PlacementSetter>(image_base + runtime_set_forced_summon_position_offset);
+    const auto set_orientation = reinterpret_cast<PlacementSetter>(
+        image_base + runtime_set_forced_summon_orientation_offset);
+    const auto set_warp =
+        reinterpret_cast<FlagSetter>(image_base + runtime_set_forced_summon_warp_offset);
     const auto select =
-        reinterpret_cast<PlacementSelector>(image_base + SelectSummonedPlacementOffset);
-    const auto transition = reinterpret_cast<StageTransition>(image_base + StageTransitionOffset);
+        reinterpret_cast<PlacementSelector>(image_base + runtime_select_summoned_placement_offset);
+    const auto transition =
+        reinterpret_cast<StageTransition>(image_base + runtime_stage_transition_offset);
 
     set_position(reinterpret_cast<const void*>(state + 0x14D0));
     set_orientation(reinterpret_cast<const void*>(state + 0x14E0));
@@ -2302,6 +2896,18 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot& registers) {
         return;
     }
 
+    {
+        std::scoped_lock lock{seamless_placement_mutex};
+        if (!pending_cross_map_summon.MarkReloadStarted(summon_generation)) {
+            record.result = "duplicate_reload_suppressed";
+            return;
+        }
+    }
+    LOG_INFO(Debug,
+             "[BLOODBORNE SEAMLESS {}] generation={} state=ForcedPlacementApplied "
+             "target_map={:#x}",
+             invader ? "PVP" : "SUMMON", summon_generation, record.received_map);
+
     pending_summon_reload_map.store(record.received_map, std::memory_order_release);
     pending_summon_reload_state_map.store(record.received_map, std::memory_order_release);
     record.summon_reload_armed = true;
@@ -2310,10 +2916,19 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot& registers) {
         pending_summon_reload_map.store(0, std::memory_order_release);
         pending_summon_reload_state_map.store(0, std::memory_order_release);
         record.summon_reload_armed = false;
+        {
+            std::scoped_lock lock{seamless_placement_mutex};
+            pending_cross_map_summon.MarkReloadFailed(summon_generation);
+        }
         record.result = "stage_transition_failed";
         return;
     }
     record.result = "applied";
+    LOG_INFO(Debug,
+             "[BLOODBORNE SEAMLESS {}] generation={} state=SingleReloadStarted "
+             "target_map={:#x} role={} native_select=true reloads=1",
+             invader ? "PVP" : "SUMMON", summon_generation, record.received_map,
+             invader ? "Invader" : "Cooperator");
 }
 
 void ApplySummonReloadStateAtDescriptor(const GuestRegisterSnapshot& registers) {
@@ -2342,7 +2957,8 @@ void ApplySummonReloadStateAtDescriptor(const GuestRegisterSnapshot& registers) 
         return;
     }
 
-    record.reload_state = ReadValue<u64>(image_base + SummonSessionRulesPointerOffset, 0);
+    record.reload_state =
+        ReadValue<u64>(image_base + runtime_summon_session_rules_pointer_offset, 0);
     if (record.reload_state < 0x10000 ||
         !HasMemoryAccess(record.reload_state, 0x88, MemoryProt::CpuWrite)) {
         pending_summon_reload_state_map.store(record.target_map, std::memory_order_release);
@@ -2357,14 +2973,14 @@ void ApplySummonReloadStateAtDescriptor(const GuestRegisterSnapshot& registers) 
 
     using SummonedMapReload = void PS4_SYSV_ABI (*)();
     const auto reload_summoned_map =
-        reinterpret_cast<SummonedMapReload>(image_base + SummonedMapReloadOffset);
+        reinterpret_cast<SummonedMapReload>(image_base + runtime_summoned_map_reload_offset);
     reload_summoned_map();
     record.summon_reload_started = true;
     record.state_after = ReadValue<s32>(record.reload_state, 0x84);
     if (record.state_after != 3) {
         using SummonReloadStateSetter = void PS4_SYSV_ABI (*)(u64 state);
-        const auto set_reload_state =
-            reinterpret_cast<SummonReloadStateSetter>(image_base + SetSummonReloadStateOffset);
+        const auto set_reload_state = reinterpret_cast<SummonReloadStateSetter>(
+            image_base + runtime_set_summon_reload_state_offset);
         set_reload_state(record.reload_state);
         record.state_setter_used = true;
         record.state_after = ReadValue<s32>(record.reload_state, 0x84);
@@ -2389,11 +3005,11 @@ void ApplySummonReloadStateAtDescriptor(const GuestRegisterSnapshot& registers) 
         WriteTransportedSummonPlacement(placement_state, *transported_host)) {
         using PlacementSetter = void PS4_SYSV_ABI (*)(const void* value);
         const auto set_map =
-            reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonMapOffset);
-        const auto set_position =
-            reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonPositionOffset);
-        const auto set_orientation =
-            reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonOrientationOffset);
+            reinterpret_cast<PlacementSetter>(image_base + runtime_set_forced_summon_map_offset);
+        const auto set_position = reinterpret_cast<PlacementSetter>(
+            image_base + runtime_set_forced_summon_position_offset);
+        const auto set_orientation = reinterpret_cast<PlacementSetter>(
+            image_base + runtime_set_forced_summon_orientation_offset);
         set_position(reinterpret_cast<const void*>(placement_state + 0x14D0));
         set_orientation(reinterpret_cast<const void*>(placement_state + 0x14E0));
         set_map(reinterpret_cast<const void*>(placement_state + 0x14C4));
@@ -2436,13 +3052,13 @@ void ApplyDeferredSummonReload() {
 
     using SummonedMapReload = void PS4_SYSV_ABI (*)();
     const auto reload_summoned_map =
-        reinterpret_cast<SummonedMapReload>(image_base + SummonedMapReloadOffset);
+        reinterpret_cast<SummonedMapReload>(image_base + runtime_summoned_map_reload_offset);
     reload_summoned_map();
     record.summon_reload_started = true;
     record.result = "applied";
 }
 
-void ApplyPreMatchCrossMapGuestWarp() {
+[[maybe_unused]] void ApplyPreMatchCrossMapGuestWarp() {
     pre_match_guest_warp = {};
     auto& record = pre_match_guest_warp;
 
@@ -2464,6 +3080,9 @@ void ApplyPreMatchCrossMapGuestWarp() {
 
     record.current_map = GetCurrentPackedMap();
     record.target_map = transported_host->packed_region;
+    const auto responder = SelectSeamlessResponderPolicy(
+        HasPlayerEffect(GetLocalPlayer(), SinisterResonantBellEffectId));
+    const bool invader = responder.role == SeamlessPeerRole::Invader;
     if (!IsUsablePackedMap(record.current_map) || !IsUsablePackedMap(record.target_map)) {
         record.result = "invalid_map";
         return;
@@ -2473,7 +3092,7 @@ void ApplyPreMatchCrossMapGuestWarp() {
         return;
     }
 
-    const u64 multi_play = ReadValue<u64>(image_base + MatchingStatePointerOffset, 0);
+    const u64 multi_play = ReadValue<u64>(image_base + runtime_matching_state_pointer_offset, 0);
     record.multi_play_state = multi_play >= 0x10000 ? ReadValue<s32>(multi_play, 0x124) : -1;
     if (multi_play >= 0x10000 &&
         (record.multi_play_state != 0 || ReadValue<u64>(multi_play, 0x18) != 0)) {
@@ -2510,15 +3129,18 @@ void ApplyPreMatchCrossMapGuestWarp() {
     using FlagSetter = void PS4_SYSV_ABI (*)();
     using PlacementSelector = bool PS4_SYSV_ABI (*)(u64 context, s32 warp_info_id);
     using StageTransition = s32 PS4_SYSV_ABI (*)();
-    const auto set_map = reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonMapOffset);
+    const auto set_map =
+        reinterpret_cast<PlacementSetter>(image_base + runtime_set_forced_summon_map_offset);
     const auto set_position =
-        reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonPositionOffset);
-    const auto set_orientation =
-        reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonOrientationOffset);
-    const auto set_warp = reinterpret_cast<FlagSetter>(image_base + SetForcedSummonWarpOffset);
+        reinterpret_cast<PlacementSetter>(image_base + runtime_set_forced_summon_position_offset);
+    const auto set_orientation = reinterpret_cast<PlacementSetter>(
+        image_base + runtime_set_forced_summon_orientation_offset);
+    const auto set_warp =
+        reinterpret_cast<FlagSetter>(image_base + runtime_set_forced_summon_warp_offset);
     const auto select =
-        reinterpret_cast<PlacementSelector>(image_base + SelectSummonedPlacementOffset);
-    const auto transition = reinterpret_cast<StageTransition>(image_base + StageTransitionOffset);
+        reinterpret_cast<PlacementSelector>(image_base + runtime_select_summoned_placement_offset);
+    const auto transition =
+        reinterpret_cast<StageTransition>(image_base + runtime_stage_transition_offset);
 
     set_position(reinterpret_cast<const void*>(state + 0x14D0));
     set_orientation(reinterpret_cast<const void*>(state + 0x14E0));
@@ -2546,6 +3168,9 @@ void ApplyPreMatchCrossMapGuestWarp() {
     pending_responder_resume = {
         .target_map = record.target_map,
         .target_area = transported_host->area,
+        .goods_id = responder.goodsId,
+        .effect_id = responder.effectId,
+        .invader = invader,
     };
     responder_resume = {};
     responder_resume.result = "armed";
@@ -2553,9 +3178,20 @@ void ApplyPreMatchCrossMapGuestWarp() {
     responder_resume.target_area = transported_host->area;
     record.responder_resume_armed = true;
     record.result = "applied";
+    if (invader) {
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS PVP] state=InvaderWarpStarted current_map={:#x} "
+                 "target_map={:#x} role=Invader SummonType=2",
+                 record.current_map, record.target_map);
+    } else {
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS SUMMON] state=GuestWarpStarted current_map={:#x} "
+                 "target_map={:#x} role=Cooperator SummonType=0",
+                 record.current_map, record.target_map);
+    }
 }
 
-void ResumePreMatchCrossMapResponder() {
+[[maybe_unused]] void ResumePreMatchCrossMapResponder() {
     auto& pending = pending_responder_resume;
     if (!IsUsablePackedMap(pending.target_map)) {
         return;
@@ -2565,6 +3201,9 @@ void ResumePreMatchCrossMapResponder() {
     auto& record = responder_resume;
     record.target_map = pending.target_map;
     record.target_area = pending.target_area;
+    record.goods_id = pending.goods_id;
+    record.effect_id = pending.effect_id;
+    record.invader = pending.invader;
     record.current_map = GetCurrentPackedMap();
     if (record.current_map != record.target_map) {
         pending.ready_observations = 0;
@@ -2620,15 +3259,17 @@ void ResumePreMatchCrossMapResponder() {
         record.result = "invalid_player";
         return;
     }
-    record.effect_active = HasPlayerEffect(record.player, SmallResonantBellEffectId);
+    record.effect_active = HasPlayerEffect(record.player, pending.effect_id);
     if (record.effect_active) {
         record.ready_observations = pending.ready_observations;
         record.attempts = pending.attempts;
         record.result = "completed";
         LOG_INFO(Debug,
-                 "Bloodborne seamless responder resumed at map={:#x} area={} after {} native "
-                 "attempt(s)",
-                 record.target_map, record.target_area, record.attempts);
+                 "[BLOODBORNE SEAMLESS {}] state={} map={:#x} area={} role={} "
+                 "native_attempts={}",
+                 pending.invader ? "PVP" : "SUMMON",
+                 pending.invader ? "InvaderWorldReady" : "GuestWorldReady", record.target_map,
+                 record.target_area, pending.invader ? "Invader" : "Cooperator", record.attempts);
         pending = {};
         return;
     }
@@ -2658,17 +3299,20 @@ void ResumePreMatchCrossMapResponder() {
 
     using UseItemNativeApply = bool PS4_SYSV_ABI (*)(u64 player, s32 goods_id, s32 argument);
     const auto use_item =
-        reinterpret_cast<UseItemNativeApply>(image_base + UseItemNativeApplyOffset);
-    record.native_result = use_item(record.player, SmallResonantBellGoodsId, BellUseArgument);
+        reinterpret_cast<UseItemNativeApply>(image_base + runtime_use_item_native_apply_offset);
+    record.native_result = use_item(record.player, pending.goods_id, BellUseArgument);
     ++pending.attempts;
     pending.dispatched = true;
     pending.dispatched_at = std::chrono::steady_clock::now();
     record.attempts = pending.attempts;
     record.result = record.native_result ? "native_dispatched" : "native_rejected";
     LOG_INFO(Debug,
-             "Bloodborne seamless responder native bell dispatch map={:#x} area={} attempt={} "
-             "result={}",
-             record.target_map, record.target_area, record.attempts, record.native_result);
+             "[BLOODBORNE SEAMLESS {}] state={} map={:#x} area={} role={} goods_id={} "
+             "attempt={} result={}",
+             pending.invader ? "PVP" : "SUMMON",
+             pending.invader ? "InvaderRebind" : "InitialSummonComplete", record.target_map,
+             record.target_area, pending.invader ? "Invader" : "Cooperator", pending.goods_id,
+             record.attempts, record.native_result);
 }
 
 void ApplyHealingFountainHostAvailability(const GuestRegisterSnapshot& registers) {
@@ -2705,10 +3349,10 @@ void ApplyHealingFountainHostAvailability(const GuestRegisterSnapshot& registers
 u64 GetSummonManagerRoot() {
     const u64 image_size = MemoryPatcher::g_eboot_image_size;
     if (image_base == 0 || image_size < sizeof(u64) ||
-        SummonManagerRootPointerOffset > image_size - sizeof(u64)) {
+        runtime_summon_manager_root_pointer_offset > image_size - sizeof(u64)) {
         return 0;
     }
-    return ReadValue<u64>(image_base + SummonManagerRootPointerOffset, 0);
+    return ReadValue<u64>(image_base + runtime_summon_manager_root_pointer_offset, 0);
 }
 
 u64 GetSummonManager() {
@@ -2719,10 +3363,10 @@ u64 GetSummonManager() {
 u64 GetMatchingState() {
     const u64 image_size = MemoryPatcher::g_eboot_image_size;
     if (image_base == 0 || image_size < sizeof(u64) ||
-        MatchingStatePointerOffset > image_size - sizeof(u64)) {
+        runtime_matching_state_pointer_offset > image_size - sizeof(u64)) {
         return 0;
     }
-    return ReadValue<u64>(image_base + MatchingStatePointerOffset, 0);
+    return ReadValue<u64>(image_base + runtime_matching_state_pointer_offset, 0);
 }
 
 void WriteHex(std::ostream& out, u64 value) {
@@ -2733,8 +3377,8 @@ void WriteRoleSelectionMask(std::ostream& out, std::string_view field, s32 role_
     if (role_code < 0 || role_code >= RoleMetadataCount || image_base == 0) {
         return;
     }
-    const u64 offset =
-        RoleMetadataTableOffset + static_cast<u64>(role_code) * RoleMetadataStride + sizeof(u32);
+    const u64 offset = runtime_role_metadata_table_offset +
+                       static_cast<u64>(role_code) * RoleMetadataStride + sizeof(u32);
     const u64 image_size = MemoryPatcher::g_eboot_image_size;
     if (image_size < sizeof(u32) || offset > image_size - sizeof(u32)) {
         return;
@@ -2994,11 +3638,12 @@ void WriteSummonCandidate(std::ostream& out, const TraceSite& site,
     out << '}';
 
     if (!is_entry || image_base == 0 || MemoryPatcher::g_eboot_image_size < sizeof(u64) ||
-        CandidateLocalStatePointerOffset > MemoryPatcher::g_eboot_image_size - sizeof(u64)) {
+        runtime_candidate_local_state_pointer_offset >
+            MemoryPatcher::g_eboot_image_size - sizeof(u64)) {
         return;
     }
 
-    const u64 root = ReadValue<u64>(image_base + CandidateLocalStatePointerOffset, 0);
+    const u64 root = ReadValue<u64>(image_base + runtime_candidate_local_state_pointer_offset, 0);
     const u64 player = root >= 0x10000 ? ReadValue<u64>(root, 0x60) : 0;
     out << ",\"candidate_local_state\":{";
     out << "\"root\":";
@@ -3223,14 +3868,16 @@ void WriteSummonBuild(std::ostream& out, const TraceSite& site,
             out << ",\"matching_state_124\":" << ReadValue<s32>(matching_state, 0x124);
         }
 
-        const u64 session_rules = ReadValue<u64>(image_base + SummonSessionRulesPointerOffset, 0);
+        const u64 session_rules =
+            ReadValue<u64>(image_base + runtime_summon_session_rules_pointer_offset, 0);
         out << ",\"session_rules\":";
         WriteHex(out, session_rules);
         if (session_rules >= 0x10000) {
             out << ",\"session_capacity\":" << ReadValue<s32>(session_rules, 0x0C);
         }
 
-        const u64 global_state = ReadValue<u64>(image_base + GlobalStatePointerOffset, 0);
+        const u64 global_state =
+            ReadValue<u64>(image_base + runtime_global_state_pointer_offset, 0);
         const u64 population = global_state >= 0x10000 ? ReadValue<u64>(global_state, 0x16F8) : 0;
         out << ",\"global_state\":";
         WriteHex(out, global_state);
@@ -3245,7 +3892,8 @@ void WriteSummonBuild(std::ostream& out, const TraceSite& site,
             out << ",\"population_request_98\":" << ReadValue<s32>(population, 0x98);
         }
 
-        const u64 local_state = ReadValue<u64>(image_base + CandidateLocalStatePointerOffset, 0);
+        const u64 local_state =
+            ReadValue<u64>(image_base + runtime_candidate_local_state_pointer_offset, 0);
         const u64 local_world = local_state >= 0x10000 ? ReadValue<u64>(local_state, 0x60) : 0;
         out << ",\"local_state\":";
         WriteHex(out, local_state);
@@ -3278,10 +3926,10 @@ void WriteSummonBuild(std::ostream& out, const TraceSite& site,
         out << ",\"request_id\":" << ReadValue<s32>(prepared, 0x88);
 
         if (role_code < RoleMetadataCount) {
-            const u64 metadata = image_base + RoleMetadataTableOffset +
+            const u64 metadata = image_base + runtime_role_metadata_table_offset +
                                  static_cast<u64>(role_code) * RoleMetadataStride;
-            const u64 build_role =
-                image_base + SummonBuildRoleTableOffset + static_cast<u64>(role_code) * 12;
+            const u64 build_role = image_base + runtime_summon_build_role_table_offset +
+                                   static_cast<u64>(role_code) * 12;
             out << ",\"selection_mask\":";
             WriteHex(out, ReadValue<u32>(metadata, 0x04));
             out << ",\"role_flags\":";
@@ -3816,10 +4464,10 @@ void WriteRespawnTransformResolve(std::ostream& out, const GuestRegisterSnapshot
 u64 GetGlobalState() {
     const u64 image_size = MemoryPatcher::g_eboot_image_size;
     if (image_base == 0 || image_size < sizeof(u64) ||
-        GlobalStatePointerOffset > image_size - sizeof(u64)) {
+        runtime_global_state_pointer_offset > image_size - sizeof(u64)) {
         return 0;
     }
-    return ReadValue<u64>(image_base + GlobalStatePointerOffset, 0);
+    return ReadValue<u64>(image_base + runtime_global_state_pointer_offset, 0);
 }
 
 void WriteWorldStateValidation(std::ostream& out, const TraceSite& site,
@@ -3882,9 +4530,8 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     }
     if (deferred_summon_reload_hook_installed && site.offset == SosStatusUpdateOffset) {
         RefreshSeamlessLocalPlacement();
-        ApplyPreMatchCrossMapGuestWarp();
         ApplyDeferredSummonReload();
-        ResumePreMatchCrossMapResponder();
+        ProcessEstablishedTravelTick();
     }
     if (healing_fountain_host_availability_hook_installed &&
         site.offset == HealingFountainAvailabilityOffset) {
@@ -4124,7 +4771,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         case TraceKind::MatchingLeaveDecision: {
             const u64 return_address = ReadValue<u64>(registers->rsp, 0);
             const u64 reload_state =
-                ReadValue<u64>(image_base + SummonSessionRulesPointerOffset, 0);
+                ReadValue<u64>(image_base + runtime_summon_session_rules_pointer_offset, 0);
             capture_file << ",\"matching_leave_decision\":{";
             const bool multi_play_site = site.offset == MultiPlayStageUidPolicyOffset ||
                                          site.offset == MultiPlayStopRequestOffset;
@@ -4153,8 +4800,8 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
                 WriteHex(capture_file, ReadValue<u64>(object, 0x280));
 
                 if (site.offset == MultiPlayStageUidPolicyOffset) {
-                    const u64 local_state_root =
-                        ReadValue<u64>(image_base + CandidateLocalStatePointerOffset, 0);
+                    const u64 local_state_root = ReadValue<u64>(
+                        image_base + runtime_candidate_local_state_pointer_offset, 0);
                     const u64 local_state =
                         local_state_root >= 0x10000 &&
                                 HasMemoryAccess(local_state_root, 0x68, MemoryProt::CpuRead)
@@ -5567,7 +6214,12 @@ std::optional<std::string> GetSeamlessHostPlacementHeader() {
         << std::bit_cast<u32>(placement->y) << ',' << std::setw(8)
         << std::bit_cast<u32>(placement->z) << ',' << std::setw(8)
         << std::bit_cast<u32>(placement->heading) << ',' << std::dec << placement->area;
-    return out.str();
+    auto value = out.str();
+    LOG_INFO(Debug,
+             "[BLOODBORNE SEAMLESS SUMMON] state=HostPlacementSerialized map={:#x} area={} "
+             "bytes={}",
+             placement->packed_region, placement->area, value.size());
+    return value;
 }
 
 bool SetSeamlessHostPlacementHeader(std::string_view value) {
@@ -5615,19 +6267,75 @@ bool SetSeamlessHostPlacementHeader(std::string_view value) {
         return false;
     }
 
-    std::scoped_lock lock{seamless_placement_mutex};
-    if (!seamless_received_host_placement.has_value() ||
-        !IsSameSummonPlacement(*seamless_received_host_placement, placement)) {
-        seamless_received_host_placement_consumed = false;
+    bool changed = false;
+    u64 generation = 0;
+    {
+        std::scoped_lock lock{seamless_placement_mutex};
+        if (!seamless_received_host_placement.has_value() ||
+            !IsSameSummonPlacement(*seamless_received_host_placement, placement)) {
+            seamless_received_host_placement_consumed = false;
+            changed = true;
+        }
+        seamless_received_host_placement = placement;
+        generation = pending_cross_map_summon.OnPlacementDeferred(placement.packed_region,
+                                                                  EstablishedTravelNowMs());
     }
-    seamless_received_host_placement = placement;
+    if (changed) {
+        // This callback runs on the HTTP worker. It only queues immutable placement data; all
+        // Bloodborne memory reads and native calls remain on the game-thread hooks.
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS SUMMON] generation={} "
+                 "state=CrossMapPlacementDeferred map={:#x} area={} bytes={}",
+                 generation, placement.packed_region, placement.area, value.size());
+    }
     return true;
 }
 
 void ClearSeamlessHostPlacementHeader() {
     std::scoped_lock lock{seamless_placement_mutex};
+    if (pending_cross_map_summon.ShouldRetainPlacementOnMissingCreate(EstablishedTravelNowMs())) {
+        return;
+    }
     seamless_received_host_placement.reset();
     seamless_received_host_placement_consumed = false;
+    pending_cross_map_summon.Reset();
+}
+
+void NotifySeamlessSummonClaimAccepted() {
+    std::scoped_lock lock{seamless_placement_mutex};
+    if (pending_cross_map_summon.OnClaimAccepted(EstablishedTravelNowMs())) {
+        const auto snapshot = pending_cross_map_summon.Snapshot();
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS SUMMON] generation={} state=ClaimAccepted",
+                 snapshot.generation);
+    }
+}
+
+void NotifySeamlessSummonRoomJoinStarted(std::uint64_t room_id) {
+    std::scoped_lock lock{seamless_placement_mutex};
+    if (pending_cross_map_summon.OnRoomJoinStarted(EstablishedTravelNowMs(), room_id)) {
+        const auto snapshot = pending_cross_map_summon.Snapshot();
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS SUMMON] generation={} state=RoomJoinStarted room={}",
+                 snapshot.generation, room_id);
+    }
+}
+
+void NotifySeamlessSummonRoomJoined(std::uint64_t room_id) {
+    std::scoped_lock lock{seamless_placement_mutex};
+    if (pending_cross_map_summon.OnRoomJoined(EstablishedTravelNowMs(), room_id)) {
+        const auto snapshot = pending_cross_map_summon.Snapshot();
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS SUMMON] generation={} state=RoomJoined room={}",
+                 snapshot.generation, snapshot.roomId);
+    }
+}
+
+void NotifySeamlessSummonSignalingEstablished(std::uint64_t room_id) {
+    std::scoped_lock lock{seamless_placement_mutex};
+    if (pending_cross_map_summon.OnSignalingEstablished(EstablishedTravelNowMs(), room_id)) {
+        const auto snapshot = pending_cross_map_summon.Snapshot();
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS SUMMON] generation={} state=SignalingEstablished room={}",
+                 snapshot.generation, snapshot.roomId);
+    }
 }
 
 void TraceMatching2LeaveRoom(std::uintptr_t return_address, std::uint64_t room_id) {
@@ -5639,7 +6347,8 @@ void TraceMatching2LeaveRoom(std::uintptr_t return_address, std::uint64_t room_i
                                                                   MemoryPatcher::g_eboot_image_size
                                   ? return_address - image_base
                                   : 0;
-    const u64 reload_state = ReadValue<u64>(image_base + SummonSessionRulesPointerOffset, 0);
+    const u64 reload_state =
+        ReadValue<u64>(image_base + runtime_summon_session_rules_pointer_offset, 0);
     const s32 reload_phase = reload_state >= 0x10000 ? ReadValue<s32>(reload_state, 0x84) : -1;
     const u64 global_state = GetGlobalState();
     const u32 current_map = GetCurrentPackedMap();
@@ -5684,17 +6393,49 @@ void TraceMatching2LeaveRoom(std::uintptr_t return_address, std::uint64_t room_i
              room_id, return_address, caller_offset, reload_phase, current_map, requested_map);
 }
 
-void InstallSeamlessCoopPatches() {
-    if ((negative_area_patch_installed && area_flag_patch_installed &&
-         responder_bell_area_patch_installed && responder_bell_common_patch_installed &&
-         active_bell_negative_area_patch_installed && active_bell_area_flag_patch_installed &&
-         responder_search_negative_area_patch_installed && sos_status_area_patch_installed &&
-         summon_candidate_area_patch_installed && summon_build_area_patch_installed &&
-         summon_build_world_state_patch_installed && summon_build_negative_event_patch_installed &&
-         summon_build_host_placement_hook_installed && cross_map_guest_handoff_hook_installed &&
-         summon_reload_state_hook_installed && deferred_summon_reload_hook_installed &&
-         healing_fountain_host_availability_hook_installed) ||
-        !EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP")) {
+const InitialSeamlessProfile* FindInitialSeamlessProfile(std::string_view profile_name) {
+    const auto profile = std::ranges::find_if(
+        InitialSeamlessProfiles, [profile_name](const auto& p) { return p.name == profile_name; });
+    return profile != std::end(InitialSeamlessProfiles) ? &*profile : nullptr;
+}
+
+void SelectInitialSeamlessRuntimeLayout(const InitialSeamlessProfile& profile) {
+    initial_seamless_profile = &profile;
+    runtime_global_state_pointer_offset = profile.global_state_pointer;
+    runtime_candidate_local_state_pointer_offset = profile.candidate_local_state_pointer;
+    runtime_summon_manager_root_pointer_offset = profile.summon_manager_root_pointer;
+    runtime_current_map_list_pointer_offset = profile.current_map_list_pointer;
+    runtime_matching_state_pointer_offset = profile.matching_state_pointer;
+    runtime_summon_session_rules_pointer_offset = profile.summon_session_rules_pointer;
+    runtime_role_metadata_table_offset = profile.role_metadata_table;
+    runtime_summon_build_role_table_offset = profile.summon_build_role_table;
+    runtime_set_forced_summon_map_offset = profile.native_calls[0].offset;
+    runtime_set_forced_summon_position_offset = profile.native_calls[1].offset;
+    runtime_set_forced_summon_orientation_offset = profile.native_calls[2].offset;
+    runtime_set_forced_summon_warp_offset = profile.native_calls[3].offset;
+    runtime_select_summoned_placement_offset = profile.native_calls[4].offset;
+    runtime_summoned_map_reload_offset = profile.native_calls[5].offset;
+    runtime_stage_transition_offset = profile.native_calls[6].offset;
+    runtime_set_summon_reload_state_offset = profile.native_calls[7].offset;
+    runtime_use_item_native_apply_offset = profile.native_calls[8].offset;
+}
+
+bool InitialSeamlessPatchesReady() {
+    return negative_area_patch_installed && area_flag_patch_installed &&
+           responder_bell_area_patch_installed && responder_bell_common_patch_installed &&
+           active_bell_negative_area_patch_installed && active_bell_area_flag_patch_installed &&
+           responder_search_negative_area_patch_installed && sos_status_area_patch_installed &&
+           summon_candidate_area_patch_installed && summon_build_area_patch_installed &&
+           summon_build_world_state_patch_installed &&
+           summon_build_negative_event_patch_installed &&
+           stage_transition_keep_matching_patch_installed &&
+           summon_build_host_placement_hook_installed && cross_map_guest_handoff_hook_installed &&
+           summon_reload_state_hook_installed && deferred_summon_reload_hook_installed &&
+           healing_fountain_host_availability_hook_installed;
+}
+
+void InstallInitialSeamlessPatches(const InitialSeamlessProfile& profile) {
+    if (InitialSeamlessPatchesReady() || !EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP")) {
         return;
     }
     if (MemoryPatcher::g_game_serial != "CUSA03173") {
@@ -5710,19 +6451,44 @@ void InstallSeamlessCoopPatches() {
         return;
     }
 
+    const u64 BeckoningAreaComparisonOffset = profile.beckoning_area_comparison;
+    const u64 BeckoningAreaFlagResultOffset = profile.beckoning_area_flag_result;
+    const u64 ResponderBellAreaResultOffset = profile.responder_bell_area_result;
+    const u64 ResponderBellCommonResultOffset = profile.responder_bell_common_result;
+    const auto& ResponderBellCommonResult = profile.responder_bell_common_expected;
+    const u64 ActiveBellAreaComparisonOffset = profile.active_bell_area_comparison;
+    const u64 ActiveBellAreaFlagResultOffset = profile.active_bell_area_flag_result;
+    const u64 ResponderSearchAreaRangeResultOffset = profile.responder_search_area_range_result;
+    const u64 SosStatusAreaRestrictionOffset = profile.sos_status_area_restriction;
+    const u64 SummonCandidateAreaRestrictionOffset = profile.summon_candidate_area_restriction;
+    const u64 SummonBuildAreaRestrictionOffset = profile.summon_build_area_restriction;
+    const u64 SummonBuildWorldStateRestrictionOffset = profile.summon_build_world_state_restriction;
+    const u64 SummonBuildNegativeEventRestrictionOffset =
+        profile.summon_build_negative_event_restriction;
+    const u64 StageTransitionStopMatchingCallOffset = profile.stage_transition_stop_matching_call;
+    const auto& StageTransitionStopMatchingCall = profile.stage_transition_stop_expected;
+    const auto& StageTransitionKeepMatchingCall = profile.stage_transition_keep_expected;
+    const u64 SummonBuildEntryOffset = profile.summon_build_entry;
+    const u64 SosStatusUpdateOffset = profile.sos_status_update;
+    const u64 StageWarpDescriptorFinalizeOffset = profile.stage_warp_descriptor_finalize;
+    const u64 CrossMapGuestHandoffOffset = profile.cross_map_guest_handoff;
+    const u64 HealingFountainAvailabilityOffset = profile.healing_fountain_availability;
+    const u64 SetSummonReloadStateOffset = profile.native_calls[7].offset;
+    const auto& CrossMapNativeCalls = profile.native_calls;
+
     const auto base = MemoryPatcher::g_eboot_address;
     const auto image_size = MemoryPatcher::g_eboot_image_size;
     const auto summon_build_entry = std::ranges::find_if(
-        Sites, [](const TraceSite& site) { return site.offset == SummonBuildEntryOffset; });
-    const auto cross_map_guest_handoff = std::ranges::find_if(
-        Sites, [](const TraceSite& site) { return site.offset == CrossMapGuestHandoffOffset; });
-    const auto deferred_summon_reload = std::ranges::find_if(
-        Sites, [](const TraceSite& site) { return site.offset == SosStatusUpdateOffset; });
-    const auto summon_reload_state = std::ranges::find_if(Sites, [](const TraceSite& site) {
-        return site.offset == StageWarpDescriptorFinalizeOffset;
+        Sites, [](const TraceSite& site) { return site.name == "SummonBuild.Entry"; });
+    const auto cross_map_guest_handoff = std::ranges::find_if(Sites, [](const TraceSite& site) {
+        return site.name == "CSMultiPlayerIns.CrossMapGuestHandoff";
     });
+    const auto deferred_summon_reload = std::ranges::find_if(
+        Sites, [](const TraceSite& site) { return site.name == "SosStatus.Update"; });
+    const auto summon_reload_state = std::ranges::find_if(
+        Sites, [](const TraceSite& site) { return site.name == "Warp.StageDescriptor.Finalize"; });
     const auto healing_fountain_host_availability = std::ranges::find_if(
-        Sites, [](const auto& site) { return site.offset == HealingFountainAvailabilityOffset; });
+        Sites, [](const auto& site) { return site.name == "HealingFountain.Availability.Host"; });
     if (summon_build_entry == Sites.end() || cross_map_guest_handoff == Sites.end() ||
         deferred_summon_reload == Sites.end() || summon_reload_state == Sites.end() ||
         healing_fountain_host_availability == Sites.end()) {
@@ -6138,6 +6904,214 @@ void InstallSeamlessCoopPatches() {
              StageTransitionStopMatchingCallOffset, SummonBuildEntryOffset,
              CrossMapGuestHandoffOffset, SosStatusUpdateOffset, SetSummonReloadStateOffset,
              HealingFountainAvailabilityOffset);
+    LOG_INFO(Debug,
+             "[BLOODBORNE SEAMLESS INIT] profile={} component=bells enabled=true "
+             "beckoning=true small_resonant=true sinister=true",
+             profile.name);
+    LOG_INFO(Debug,
+             "[BLOODBORNE SEAMLESS INIT] profile={} component=initial_cross_map enabled=true "
+             "host_placement=true guest_handoff=true native_reload=true",
+             profile.name);
+    LOG_INFO(Debug,
+             "[BLOODBORNE SEAMLESS INIT] profile={} component=pvp enabled=true "
+             "summon_type_2_preserved=true invader_handoff=true",
+             profile.name);
+}
+
+bool MatchesEstablishedTravelBytes(u64 offset, std::span<const u8> expected) {
+    const u64 image_size = MemoryPatcher::g_eboot_image_size;
+    if (image_base == 0 || offset > image_size || expected.size() > image_size - offset ||
+        !HasMemoryAccess(image_base + offset, expected.size(), MemoryProt::CpuRead)) {
+        return false;
+    }
+    return std::ranges::equal(
+        expected,
+        std::span<const u8>{reinterpret_cast<const u8*>(image_base + offset), expected.size()});
+}
+
+const EstablishedTravelProfile* SelectEstablishedTravelProfile() {
+    const auto standard_r15 = std::span<const u8>{StandardR15Prologue.data(), 6};
+    for (const auto& profile : EstablishedTravelProfiles) {
+        if (MatchesEstablishedTravelBytes(profile.warp_param, standard_r15) &&
+            MatchesEstablishedTravelBytes(profile.stage_transition, standard_r15) &&
+            MatchesEstablishedTravelBytes(profile.periodic_tick, standard_r15) &&
+            MatchesEstablishedTravelBytes(profile.stage_stop_call, profile.stage_stop_expected) &&
+            MatchesEstablishedTravelBytes(profile.matching_check_stop_call,
+                                          profile.matching_check_stop_expected)) {
+            return &profile;
+        }
+    }
+    return nullptr;
+}
+
+void SelectEstablishedTravelRuntimeLayout(const EstablishedTravelProfile& profile) {
+    established_travel_profile = &profile;
+    runtime_global_state_pointer_offset = profile.global_state_pointer;
+    runtime_candidate_local_state_pointer_offset = profile.candidate_local_state_pointer;
+    runtime_summon_manager_root_pointer_offset = profile.summon_manager_root_pointer;
+    runtime_current_map_list_pointer_offset = profile.current_map_list_pointer;
+    runtime_matching_state_pointer_offset = profile.matching_state_pointer;
+    runtime_summon_session_rules_pointer_offset = profile.summon_session_rules_pointer;
+}
+
+bool InstallEstablishedTravelHooks(const EstablishedTravelProfile& profile) {
+    const auto standard_r15 = std::span<const u8>{StandardR15Prologue.data(), 6};
+    if (!InstallGuestCodeHook(reinterpret_cast<void*>(image_base + profile.warp_param),
+                              standard_r15, static_cast<u64>(EstablishedTravelHook::WarpParamEntry),
+                              EstablishedTravelEntry)) {
+        LOG_ERROR(Debug, "Bloodborne established travel WarpParam hook failed at {:#x}",
+                  profile.warp_param);
+        return false;
+    }
+    established_warp_param_hook_installed = true;
+
+    if (!InstallGuestCodeHook(reinterpret_cast<void*>(image_base + profile.stage_transition),
+                              standard_r15,
+                              static_cast<u64>(EstablishedTravelHook::StageTransitionEntry),
+                              EstablishedTravelEntry)) {
+        LOG_ERROR(Debug, "Bloodborne established travel StageTransition hook failed at {:#x}",
+                  profile.stage_transition);
+        return false;
+    }
+    established_stage_transition_hook_installed = true;
+
+    if (initial_seamless_profile != nullptr &&
+        profile.periodic_tick == initial_seamless_profile->sos_status_update &&
+        deferred_summon_reload_hook_installed) {
+        established_periodic_hook_installed = true;
+    } else if (InstallGuestCodeHook(
+                   reinterpret_cast<void*>(image_base + profile.periodic_tick), standard_r15,
+                   static_cast<u64>(EstablishedTravelHook::PeriodicTick), EstablishedTravelEntry)) {
+        established_periodic_hook_installed = true;
+    } else {
+        LOG_ERROR(Debug, "Bloodborne established travel periodic hook failed at {:#x}",
+                  profile.periodic_tick);
+        return false;
+    }
+
+    if (MatchesEstablishedTravelBytes(profile.stage_stop_call, profile.stage_keep_expected)) {
+        established_stage_stop_guard_installed = true;
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS MATCHING] profile={} stage guard uses existing "
+                 "matching-existence patch",
+                 profile.name);
+    } else if (MatchesEstablishedTravelBytes(profile.stage_stop_call,
+                                             profile.stage_stop_expected) &&
+               InstallGuestConditionalCallHook(
+                   reinterpret_cast<void*>(image_base + profile.stage_stop_call),
+                   profile.stage_stop_expected, 1, ShouldSuppressEstablishedTravelStop)) {
+        established_stage_stop_guard_installed = true;
+    } else {
+        LOG_ERROR(Debug, "Bloodborne established travel stage Stop guard failed at {:#x}",
+                  profile.stage_stop_call);
+        return false;
+    }
+
+    if (!InstallGuestConditionalCallHook(
+            reinterpret_cast<void*>(image_base + profile.matching_check_stop_call),
+            profile.matching_check_stop_expected, 2, ShouldSuppressEstablishedTravelStop)) {
+        LOG_ERROR(Debug, "Bloodborne established travel OnMatchingCheck guard failed at {:#x}",
+                  profile.matching_check_stop_call);
+        return false;
+    }
+    established_matching_stop_guard_installed = true;
+    return true;
+}
+
+void InstallSeamlessCoopPatches() {
+    if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP")) {
+        return;
+    }
+    LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] env=1");
+    if (MemoryPatcher::g_game_serial != "CUSA03173") {
+        LOG_ERROR(Debug, "[BLOODBORNE SEAMLESS INIT] game={} result=unsupported_game",
+                  MemoryPatcher::g_game_serial);
+        return;
+    }
+    const auto* param_sfo = Common::Singleton<PSF>::Instance();
+    const std::string_view app_version = param_sfo->GetString("APP_VER").value_or("Unknown");
+    LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] game=CUSA03173 app={}", app_version);
+    if (app_version != "01.09") {
+        LOG_ERROR(Debug,
+                  "Bloodborne established travel requires CUSA03173 01.09; loaded version is {}",
+                  app_version);
+        return;
+    }
+
+    image_base = MemoryPatcher::g_eboot_address;
+    const auto* profile = SelectEstablishedTravelProfile();
+    if (profile == nullptr) {
+        LOG_ERROR(Debug, "Bloodborne established travel disabled: no exact byte-verified 01.09 "
+                         "profile matched");
+        return;
+    }
+    SelectEstablishedTravelRuntimeLayout(*profile);
+
+    const auto* initial_profile = FindInitialSeamlessProfile(profile->name);
+    if (initial_profile == nullptr) {
+        LOG_ERROR(Debug,
+                  "[BLOODBORNE SEAMLESS INIT] profile={} component=initial_cross_map "
+                  "enabled=false reason=no_matching_profile",
+                  profile->name);
+    } else {
+        SelectInitialSeamlessRuntimeLayout(*initial_profile);
+        InstallInitialSeamlessPatches(*initial_profile);
+        if (!InitialSeamlessPatchesReady()) {
+            LOG_ERROR(Debug,
+                      "[BLOODBORNE SEAMLESS INIT] profile={} component=initial_cross_map "
+                      "enabled=false reason=byte_or_hook_validation_failed",
+                      profile->name);
+        }
+    }
+
+    Libraries::Np::NpMatching2::SetSeamlessControlHandlers(OnEstablishedTravelNotification,
+                                                           OnEstablishedTravelReply);
+    const bool hooks_ready = InstallEstablishedTravelHooks(*profile);
+    {
+        std::scoped_lock lock{established_travel_mutex};
+        established_travel_state.SetEnabled(hooks_ready);
+        pending_guest_travel.reset();
+        established_rebind_ready_observations = 0;
+        established_stop_guard_log_valid.fill(false);
+    }
+    {
+        std::scoped_lock lock{seamless_placement_mutex};
+        pending_cross_map_summon.SetEnabled(hooks_ready && InitialSeamlessPatchesReady());
+        duplicate_reload_logged_generation = 0;
+    }
+    if (!hooks_ready) {
+        LOG_ERROR(Debug,
+                  "Bloodborne established travel disabled because a required guarded hook failed");
+        return;
+    }
+    LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] profile={}", profile->name);
+    if (!InitialSeamlessPatchesReady()) {
+        LOG_ERROR(Debug,
+                  "Bloodborne seamless initial summon path is disabled; established travel "
+                  "remains guarded but a new seamless party cannot be created on this eboot");
+    } else {
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] beckoning_bell=true");
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] resonant_bell=true");
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] sinister_bell=true");
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] active_search=true");
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] summon_candidate_cross_map=true");
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] summon_build_cross_map=true");
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] pvp_candidate_cross_map=true");
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] pvp_build_cross_map=true");
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] host_placement=true");
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] guest_handoff=true");
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] invader_handoff=true");
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] summon_reload=true");
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] pvp_reload=true");
+        LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] lantern_actions=true");
+    }
+    LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] established_travel=true");
+    LOG_INFO(Debug, "[BLOODBORNE SEAMLESS INIT] pvp_session={}", InitialSeamlessPatchesReady());
+    LOG_INFO(Debug,
+             "[BLOODBORNE SEAMLESS PARTY] profile={} state=EstablishedTravelReady "
+             "warp_param={:#x} stage_transition={:#x} matching_guard={:#x}",
+             profile->name, profile->warp_param, profile->stage_transition,
+             profile->matching_check_stop_call);
 }
 
 void InstallReverseEngineeringTrace() {

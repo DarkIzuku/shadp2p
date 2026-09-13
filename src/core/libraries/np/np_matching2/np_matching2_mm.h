@@ -3,15 +3,18 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string_view>
 #include <vector>
 
 #include "common/types.h"
+#include "core/bloodborne_seamless_state.h"
 #include "core/libraries/np/np_matching2/np_matching2.h"
 
 namespace ShadNet {
 class ShadNetClient;
+struct NotifySeamlessControl;
 enum class CommandType : u16;
 enum class ErrorType : u8;
 } // namespace ShadNet
@@ -35,7 +38,19 @@ enum class MmCommand : u16 {
     GetUserInfoList = 113,
     GetRoomMemberDataExternalList = 114,
     SendRoomMessage = 115,
+    SeamlessControl = 116,
 };
+
+using SeamlessNotificationHandler = std::function<void(const ShadNet::NotifySeamlessControl&)>;
+using SeamlessReplyHandler =
+    std::function<void(Core::Bloodborne::SeamlessTravelPhase requested_phase, bool accepted,
+                       const std::string& reason, const std::string& party_id, u64 generation,
+                       u64 sequence_id, Core::Bloodborne::SeamlessTravelState state)>;
+
+void SetSeamlessControlHandlers(SeamlessNotificationHandler notification_handler,
+                                SeamlessReplyHandler reply_handler);
+Core::Bloodborne::SeamlessMatchingSnapshot GetSeamlessMatchingSnapshot();
+bool MmSendSeamlessControl(const Core::Bloodborne::SeamlessTravelEvent& event);
 
 void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
                         std::string_view server_host, u16 tcp_port);
