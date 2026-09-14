@@ -35,9 +35,36 @@ constexpr bool ShouldNormalizeSeamlessAppearance(SeamlessPeerRole role) {
     return role == SeamlessPeerRole::Cooperator;
 }
 
+constexpr bool ShouldRestoreSeamlessGuestHealth(SeamlessPeerRole role) {
+    // Bloodborne's exact 1.09 game parameters reduce max HP to 70% in both the cooperative
+    // guest state (9006) and the invasion guest state (9026). Seamless removes that guest-only
+    // penalty for both roles without changing either role's distinct state/team semantics.
+    return role == SeamlessPeerRole::Cooperator || role == SeamlessPeerRole::Invader;
+}
+
+struct SeamlessGuestParamPolicy {
+    s32 activeEffectId = -1;
+    u16 stateInfo = 0;
+    float maxHpRate = 1.0F;
+    bool normalizeAppearance = false;
+};
+
+constexpr std::optional<SeamlessGuestParamPolicy> SelectSeamlessGuestParamPolicy(
+    SeamlessPeerRole role) {
+    switch (role) {
+    case SeamlessPeerRole::Cooperator:
+        return SeamlessGuestParamPolicy{9006, 272, 1.0F, true};
+    case SeamlessPeerRole::Invader:
+        return SeamlessGuestParamPolicy{9026, 276, 1.0F, false};
+    default:
+        return std::nullopt;
+    }
+}
+
 enum class PendingCrossMapSummonPhase : u32 {
     Idle = 0,
     PlacementDeferred,
+    NativeHandoffObserved,
     ClaimAccepted,
     RoomJoinStarted,
     RoomJoined,
@@ -52,6 +79,7 @@ enum class PendingCrossMapSummonPhase : u32 {
 
 enum class PendingCrossMapSummonDecision : u32 {
     None = 0,
+    WaitForNativeHandoff,
     WaitForClaim,
     WaitForRoom,
     WaitForSignaling,
@@ -59,6 +87,7 @@ enum class PendingCrossMapSummonDecision : u32 {
     Commit,
     DuplicateReload,
     StaleTarget,
+    TimedOut,
 };
 
 struct PendingCrossMapSummonSnapshot {
@@ -66,8 +95,10 @@ struct PendingCrossMapSummonSnapshot {
     SeamlessPeerRole role = SeamlessPeerRole::Unknown;
     u64 generation = 0;
     u64 roomId = 0;
+    u32 sourceMap = 0;
     u32 targetMap = 0;
     u32 reloadCount = 0;
+    bool nativeHandoffObserved = false;
     bool claimAccepted = false;
     bool roomJoinStarted = false;
     bool roomJoined = false;
@@ -85,6 +116,8 @@ public:
 
     void SetEnabled(bool enabled);
     u64 OnPlacementDeferred(u32 targetMap, s64 nowMs);
+    bool OnNativeHandoffObserved(u32 currentMap, u32 targetMap, SeamlessPeerRole role, s64 nowMs,
+                                 u64 generation = 0);
     bool BindRole(SeamlessPeerRole role, u64 generation = 0);
     bool OnClaimAccepted(s64 nowMs, u64 generation = 0);
     bool OnRoomJoinStarted(s64 nowMs, u64 roomId = 0, u64 generation = 0);

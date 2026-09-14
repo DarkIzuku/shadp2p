@@ -54,6 +54,25 @@ TEST(BloodborneSeamlessState, ResponderRolesPreserveCapturedBellSemantics) {
     EXPECT_EQ(invader.effectId, 9025);
     EXPECT_TRUE(ShouldNormalizeSeamlessAppearance(cooperator.role));
     EXPECT_FALSE(ShouldNormalizeSeamlessAppearance(invader.role));
+    EXPECT_TRUE(ShouldRestoreSeamlessGuestHealth(cooperator.role));
+    EXPECT_TRUE(ShouldRestoreSeamlessGuestHealth(invader.role));
+    EXPECT_FALSE(ShouldRestoreSeamlessGuestHealth(SeamlessPeerRole::Host));
+    EXPECT_FALSE(ShouldRestoreSeamlessGuestHealth(SeamlessPeerRole::Unknown));
+
+    const auto cooperator_params = SelectSeamlessGuestParamPolicy(cooperator.role);
+    ASSERT_TRUE(cooperator_params.has_value());
+    EXPECT_EQ(cooperator_params->activeEffectId, 9006);
+    EXPECT_EQ(cooperator_params->stateInfo, 272);
+    EXPECT_FLOAT_EQ(cooperator_params->maxHpRate, 1.0F);
+    EXPECT_TRUE(cooperator_params->normalizeAppearance);
+
+    const auto invader_params = SelectSeamlessGuestParamPolicy(invader.role);
+    ASSERT_TRUE(invader_params.has_value());
+    EXPECT_EQ(invader_params->activeEffectId, 9026);
+    EXPECT_EQ(invader_params->stateInfo, 276);
+    EXPECT_FLOAT_EQ(invader_params->maxHpRate, 1.0F);
+    EXPECT_FALSE(invader_params->normalizeAppearance);
+    EXPECT_FALSE(SelectSeamlessGuestParamPolicy(SeamlessPeerRole::Host).has_value());
 }
 
 TEST(BloodborneSeamlessState, CrossMapSummonCommitsOnceAfterSignaling) {
@@ -67,6 +86,8 @@ TEST(BloodborneSeamlessState, CrossMapSummonCommitsOnceAfterSignaling) {
     EXPECT_TRUE(machine.OnClaimAccepted(110, generation));
     EXPECT_TRUE(machine.OnRoomJoinStarted(120, 0, generation));
     EXPECT_TRUE(machine.OnRoomJoined(130, 17, generation));
+    EXPECT_TRUE(machine.OnNativeHandoffObserved(0x18010000, 0x15000000,
+                                                SeamlessPeerRole::Cooperator, 131, generation));
     EXPECT_EQ(machine.EvaluateNativeHandoff(0x18010000, 0x15000000, 131),
               PendingCrossMapSummonDecision::WaitForSignaling);
     EXPECT_FALSE(machine.OnSignalingEstablished(139, 16, generation));
@@ -83,6 +104,57 @@ TEST(BloodborneSeamlessState, CrossMapSummonCommitsOnceAfterSignaling) {
     EXPECT_EQ(result.phase, PendingCrossMapSummonPhase::Complete);
     EXPECT_EQ(result.roomId, 17);
     EXPECT_EQ(result.reloadCount, 1);
+}
+
+TEST(BloodborneSeamlessState, HandoffBeforeSignalingRemainsPendingForGameThreadCommit) {
+    PendingCrossMapSummonStateMachine machine;
+    machine.SetEnabled(true);
+    const u64 generation = machine.OnPlacementDeferred(0x15000000, 100);
+    ASSERT_TRUE(machine.OnClaimAccepted(110, generation));
+    ASSERT_TRUE(machine.OnNativeHandoffObserved(0x18010000, 0x15000000,
+                                                SeamlessPeerRole::Cooperator, 120, generation));
+    EXPECT_EQ(machine.EvaluateNativeHandoff(0x18010000, 0x15000000, 121),
+              PendingCrossMapSummonDecision::WaitForRoom);
+    ASSERT_TRUE(machine.OnRoomJoinStarted(130, 17, generation));
+    ASSERT_TRUE(machine.OnRoomJoined(140, 17, generation));
+    EXPECT_EQ(machine.EvaluateNativeHandoff(0x18010000, 0x15000000, 141),
+              PendingCrossMapSummonDecision::WaitForSignaling);
+    ASSERT_TRUE(machine.OnSignalingEstablished(150, 17, generation));
+
+    // The native handoff hook is not required to fire a second time. The periodic game-thread
+    // tick can now observe the retained handoff and commit it exactly once.
+    EXPECT_EQ(machine.EvaluateNativeHandoff(0x18010000, 0x15000000, 151),
+              PendingCrossMapSummonDecision::Commit);
+    EXPECT_TRUE(machine.MarkReloadStarted(generation));
+    EXPECT_EQ(machine.Snapshot().sourceMap, 0x18010000);
+    EXPECT_TRUE(machine.Snapshot().nativeHandoffObserved);
+}
+
+TEST(BloodborneSeamlessState, SignalingCannotWarpBeforeNativeHandoff) {
+    PendingCrossMapSummonStateMachine machine;
+    machine.SetEnabled(true);
+    const u64 generation = machine.OnPlacementDeferred(0x15000000, 100);
+    ASSERT_TRUE(machine.OnClaimAccepted(110, generation));
+    ASSERT_TRUE(machine.OnRoomJoinStarted(120, 17, generation));
+    ASSERT_TRUE(machine.OnRoomJoined(130, 17, generation));
+    ASSERT_TRUE(machine.OnSignalingEstablished(140, 17, generation));
+    EXPECT_EQ(machine.EvaluateNativeHandoff(0x18010000, 0x15000000, 141),
+              PendingCrossMapSummonDecision::WaitForNativeHandoff);
+    EXPECT_EQ(machine.Snapshot().reloadCount, 0);
+}
+
+TEST(BloodborneSeamlessState, ExpiredCrossMapSummonFailsWithoutReload) {
+    PendingCrossMapSummonStateMachine::Options options;
+    options.timeoutMs = 5'000;
+    PendingCrossMapSummonStateMachine machine(options);
+    machine.SetEnabled(true);
+    const u64 generation = machine.OnPlacementDeferred(0x15000000, 100);
+    ASSERT_TRUE(machine.OnNativeHandoffObserved(0x18010000, 0x15000000,
+                                                SeamlessPeerRole::Cooperator, 101, generation));
+    EXPECT_EQ(machine.EvaluateNativeHandoff(0x18010000, 0x15000000, 5'102),
+              PendingCrossMapSummonDecision::TimedOut);
+    EXPECT_EQ(machine.Snapshot().phase, PendingCrossMapSummonPhase::Failed);
+    EXPECT_EQ(machine.Snapshot().reloadCount, 0);
 }
 
 TEST(BloodborneSeamlessState, SameMapSummonNeverRequestsArtificialReload) {

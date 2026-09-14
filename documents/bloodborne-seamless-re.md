@@ -1713,6 +1713,7 @@ The replacement sequence keeps the responder in the source world:
 ```text
 CandidateFound -> CrossMapPlacementDeferred -> ClaimAccepted
   -> RoomJoinStarted -> RoomJoined -> SignalingEstablished
+  -> NativeHandoffObserved
   -> CrossMapCommit -> ForcedPlacementApplied -> SingleReloadStarted
   -> WorldReady -> RemoteInserted -> Complete
 ```
@@ -1725,6 +1726,18 @@ generation cannot commit a warp. Once the counter reaches one, another native
 handoff for the same generation returns `DuplicateReload` and logs
 `DuplicateReloadSuppressed`; it cannot issue another stage transition. A
 same-map handoff completes with zero artificial reloads.
+
+The first runtime attempt exposed an ordering hole in that design. Bloodborne
+reached `CSMultiPlayerIns.CrossMapGuestHandoff` before signaling was ready, so
+the state machine correctly returned `WaitForSignaling`, but the native
+handoff site did not execute a second time after signaling became ready. The
+placement remained valid and the network session completed while the guest
+stayed in the source map. The handoff is now recorded as a validated,
+generation-bound event. The existing periodic game-thread hook reevaluates
+that retained handoff after claim, room join, and signaling have all completed.
+Network callbacks still make no Bloodborne memory reads or native calls. A
+signaling callback without a validated native handoff cannot trigger a warp,
+and an expired generation fails with zero reloads.
 
 shadNet now returns every eligible cross-map advertisement immediately. It
 stores the host placement as the final summon destination and delivers the
@@ -1756,14 +1769,51 @@ an exact byte signature. This build deliberately does not replace those
 unknown gates with a global multiplayer NOP.
 
 The role-state function at user-eboot `0x01507A70` selects SpEffect `9006`
-for a regular cooperative guest and `9026` for an invader. Public Bloodborne
-parameter names describe these as the active cooperative/invasion guest-play
-states, not as visual-only flags. Removing or substituting either effect could
-change team, damage, AI targeting, or network role. The appearance policy is
-therefore explicitly role-separated and tested (cooperator eligible, invader
-never eligible), but no runtime appearance mutation is enabled until the
-downstream material/VFX selector is identified. Effect `9005` and effect
-`9025` remain untouched.
+for a regular cooperative guest and `9026` for an invader. Exact extraction of
+the shipped 01.09 `gameparam.parambnd.dcx` isolated the relevant differences:
+
+```text
+effect  maxHpRate  stateInfo  useSpEffectEffect
+9005       1.0        188            0
+9006       0.7        272            1
+9025       1.0        190            0
+9026       0.7        276            1
+```
+
+Rows `9006` and `9026` otherwise retain `1.0` for the inspected stamina,
+attack, defense, stamina-consumption, and vial-healing multipliers. Their only
+mutual difference among the inspected fields is `stateInfo` (`272` versus
+`276`). The 30% guest HP reduction therefore comes from `maxHpRate`, rather
+than from a generic character-stat write.
+
+The exact param lookup is `0x01F28D20`, validated by the original 14-byte
+prologue `55 48 89 E5 41 57 41 56 41 54 53 44 89 E6`. Its result stores the
+row pointer at `+0x08`; the verified row fields are `maxHpRate` at `+0x10`,
+`stateInfo` at `+0x156`, and `useSpEffectEffect` bit `0x08` at byte `+0x160`.
+Only on the periodic game thread and only for the exact seamless profile, the
+policy changes `maxHpRate` from the verified vanilla value `0.7` to `1.0` for
+both cooperative and invasion guest rows. This follows the explicit project
+policy that neither seamless guest role receives the vanilla health penalty.
+It does not write current HP, heal repeatedly, replace the SpEffect, or alter
+role/team/faction state.
+
+For the cooperative row only, the visual-use bit is cleared while preserving
+`stateInfo=272` and the complete cooperative state. The invasion row keeps its
+visual-use bit and `stateInfo=276`, so the invader remains the native red,
+hostile role while receiving full max HP. Effect `9005` and effect `9025`
+remain untouched. Any unexpected state, flag, value, profile, or byte signature
+fails closed and emits one diagnostic instead of applying a guessed patch.
+
+Decoded Hunter's Dream events also identify a separate guest travel gate.
+Event `12107000` (normal headstones) and event `12107100` (Chalice headstones)
+both begin with `END IF Multiplayer State: Client`; event `12107200` performs
+the later dungeon warp without that initial check. This is useful evidence for
+why a guest cannot use those travel objects, but it is not by itself a safe
+runtime patch: the host prompt failure occurs earlier in native interaction
+selection, and globally changing the event interpreter would affect unrelated
+events. This iteration therefore keeps the existing exact Healing Fountain
+override and documents the remaining prompt/selection gate instead of adding a
+global multiplayer NOP.
 
 ## Established-session travel iteration 1
 

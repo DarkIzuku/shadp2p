@@ -69,6 +69,27 @@ u64 PendingCrossMapSummonStateMachine::OnPlacementDeferred(u32 targetMap, s64 no
     return m_pending.generation;
 }
 
+bool PendingCrossMapSummonStateMachine::OnNativeHandoffObserved(u32 currentMap, u32 targetMap,
+                                                                SeamlessPeerRole role, s64 nowMs,
+                                                                u64 generation) {
+    if (!m_enabled || currentMap == 0 || targetMap != m_pending.targetMap ||
+        role == SeamlessPeerRole::Unknown || !MatchesGeneration(generation) || IsExpired(nowMs) ||
+        m_pending.phase == PendingCrossMapSummonPhase::Complete ||
+        m_pending.phase == PendingCrossMapSummonPhase::Failed) {
+        return false;
+    }
+    m_pending.sourceMap = currentMap;
+    m_pending.role = role;
+    m_pending.nativeHandoffObserved = true;
+    if (!m_pending.claimAccepted) {
+        m_pending.phase = PendingCrossMapSummonPhase::NativeHandoffObserved;
+    } else {
+        AdvanceReadyPhase();
+    }
+    RefreshDeadline(nowMs);
+    return true;
+}
+
 bool PendingCrossMapSummonStateMachine::BindRole(SeamlessPeerRole role, u64 generation) {
     if (!m_enabled || role == SeamlessPeerRole::Unknown || !MatchesGeneration(generation))
         return false;
@@ -92,6 +113,10 @@ void PendingCrossMapSummonStateMachine::AdvanceReadyPhase() {
         m_pending.phase = PendingCrossMapSummonPhase::RoomJoined;
     else if (m_pending.roomJoinStarted)
         m_pending.phase = PendingCrossMapSummonPhase::RoomJoinStarted;
+    else if (m_pending.claimAccepted)
+        m_pending.phase = PendingCrossMapSummonPhase::ClaimAccepted;
+    else if (m_pending.nativeHandoffObserved)
+        m_pending.phase = PendingCrossMapSummonPhase::NativeHandoffObserved;
 }
 
 bool PendingCrossMapSummonStateMachine::OnRoomJoinStarted(s64 nowMs, u64 roomId, u64 generation) {
@@ -135,10 +160,14 @@ bool PendingCrossMapSummonStateMachine::OnSignalingEstablished(s64 nowMs, u64 ro
 
 PendingCrossMapSummonDecision PendingCrossMapSummonStateMachine::EvaluateNativeHandoff(
     u32 currentMap, u32 targetMap, s64 nowMs) {
-    if (!m_enabled || m_pending.phase == PendingCrossMapSummonPhase::Idle || IsExpired(nowMs))
+    if (!m_enabled || m_pending.phase == PendingCrossMapSummonPhase::Idle)
         return PendingCrossMapSummonDecision::None;
     if (m_pending.phase == PendingCrossMapSummonPhase::Complete)
         return PendingCrossMapSummonDecision::None;
+    if (IsExpired(nowMs)) {
+        m_pending.phase = PendingCrossMapSummonPhase::Failed;
+        return PendingCrossMapSummonDecision::TimedOut;
+    }
     if (targetMap != m_pending.targetMap)
         return PendingCrossMapSummonDecision::StaleTarget;
     if (currentMap == targetMap) {
@@ -148,6 +177,8 @@ PendingCrossMapSummonDecision PendingCrossMapSummonStateMachine::EvaluateNativeH
     }
     if (m_pending.reloadCount != 0)
         return PendingCrossMapSummonDecision::DuplicateReload;
+    if (!m_pending.nativeHandoffObserved)
+        return PendingCrossMapSummonDecision::WaitForNativeHandoff;
     if (!m_pending.claimAccepted)
         return PendingCrossMapSummonDecision::WaitForClaim;
     if (!m_pending.roomJoined)
