@@ -1713,7 +1713,6 @@ The replacement sequence keeps the responder in the source world:
 ```text
 CandidateFound -> CrossMapPlacementDeferred -> ClaimAccepted
   -> RoomJoinStarted -> RoomJoined -> SignalingEstablished
-  -> NativeHandoffObserved
   -> CrossMapCommit -> ForcedPlacementApplied -> SingleReloadStarted
   -> WorldReady -> RemoteInserted -> Complete
 ```
@@ -1727,23 +1726,38 @@ handoff for the same generation returns `DuplicateReload` and logs
 `DuplicateReloadSuppressed`; it cannot issue another stage transition. A
 same-map handoff completes with zero artificial reloads.
 
-The first runtime attempt exposed an ordering hole in that design. Bloodborne
-reached `CSMultiPlayerIns.CrossMapGuestHandoff` before signaling was ready, so
-the state machine correctly returned `WaitForSignaling`, but the native
-handoff site did not execute a second time after signaling became ready. The
-placement remained valid and the network session completed while the guest
-stayed in the source map. The handoff is now recorded as a validated,
-generation-bound event. The existing periodic game-thread hook reevaluates
-that retained handoff after claim, room join, and signaling have all completed.
-Network callbacks still make no Bloodborne memory reads or native calls. A
-signaling callback without a validated native handoff cannot trigger a warp,
-and an expired generation fails with zero reloads.
+The first runtime attempt exposed two ordering holes in that design. Bloodborne
+could reach `CSMultiPlayerIns.CrossMapGuestHandoff` before signaling, and in the
+latest capture no native handoff was observed at all after claim, room join, and
+signaling completed. Requiring that optional observation therefore left a fully
+valid pending summon permanently waiting in the source map.
 
-shadNet now returns every eligible cross-map advertisement immediately. It
-stores the host placement as the final summon destination and delivers the
-claim plus placement to the responder while that responder is still in the
-source world. `Preparing`, pre-match `StageTransition`, automatic bell reuse,
-and destination-world re-advertisement are no longer part of the active path.
+The state machine now latches claim, room, and signaling facts even when they
+arrive before the placement record. `TryAdvancePendingCrossMapSummon` is driven
+from the existing periodic game-thread hook and reevaluates whenever any fact
+changes. A commit requires a current generation, finite target placement,
+accepted claim, the expected room, signaling for that room/peer, an unexpired
+deadline, and an unclaimed commit token. Native handoff remains useful trace
+evidence but is not an independent prerequisite. The commit token and reload
+counter make the path idempotent: a callback or hook repeated for the same
+generation cannot issue a second reload. Network callbacks still make no
+Bloodborne memory reads or native calls, and an expired generation fails with
+zero reloads.
+
+shadNet now returns every eligible cross-map advertisement immediately. The
+captured protocol is asymmetric: the Small/Sinister Resonant user publishes
+`SummonDataCreateRequest`, while the Beckoning host performs `GetList` and the
+claim request. Consequently the advertiser's placement is source-world
+diagnostic data, not the summon destination. The Beckoning requester's exact
+placement becomes the destination only when a particular candidate/session is
+claimed. A `GetList` can observe but cannot write placement into an
+advertisement, so an unrelated or repeated search cannot replace the target.
+The claim binds requester, candidate session, placement, and a monotonically
+increasing placement generation; advertisement removal/expiry/consumption
+clears that association. The server delivers that claim-bound destination to
+the responder while the responder is still in the source world. `Preparing`,
+pre-match `StageTransition`, automatic bell reuse, and destination-world
+re-advertisement are no longer part of the active path.
 The server trace records one textual reason for every candidate that is not
 returned, including filter mismatch, consumed/unavailable state, another
 requester's active claim, and `GetCount` truncation.
@@ -1803,6 +1817,17 @@ visual-use bit and `stateInfo=276`, so the invader remains the native red,
 hostile role while receiving full max HP. Effect `9005` and effect `9025`
 remain untouched. Any unexpected state, flag, value, profile, or byte signature
 fails closed and emits one diagnostic instead of applying a guessed patch.
+
+The runtime `unsupported_profile` result was caused before this policy ran:
+profile selection accepted the generic `cusa03173-109-reference` entry before
+testing the exact user-eboot fingerprint. Selection now validates the SpEffect
+lookup prologue plus all nine native initial-summon call signatures and prefers
+`cusa03173-109-user-eboot-6764938b` when those bytes match. The generic fallback
+is still available for its own executable, but is intentionally not accepted by
+the user-eboot HP/visual policy. Applied logs report profile, role, summon type,
+the verified old/new rates, `source=SpEffectParam`, and `result=applied`. Absolute
+per-character HP values are not fabricated because this scoped patch operates
+on the native parameter row rather than a live player-stat field.
 
 Decoded Hunter's Dream events also identify a separate guest travel gate.
 Event `12107000` (normal headstones) and event `12107100` (Chalice headstones)
@@ -1960,3 +1985,102 @@ PvP cleanup. Unknown summon values are never guessed into either role.
 These changes are byte-verified and build-tested, but cross-map co-op, Hunter's
 Dream bell use, red-phantom creation, and runtime invasion cleanup still require
 the Izuku/Hiryu game tests before they can be described as runtime confirmed.
+
+## Hunter's Dream Interaction RE
+
+This iteration is instrumentation only. It does not force an interaction result,
+change a role or event flag, hide multiplayer from the game, disable
+`CSMultiPlayMan`, or alter travel. The observers are disabled unless
+`SHADPS4_BLOODBORNE_INTERACT_TRACE=1` is present. The optional
+`SHADPS4_BLOODBORNE_INTERACT_TRACE_VERBOSE=1` includes otherwise unrelated
+event instructions, the first four raw argument words, and a bounded four-frame
+caller chain. Seamless itself continues to use its independent
+`SHADPS4_BLOODBORNE_SEAMLESS_COOP` switch.
+
+The trace profile is restricted to CUSA03173, app version 01.09, and the existing
+`cusa03173-109-user-eboot-6764938b` layout derived from the eboot whose SHA-256 is
+`6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80`.
+Every observer separately checks the complete original instruction sequence
+shown below before installing and fails closed if any byte differs:
+
+```text
+Event instruction dispatcher       0x017B95C0  55 48 89 E5 53 50
+Healing-fountain registration      0x0133B3D0  55 48 89 E5 41 57
+RE_InteractionAvailability gates   0x012F870E  41 80 7D 48 00
+RE_ActionCandidate transition      0x012F8799  4D 8D 75 2C 44 39 3E
+RE_Prompt state                    0x012F8BB3  B8 6F A0 FE FF
+RE_Availability downstream gates   0x012F8F48  41 80 7D 48 00
+RE_Availability blocked target     0x012F921A  41 C7 45 60 00 00 00 00
+RE_Availability publish            0x012F9253  41 8B 7D 20 41 0F BE 55 28
+Warp respawn-point parameter       0x013CE320  55 48 89 E5 41 57
+```
+
+The `RE_` function labels are inferred names, not recovered symbols. Static
+analysis establishes that the availability object carries four byte gates at
+`+0x48..+0x4B`; `0x012F8799` compares a value at `+0x2C` while moving through
+candidate selection; `0x012F8BB3` selects prompt state `0xFFFEA06F`;
+`0x012F8F48` consumes the same four gates later in the pipeline;
+`0x012F921A` is a blocked target which clears object state at `+0x60`; and
+`0x012F9253` prepares the native availability publication call. Runtime evidence
+is still required before assigning higher-level semantics to gates `48`, `4A`,
+or `4B`. Gate `49` is labelled `multiplayer_gate_49` in a blocked trace only to
+make the known host-effect path easy to compare; its complete native policy is
+not yet claimed as proven.
+
+The event dispatcher reads the real bank and command from the instruction
+definition and decodes only layouts established by the event command contract:
+
+```text
+bank 3, command 0       event-flag condition
+bank 3, command 5       target entity, entity id, help-message id
+bank 3, command 24      action-button parameter and entity id
+bank 1003, 5/6/105      requested multiplayer-state condition
+bank 2003, command 49   Warp Player to Respawn Point
+bank 2009, command 5    Register Healing Fountain
+```
+
+The decoded `m21_00_00_00` event data gives the following confirmed Dream
+identities. Normal headstones are entities `2100950..2100953` and event
+`12107000`. Chalice headstones are entities `2100954..2100960` and events
+`12107100`/`12107200`; slot flags `9020..9026` occur in that path. Both
+`12107000` and `12107100` begin with a client-multiplayer-state condition, while
+the later `12107200` path does not begin with the same condition. This describes
+the event scripts only; it does not yet prove which native branch suppresses the
+host prompt.
+
+The normal trace is limited to Hunter's Dream packed map `0x15000000`, confirmed
+headstone/event routes, multiplayer-state commands, healing-fountain
+registration, and the native WarpParam entry. It records state changes and then
+suppresses identical observations for 30 seconds. Entries expire after two
+minutes and are bounded to 512 identities. Moving to another packed map, leaving
+the Matching2 room, or starting a new trace clears stale observations. Verbose
+mode can observe the same hook set outside the Dream for comparison.
+
+Each `[BLOODBORNE SEAMLESS INTERACT ...]` record includes a timestamp and logical
+counter, native thread name, phase, known interaction class, exact role, packed
+map and region, entity/action/prompt IDs, object address, Seamless party and
+Matching2 state, room/member IDs, signaling state, `CSMultiPlayMan` state, the
+four availability gates, decoded event fields, respawn parameter, exact eboot
+and caller offsets, validated original bytes, result, and local placement when
+available. The hook runs synchronously inside guest code; the log deliberately
+uses `hook_context=guest_code_synchronous` rather than claiming every observed
+dispatcher call is the periodic game thread. Verbose records add raw arguments
+and the bounded caller chain.
+
+The exact current event instance ID is not yet resolved from the interpreter
+context and is therefore emitted as `event_id=-1`; the known event numbers above
+come from static event-script analysis. Static `m21` evidence strongly associates
+entity `2100700` with the Doll's insight-dependent animation and player-facing
+behavior, but this is not yet a runtime-proven NPC contract. The trace therefore
+labels it `DollCandidate`, never simply `Doll`, and emits a deduplicated
+`[BLOODBORNE SEAMLESS NPC]` record at candidate, prompt, and block transitions.
+Unknown NPC-param, ownership, phantom-presentation, team, and SpEffect fields are
+reported as unavailable instead of being read from guessed offsets. Workshop,
+Storage, Bath Messenger, and Memory Altar identifiers remain unknown until the
+runtime capture identifies them. The broad action-button and event hooks will
+expose their entity, prompt, flag, role, and caller data without inventing a
+contract. The next comparison must determine whether the guest Doll phantom is
+created by network ownership, native visual presentation, an SpEffect, or a
+separate NPC instance, and whether each interaction fails during candidate
+generation, prompt publication, selection, event dispatch, menu opening, or the
+final WarpParam path. No interaction bypass has been added in this iteration.

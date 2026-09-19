@@ -22,6 +22,98 @@ bool IsTransitionState(SeamlessTravelState state) {
 
 } // namespace
 
+HunterDreamInteractionTraceState::HunterDreamInteractionTraceState()
+    : HunterDreamInteractionTraceState(Options{}) {}
+
+HunterDreamInteractionTraceState::HunterDreamInteractionTraceState(Options options)
+    : m_options(options) {
+    m_options.repeatAfterMs = std::max<s64>(100, m_options.repeatAfterMs);
+    m_options.staleAfterMs = std::max(m_options.repeatAfterMs, m_options.staleAfterMs);
+    m_options.maxEntries = std::max<size_t>(1, m_options.maxEntries);
+    m_entries.reserve(m_options.maxEntries);
+}
+
+void HunterDreamInteractionTraceState::SetEnabled(bool enabled) {
+    m_enabled = enabled;
+    m_world = 0;
+    m_entries.clear();
+}
+
+bool HunterDreamInteractionTraceState::IsEnabled() const {
+    return m_enabled;
+}
+
+bool HunterDreamInteractionTraceState::SameIdentity(
+    const HunterDreamInteractionTraceSnapshot& left,
+    const HunterDreamInteractionTraceSnapshot& right) {
+    return left.phase == right.phase && left.object == right.object &&
+           left.entityId == right.entityId && left.eventId == right.eventId &&
+           left.actionButtonId == right.actionButtonId && left.eventBank == right.eventBank &&
+           left.eventCommand == right.eventCommand;
+}
+
+bool HunterDreamInteractionTraceState::SameState(const HunterDreamInteractionTraceSnapshot& left,
+                                                 const HunterDreamInteractionTraceSnapshot& right) {
+    return left.kind == right.kind && left.role == right.role && left.map == right.map &&
+           left.areaRegion == right.areaRegion && left.promptId == right.promptId &&
+           left.gates == right.gates && left.available == right.available &&
+           left.selected == right.selected;
+}
+
+void HunterDreamInteractionTraceState::Expire(s64 nowMs) {
+    std::erase_if(m_entries, [&](const Entry& entry) {
+        return nowMs - entry.lastSeenMs > m_options.staleAfterMs;
+    });
+}
+
+HunterDreamInteractionTraceDecision HunterDreamInteractionTraceState::Observe(
+    const HunterDreamInteractionTraceSnapshot& value, s64 nowMs) {
+    if (!m_enabled)
+        return HunterDreamInteractionTraceDecision::Suppressed;
+
+    const bool worldChanged = m_world != 0 && value.map != 0 && value.map != m_world;
+    if (value.map != 0 && value.map != m_world) {
+        m_world = value.map;
+        m_entries.clear();
+    }
+    Expire(nowMs);
+
+    const auto existing = std::ranges::find_if(
+        m_entries, [&](const Entry& entry) { return SameIdentity(entry.snapshot, value); });
+    if (existing != m_entries.end()) {
+        const bool unchanged = SameState(existing->snapshot, value);
+        existing->lastSeenMs = nowMs;
+        if (unchanged && nowMs - existing->lastEmittedMs < m_options.repeatAfterMs)
+            return HunterDreamInteractionTraceDecision::Suppressed;
+        existing->snapshot = value;
+        existing->lastEmittedMs = nowMs;
+        return worldChanged ? HunterDreamInteractionTraceDecision::WorldChanged
+                            : HunterDreamInteractionTraceDecision::Emit;
+    }
+
+    if (m_entries.size() == m_options.maxEntries) {
+        const auto oldest = std::ranges::min_element(m_entries, {}, &Entry::lastSeenMs);
+        m_entries.erase(oldest);
+    }
+    m_entries.push_back({value, nowMs, nowMs});
+    return worldChanged ? HunterDreamInteractionTraceDecision::WorldChanged
+                        : HunterDreamInteractionTraceDecision::Emit;
+}
+
+void HunterDreamInteractionTraceState::ResetForWorld(u32 map) {
+    m_world = map;
+    m_entries.clear();
+}
+
+void HunterDreamInteractionTraceState::ResetForSessionEnd() {
+    m_world = 0;
+    m_entries.clear();
+}
+
+size_t HunterDreamInteractionTraceState::EntryCount() const {
+    return m_entries.size();
+}
+
 PendingCrossMapSummonStateMachine::PendingCrossMapSummonStateMachine()
     : PendingCrossMapSummonStateMachine(Options{}) {}
 
@@ -37,7 +129,9 @@ void PendingCrossMapSummonStateMachine::SetEnabled(bool enabled) {
 
 void PendingCrossMapSummonStateMachine::Reset() {
     m_pending = {};
+    m_unbound = {};
     m_deadlineMs = 0;
+    m_unboundDeadlineMs = 0;
 }
 
 bool PendingCrossMapSummonStateMachine::MatchesGeneration(u64 generation) const {
@@ -65,8 +159,26 @@ u64 PendingCrossMapSummonStateMachine::OnPlacementDeferred(u32 targetMap, s64 no
     m_pending.phase = PendingCrossMapSummonPhase::PlacementDeferred;
     m_pending.generation = ++m_nextGeneration;
     m_pending.targetMap = targetMap;
+    m_pending.placementReady = true;
+    BindUnboundEvents(nowMs);
+    AdvanceReadyPhase();
     RefreshDeadline(nowMs);
     return m_pending.generation;
+}
+
+void PendingCrossMapSummonStateMachine::BindUnboundEvents(s64 nowMs) {
+    if (m_unboundDeadlineMs == 0 || nowMs > m_unboundDeadlineMs) {
+        m_unbound = {};
+        m_unboundDeadlineMs = 0;
+        return;
+    }
+    m_pending.claimAccepted = m_unbound.claimAccepted;
+    m_pending.roomJoinStarted = m_unbound.roomJoinStarted;
+    m_pending.roomJoined = m_unbound.roomJoined;
+    m_pending.signalingEstablished = m_unbound.signalingEstablished;
+    m_pending.roomId = m_unbound.roomId;
+    m_unbound = {};
+    m_unboundDeadlineMs = 0;
 }
 
 bool PendingCrossMapSummonStateMachine::OnNativeHandoffObserved(u32 currentMap, u32 targetMap,
@@ -98,10 +210,19 @@ bool PendingCrossMapSummonStateMachine::BindRole(SeamlessPeerRole role, u64 gene
 }
 
 bool PendingCrossMapSummonStateMachine::OnClaimAccepted(s64 nowMs, u64 generation) {
-    if (!m_enabled || !MatchesGeneration(generation) || IsExpired(nowMs))
+    if (!m_enabled)
+        return false;
+    if (m_pending.phase == PendingCrossMapSummonPhase::Idle) {
+        if (generation != 0)
+            return false;
+        m_unbound.claimAccepted = true;
+        m_unboundDeadlineMs = nowMs + m_options.timeoutMs;
+        return true;
+    }
+    if (!MatchesGeneration(generation) || IsExpired(nowMs))
         return false;
     m_pending.claimAccepted = true;
-    m_pending.phase = PendingCrossMapSummonPhase::ClaimAccepted;
+    AdvanceReadyPhase();
     RefreshDeadline(nowMs);
     return true;
 }
@@ -120,22 +241,46 @@ void PendingCrossMapSummonStateMachine::AdvanceReadyPhase() {
 }
 
 bool PendingCrossMapSummonStateMachine::OnRoomJoinStarted(s64 nowMs, u64 roomId, u64 generation) {
-    if (!m_enabled || !MatchesGeneration(generation) || !m_pending.claimAccepted ||
-        IsExpired(nowMs)) {
+    if (!m_enabled)
+        return false;
+    if (m_pending.phase == PendingCrossMapSummonPhase::Idle) {
+        if (generation != 0)
+            return false;
+        m_unbound.roomJoinStarted = true;
+        m_unbound.roomId = roomId;
+        m_unboundDeadlineMs = nowMs + m_options.timeoutMs;
+        return true;
+    }
+    if (!MatchesGeneration(generation) || IsExpired(nowMs)) {
         return false;
     }
+    const bool roomChanged = roomId != 0 && m_pending.roomId != 0 && m_pending.roomId != roomId;
     m_pending.roomJoinStarted = true;
-    m_pending.roomJoined = false;
-    m_pending.signalingEstablished = false;
-    m_pending.roomId = roomId;
+    if (roomChanged) {
+        m_pending.roomJoined = false;
+        m_pending.signalingEstablished = false;
+    }
+    if (roomId != 0)
+        m_pending.roomId = roomId;
     AdvanceReadyPhase();
     RefreshDeadline(nowMs);
     return true;
 }
 
 bool PendingCrossMapSummonStateMachine::OnRoomJoined(s64 nowMs, u64 roomId, u64 generation) {
-    if (!m_enabled || !MatchesGeneration(generation) || !m_pending.claimAccepted || roomId == 0 ||
-        IsExpired(nowMs) || (m_pending.roomId != 0 && m_pending.roomId != roomId)) {
+    if (!m_enabled || roomId == 0)
+        return false;
+    if (m_pending.phase == PendingCrossMapSummonPhase::Idle) {
+        if (generation != 0 || (m_unbound.roomId != 0 && m_unbound.roomId != roomId))
+            return false;
+        m_unbound.roomJoinStarted = true;
+        m_unbound.roomJoined = true;
+        m_unbound.roomId = roomId;
+        m_unboundDeadlineMs = nowMs + m_options.timeoutMs;
+        return true;
+    }
+    if (!MatchesGeneration(generation) || IsExpired(nowMs) ||
+        (m_pending.roomId != 0 && m_pending.roomId != roomId)) {
         return false;
     }
     m_pending.roomJoinStarted = true;
@@ -148,18 +293,34 @@ bool PendingCrossMapSummonStateMachine::OnRoomJoined(s64 nowMs, u64 roomId, u64 
 
 bool PendingCrossMapSummonStateMachine::OnSignalingEstablished(s64 nowMs, u64 roomId,
                                                                u64 generation) {
-    if (!m_enabled || !MatchesGeneration(generation) || !m_pending.claimAccepted ||
-        !m_pending.roomJoined || roomId == 0 || roomId != m_pending.roomId || IsExpired(nowMs)) {
+    if (!m_enabled || roomId == 0)
+        return false;
+    if (m_pending.phase == PendingCrossMapSummonPhase::Idle) {
+        if (generation != 0 || (m_unbound.roomId != 0 && m_unbound.roomId != roomId))
+            return false;
+        m_unbound.roomJoinStarted = true;
+        m_unbound.roomJoined = true;
+        m_unbound.signalingEstablished = true;
+        m_unbound.roomId = roomId;
+        m_unboundDeadlineMs = nowMs + m_options.timeoutMs;
+        return true;
+    }
+    if (!MatchesGeneration(generation) || IsExpired(nowMs) ||
+        (m_pending.roomId != 0 && roomId != m_pending.roomId)) {
         return false;
     }
+    m_pending.roomJoinStarted = true;
+    m_pending.roomJoined = true;
+    m_pending.roomId = roomId;
     m_pending.signalingEstablished = true;
     AdvanceReadyPhase();
     RefreshDeadline(nowMs);
     return true;
 }
 
-PendingCrossMapSummonDecision PendingCrossMapSummonStateMachine::EvaluateNativeHandoff(
-    u32 currentMap, u32 targetMap, s64 nowMs) {
+PendingCrossMapSummonDecision PendingCrossMapSummonStateMachine::Evaluate(u32 currentMap,
+                                                                          u32 targetMap,
+                                                                          s64 nowMs) {
     if (!m_enabled || m_pending.phase == PendingCrossMapSummonPhase::Idle)
         return PendingCrossMapSummonDecision::None;
     if (m_pending.phase == PendingCrossMapSummonPhase::Complete)
@@ -175,10 +336,11 @@ PendingCrossMapSummonDecision PendingCrossMapSummonStateMachine::EvaluateNativeH
                                                      : PendingCrossMapSummonPhase::WorldReady;
         return PendingCrossMapSummonDecision::SameMap;
     }
-    if (m_pending.reloadCount != 0)
+    m_pending.sourceMap = currentMap;
+    if (m_pending.reloadCount != 0 || m_pending.commitIssued)
         return PendingCrossMapSummonDecision::DuplicateReload;
-    if (!m_pending.nativeHandoffObserved)
-        return PendingCrossMapSummonDecision::WaitForNativeHandoff;
+    if (!m_pending.placementReady)
+        return PendingCrossMapSummonDecision::WaitForPlacement;
     if (!m_pending.claimAccepted)
         return PendingCrossMapSummonDecision::WaitForClaim;
     if (!m_pending.roomJoined)
@@ -190,9 +352,28 @@ PendingCrossMapSummonDecision PendingCrossMapSummonStateMachine::EvaluateNativeH
     return PendingCrossMapSummonDecision::Commit;
 }
 
+bool PendingCrossMapSummonStateMachine::BeginCommit(u64 generation) {
+    if (!m_enabled || !MatchesGeneration(generation) || m_pending.commitIssued ||
+        m_pending.reloadCount != 0 ||
+        m_pending.phase != PendingCrossMapSummonPhase::CrossMapCommit) {
+        return false;
+    }
+    m_pending.commitIssued = true;
+    return true;
+}
+
+bool PendingCrossMapSummonStateMachine::MarkCommitFailed(u64 generation) {
+    if (!MatchesGeneration(generation) || !m_pending.commitIssued ||
+        m_pending.phase != PendingCrossMapSummonPhase::CrossMapCommit) {
+        return false;
+    }
+    m_pending.phase = PendingCrossMapSummonPhase::Failed;
+    return true;
+}
+
 bool PendingCrossMapSummonStateMachine::MarkReloadStarted(u64 generation) {
     if (!m_enabled || !MatchesGeneration(generation) || m_pending.reloadCount != 0 ||
-        m_pending.phase != PendingCrossMapSummonPhase::CrossMapCommit) {
+        !m_pending.commitIssued || m_pending.phase != PendingCrossMapSummonPhase::CrossMapCommit) {
         return false;
     }
     m_pending.reloadCount = 1;
@@ -204,8 +385,7 @@ bool PendingCrossMapSummonStateMachine::MarkReloadFailed(u64 generation) {
     if (!MatchesGeneration(generation) ||
         m_pending.phase != PendingCrossMapSummonPhase::ReloadStarted)
         return false;
-    m_pending.reloadCount = 0;
-    m_pending.phase = PendingCrossMapSummonPhase::SignalingEstablished;
+    m_pending.phase = PendingCrossMapSummonPhase::Failed;
     return true;
 }
 
@@ -237,6 +417,10 @@ bool PendingCrossMapSummonStateMachine::ShouldRetainPlacementOnMissingCreate(s64
 
 PendingCrossMapSummonSnapshot PendingCrossMapSummonStateMachine::Snapshot() const {
     return m_pending;
+}
+
+bool IsSeamlessGuestParamProfileSupported(std::string_view profileName) {
+    return profileName == "cusa03173-109-user-eboot-6764938b";
 }
 
 SeamlessTravelStateMachine::SeamlessTravelStateMachine() : SeamlessTravelStateMachine(Options{}) {}
@@ -396,9 +580,10 @@ SeamlessAction SeamlessTravelStateMachine::OnNotification(const SeamlessTravelEv
     if (event.phase == SeamlessTravelPhase::TravelReady) {
         if (matching.localUserId != event.leaderUserId || sourceUserId == event.leaderUserId)
             return {};
-        // A guest can answer the server-forwarded Begin before the leader receives its own Begin
-        // reply. Adopt the server-authoritative party identity here so the resulting Commit is
-        // correlated correctly instead of carrying the leader's still-pending empty identity.
+        // A guest can answer the server-forwarded Begin before the leader receives
+        // its own Begin reply. Adopt the server-authoritative party identity here
+        // so the resulting Commit is correlated correctly instead of carrying the
+        // leader's still-pending empty identity.
         m_activeTravel->partyId = event.partyId;
         m_activeTravel->generation = event.generation;
         m_activeTravel->sequenceId = event.sequenceId;

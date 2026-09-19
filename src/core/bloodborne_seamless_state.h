@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
+#include <array>
 #include <optional>
 #include <string>
+#include <vector>
 #include "common/types.h"
 
 namespace Core::Bloodborne {
@@ -30,15 +32,17 @@ constexpr SeamlessResponderPolicy SelectSeamlessResponderPolicy(bool sinisterBel
 }
 
 constexpr bool ShouldNormalizeSeamlessAppearance(SeamlessPeerRole role) {
-    // Appearance policy is intentionally separate from team/faction/network role. Invaders keep
-    // Bloodborne's hostile presentation and are never folded into the cooperative party.
+    // Appearance policy is intentionally separate from team/faction/network role.
+    // Invaders keep Bloodborne's hostile presentation and are never folded into
+    // the cooperative party.
     return role == SeamlessPeerRole::Cooperator;
 }
 
 constexpr bool ShouldRestoreSeamlessGuestHealth(SeamlessPeerRole role) {
-    // Bloodborne's exact 1.09 game parameters reduce max HP to 70% in both the cooperative
-    // guest state (9006) and the invasion guest state (9026). Seamless removes that guest-only
-    // penalty for both roles without changing either role's distinct state/team semantics.
+    // Bloodborne's exact 1.09 game parameters reduce max HP to 70% in both the
+    // cooperative guest state (9006) and the invasion guest state (9026).
+    // Seamless removes that guest-only penalty for both roles without changing
+    // either role's distinct state/team semantics.
     return role == SeamlessPeerRole::Cooperator || role == SeamlessPeerRole::Invader;
 }
 
@@ -61,6 +65,126 @@ constexpr std::optional<SeamlessGuestParamPolicy> SelectSeamlessGuestParamPolicy
     }
 }
 
+enum class HunterDreamInteractionRole : u32 {
+    Unknown = 0,
+    Solo,
+    Host,
+    Cooperator,
+    Invader,
+};
+
+constexpr HunterDreamInteractionRole ClassifyHunterDreamInteractionRole(bool inRoom, bool roomOwner,
+                                                                        bool hostEffect,
+                                                                        bool cooperatorEffect,
+                                                                        bool invaderEffect) {
+    if (!inRoom)
+        return HunterDreamInteractionRole::Solo;
+    if (invaderEffect)
+        return HunterDreamInteractionRole::Invader;
+    if (roomOwner || hostEffect)
+        return HunterDreamInteractionRole::Host;
+    if (cooperatorEffect)
+        return HunterDreamInteractionRole::Cooperator;
+    return HunterDreamInteractionRole::Unknown;
+}
+
+enum class HunterDreamInteractionKind : u32 {
+    Unknown = 0,
+    NormalHeadstone,
+    ChaliceHeadstone,
+    PersonalService,
+    WorldTravel,
+};
+
+constexpr HunterDreamInteractionKind ClassifyHunterDreamInteraction(s32 entityId, s32 eventId,
+                                                                    s32 eventBank,
+                                                                    s32 eventCommand) {
+    // These IDs come from the decoded CUSA03173 01.09 m21_00_00_00 events. Other
+    // Dream objects deliberately remain Unknown until a runtime capture proves
+    // their identity.
+    if ((entityId >= 2'100'950 && entityId <= 2'100'953) || eventId == 12'107'000)
+        return HunterDreamInteractionKind::NormalHeadstone;
+    if ((entityId >= 2'100'954 && entityId <= 2'100'960) || eventId == 12'107'100 ||
+        eventId == 12'107'200)
+        return HunterDreamInteractionKind::ChaliceHeadstone;
+    if (eventBank == 2003 && eventCommand == 49)
+        return HunterDreamInteractionKind::WorldTravel;
+    return HunterDreamInteractionKind::Unknown;
+}
+
+enum class HunterDreamInteractionPhase : u32 {
+    Registration = 0,
+    Candidate,
+    Prompt,
+    Select,
+    Execute,
+    Block,
+    Event,
+    State,
+};
+
+struct HunterDreamInteractionTraceSnapshot {
+    HunterDreamInteractionPhase phase = HunterDreamInteractionPhase::State;
+    HunterDreamInteractionKind kind = HunterDreamInteractionKind::Unknown;
+    HunterDreamInteractionRole role = HunterDreamInteractionRole::Unknown;
+    u32 map = 0;
+    s32 areaRegion = -1;
+    u64 object = 0;
+    s32 entityId = -1;
+    s32 eventId = -1;
+    s32 actionButtonId = -1;
+    s32 promptId = -1;
+    s32 eventBank = -1;
+    s32 eventCommand = -1;
+    std::array<u8, 4> gates{};
+    bool available = false;
+    bool selected = false;
+};
+
+enum class HunterDreamInteractionTraceDecision : u32 {
+    Suppressed = 0,
+    Emit,
+    WorldChanged,
+};
+
+class HunterDreamInteractionTraceState {
+public:
+    struct Options {
+        s64 repeatAfterMs = 5'000;
+        s64 staleAfterMs = 30'000;
+        size_t maxEntries = 64;
+    };
+
+    HunterDreamInteractionTraceState();
+    explicit HunterDreamInteractionTraceState(Options options);
+
+    void SetEnabled(bool enabled);
+    bool IsEnabled() const;
+    HunterDreamInteractionTraceDecision Observe(const HunterDreamInteractionTraceSnapshot& value,
+                                                s64 nowMs);
+    void ResetForWorld(u32 map);
+    void ResetForSessionEnd();
+    size_t EntryCount() const;
+
+private:
+    struct Entry {
+        HunterDreamInteractionTraceSnapshot snapshot;
+        s64 lastSeenMs = 0;
+        s64 lastEmittedMs = 0;
+    };
+
+    static bool SameIdentity(const HunterDreamInteractionTraceSnapshot& left,
+                             const HunterDreamInteractionTraceSnapshot& right);
+    static bool SameState(const HunterDreamInteractionTraceSnapshot& left,
+                          const HunterDreamInteractionTraceSnapshot& right);
+    void Expire(s64 nowMs);
+
+    Options m_options;
+    bool m_enabled = false;
+    u32 m_world = 0;
+    std::vector<Entry> m_entries;
+};
+
 enum class PendingCrossMapSummonPhase : u32 {
     Idle = 0,
     PlacementDeferred,
@@ -79,7 +203,7 @@ enum class PendingCrossMapSummonPhase : u32 {
 
 enum class PendingCrossMapSummonDecision : u32 {
     None = 0,
-    WaitForNativeHandoff,
+    WaitForPlacement,
     WaitForClaim,
     WaitForRoom,
     WaitForSignaling,
@@ -98,6 +222,8 @@ struct PendingCrossMapSummonSnapshot {
     u32 sourceMap = 0;
     u32 targetMap = 0;
     u32 reloadCount = 0;
+    bool placementReady = false;
+    bool commitIssued = false;
     bool nativeHandoffObserved = false;
     bool claimAccepted = false;
     bool roomJoinStarted = false;
@@ -123,7 +249,9 @@ public:
     bool OnRoomJoinStarted(s64 nowMs, u64 roomId = 0, u64 generation = 0);
     bool OnRoomJoined(s64 nowMs, u64 roomId, u64 generation = 0);
     bool OnSignalingEstablished(s64 nowMs, u64 roomId, u64 generation = 0);
-    PendingCrossMapSummonDecision EvaluateNativeHandoff(u32 currentMap, u32 targetMap, s64 nowMs);
+    PendingCrossMapSummonDecision Evaluate(u32 currentMap, u32 targetMap, s64 nowMs);
+    bool BeginCommit(u64 generation);
+    bool MarkCommitFailed(u64 generation);
     bool MarkReloadStarted(u64 generation);
     bool MarkReloadFailed(u64 generation);
     bool MarkWorldReady(u32 currentMap, u64 generation);
@@ -137,13 +265,18 @@ private:
     bool IsExpired(s64 nowMs) const;
     void RefreshDeadline(s64 nowMs);
     void AdvanceReadyPhase();
+    void BindUnboundEvents(s64 nowMs);
 
     Options m_options;
     bool m_enabled = false;
     PendingCrossMapSummonSnapshot m_pending;
+    PendingCrossMapSummonSnapshot m_unbound;
     u64 m_nextGeneration = 0;
     s64 m_deadlineMs = 0;
+    s64 m_unboundDeadlineMs = 0;
 };
+
+bool IsSeamlessGuestParamProfileSupported(std::string_view profileName);
 
 enum class SeamlessTravelPhase : u32 {
     TravelBegin = 1,
