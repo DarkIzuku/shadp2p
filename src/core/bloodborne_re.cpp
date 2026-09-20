@@ -1570,6 +1570,8 @@ bool hunter_dream_interaction_warp_uses_established_hook{};
 bool hunter_dream_interaction_session_active{};
 std::array<bool, HunterDreamInteractionTraceSites.size()>
     hunter_dream_interaction_trace_hook_installed{};
+std::array<u64, HunterDreamInteractionTraceSites.size()>
+    hunter_dream_interaction_trace_runtime_offsets{};
 
 struct HunterDreamInteractionOverrideState {
     u64 blocked_object{};
@@ -4685,8 +4687,11 @@ void PS4_SYSV_ABI HunterDreamInteractionTraceEntry(u64 tag,
                                                    const GuestRegisterSnapshot* registers) {
     if (tag >= HunterDreamInteractionTraceSites.size() || registers == nullptr)
         return;
-    ApplyHunterDreamLocalWorldOverride(HunterDreamInteractionTraceSites[tag], registers);
-    EmitHunterDreamInteractionTrace(HunterDreamInteractionTraceSites[tag], *registers);
+    auto runtime_site = HunterDreamInteractionTraceSites[tag];
+    if (hunter_dream_interaction_trace_runtime_offsets[tag] != 0)
+        runtime_site.offset = hunter_dream_interaction_trace_runtime_offsets[tag];
+    ApplyHunterDreamLocalWorldOverride(runtime_site, registers);
+    EmitHunterDreamInteractionTrace(runtime_site, *registers);
 }
 
 void WriteHex(std::ostream& out, u64 value) {
@@ -8587,6 +8592,7 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
     size_t rejected_count = 0;
     for (size_t index = 0; index < HunterDreamInteractionTraceSites.size(); ++index) {
         const auto& site = HunterDreamInteractionTraceSites[index];
+        hunter_dream_interaction_trace_runtime_offsets[index] = site.offset;
         if (site.hook == HunterDreamInteractionHook::AvailabilityGate &&
             healing_fountain_host_availability_hook_installed) {
             hunter_dream_interaction_availability_uses_seamless_hook = true;
@@ -8617,34 +8623,64 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
         }
 
         const auto expected = std::span<const u8>{site.expected.data(), site.expectedSize};
-        const std::string observed = ReadDiagnosticBytes(
-            image_base, MemoryPatcher::g_eboot_image_size, site.offset, expected.size());
+        u64 resolved_offset = site.offset;
+        std::string observed = ReadDiagnosticBytes(
+            image_base, MemoryPatcher::g_eboot_image_size, resolved_offset, expected.size());
+        bool signature_matches = MatchesEstablishedTravelBytes(resolved_offset, expected);
+
+        if (!signature_matches &&
+            site.hook == HunterDreamInteractionHook::EventInstruction) {
+            // The fixed D65 offset observed in the first runtime landed inside a different
+            // instruction stream. Relocate only within the narrow interpreter neighborhood
+            // bounded by the known Dream WarpParam caller (0x017C1CF5), and only when the
+            // exact entry signature has one unique match. Ambiguity remains fail-closed.
+            constexpr u64 EventDispatcherSearchBegin = 0x017B0000;
+            constexpr u64 EventDispatcherSearchEnd = 0x017C2000;
+            const auto candidates =
+                FindEbootSignatureMatches(expected, EventDispatcherSearchBegin,
+                                          EventDispatcherSearchEnd);
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SEAMLESS INTERACT LOCATOR] hook={} static_offset={:#x} "
+                     "search_begin={:#x} search_end={:#x} matches={} candidates={}",
+                     site.name, site.offset, EventDispatcherSearchBegin,
+                     EventDispatcherSearchEnd, candidates.size(),
+                     FormatEbootSignatureMatches(candidates));
+            if (candidates.size() == 1) {
+                resolved_offset = candidates.front();
+                observed = ReadDiagnosticBytes(image_base, MemoryPatcher::g_eboot_image_size,
+                                               resolved_offset, expected.size());
+                signature_matches = MatchesEstablishedTravelBytes(resolved_offset, expected);
+            }
+        }
+
         if (!ShouldInstallBloodborneVerifiedHook(
-                profile.name == "cusa03173-109-d65f0b4f",
-                MatchesEstablishedTravelBytes(site.offset, expected))) {
+                profile.name == "cusa03173-109-d65f0b4f", signature_matches)) {
             ++rejected_count;
             LOG_ERROR(Debug,
-                      "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} eboot_offset={:#x} "
-                      "expected_bytes={} observed_bytes={} "
+                      "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} static_offset={:#x} "
+                      "resolved_offset={:#x} expected_bytes={} observed_bytes={} "
                       "result=signature_mismatch_not_installed",
-                      site.name, site.offset, BytesToHex(expected), observed);
+                      site.name, site.offset, resolved_offset, BytesToHex(expected), observed);
             continue;
         }
-        if (!InstallGuestCodeHook(reinterpret_cast<void*>(image_base + site.offset), expected,
+        if (!InstallGuestCodeHook(reinterpret_cast<void*>(image_base + resolved_offset), expected,
                                   index, HunterDreamInteractionTraceEntry)) {
             ++rejected_count;
             LOG_ERROR(Debug,
-                      "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} eboot_offset={:#x} "
-                      "expected_bytes={} observed_bytes={} result=observer_install_failed",
-                      site.name, site.offset, BytesToHex(expected), observed);
+                      "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} static_offset={:#x} "
+                      "resolved_offset={:#x} expected_bytes={} observed_bytes={} "
+                      "result=observer_install_failed",
+                      site.name, site.offset, resolved_offset, BytesToHex(expected), observed);
             continue;
         }
+        hunter_dream_interaction_trace_runtime_offsets[index] = resolved_offset;
         hunter_dream_interaction_trace_hook_installed[index] = true;
         ++installed_count;
         LOG_INFO(Debug,
-                 "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} eboot_offset={:#x} "
-                 "expected_bytes={} observed_bytes={} result=read_only_observer_installed",
-                 site.name, site.offset, BytesToHex(expected), observed);
+                 "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} static_offset={:#x} "
+                 "resolved_offset={:#x} expected_bytes={} observed_bytes={} "
+                 "result=read_only_observer_installed",
+                 site.name, site.offset, resolved_offset, BytesToHex(expected), observed);
     }
     LOG_INFO(Debug,
              "[BLOODBORNE SEAMLESS INTERACT STATE] enabled={} verbose={} behavior_override={} "
