@@ -2439,106 +2439,69 @@ std::optional<u64> FindUniqueEbootSignature(std::span<const u8> signature, u64 b
     return matches.size() == 1 ? std::optional<u64>{matches.front()} : std::nullopt;
 }
 
+u64 GetLocalPlayer();
+
+struct ActivePlayerEffectParam {
+    u64 node{};
+    u64 row{};
+    u32 flags{};
+};
+
+std::optional<ActivePlayerEffectParam> FindActivePlayerEffectParam(u64 player, s32 effect_id) {
+    if (player < 0x10000 || !HasMemoryAccess(player, 0x1D0, MemoryProt::CpuRead))
+        return std::nullopt;
+
+    const u64 manager = ReadValue<u64>(player, 0x1C8);
+    if (manager < 0x10000 || !HasMemoryAccess(manager, 0x28, MemoryProt::CpuRead))
+        return std::nullopt;
+
+    u64 node = ReadValue<u64>(manager, 0x08);
+    for (size_t index = 0; node >= 0x10000 && index < 512; ++index) {
+        if (!HasMemoryAccess(node, 0x60, MemoryProt::CpuRead))
+            break;
+
+        const u64 next = ReadValue<u64>(node, 0x58);
+        const u32 flags = ReadValue<u32>(node, 0x1C);
+        const s32 active_effect_id = ReadValue<s32>(node, 0x40);
+        const u64 row = ReadValue<u64>(node, 0x48);
+        if ((flags & 0x800C0003U) == 0 && active_effect_id == effect_id && row >= 0x10000) {
+            return ActivePlayerEffectParam{.node = node, .row = row, .flags = flags};
+        }
+
+        if (next == 0 || next == node)
+            break;
+        node = next;
+    }
+    return std::nullopt;
+}
+
 void ApplySeamlessGuestParamPolicy() {
     if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP") ||
         initial_seamless_profile == nullptr || image_base == 0) {
         return;
     }
 
-    const auto& lookup_site = initial_seamless_profile->sp_effect_param_lookup;
     if (!seamless_guest_health_signature_checked) {
         seamless_guest_health_signature_checked = true;
         if (!IsSeamlessGuestParamProfileSupported(initial_seamless_profile->name)) {
             LOG_ERROR(Debug,
                       "[BLOODBORNE SEAMLESS HEALTH] result=disabled "
-                      "reason=unsupported_profile "
-                      "profile={}",
+                      "reason=unsupported_profile profile={}",
                       initial_seamless_profile->name);
             return;
         }
-        if (lookup_site.prologue_size == 0) {
-            LOG_ERROR(Debug,
-                      "[BLOODBORNE SEAMLESS HEALTH] result=disabled "
-                      "reason=missing_lookup_signature "
-                      "profile={}",
-                      initial_seamless_profile->name);
-            return;
-        }
-        const auto expected =
-            std::span<const u8>{lookup_site.prologue.data(), lookup_site.prologue_size};
-        runtime_sp_effect_param_lookup_offset = lookup_site.offset;
-        if (runtime_sp_effect_param_lookup_offset == 0 &&
-            initial_seamless_profile->name == "cusa03173-109-d65f0b4f") {
-            // The legacy 676 layout places this function at 0x01F28D20. D65 has small,
-            // non-uniform code shifts elsewhere, so first search a bounded neighborhood
-            // without ever reusing the legacy address blindly.
-            const auto nearby_matches =
-                FindEbootSignatureMatches(expected, 0x01F20000, 0x01F38000);
-            LOG_INFO(Debug,
-                     "[BLOODBORNE SEAMLESS HEALTH LOCATOR] profile={} scope=near_legacy "
-                     "begin=0x01f20000 end=0x01f38000 matches={} candidates={}",
-                     initial_seamless_profile->name, nearby_matches.size(),
-                     FormatEbootSignatureMatches(nearby_matches));
-            if (nearby_matches.size() == 1) {
-                runtime_sp_effect_param_lookup_offset = nearby_matches.front();
-            } else {
-                // If the near-legacy window is empty or ambiguous, scan the full bounded
-                // executable range as a diagnostic. We still fail closed unless exactly
-                // one candidate exists; no legacy address is guessed into the D65 profile.
-                const auto full_matches =
-                    FindEbootSignatureMatches(expected, 0x01E00000, 0x02100000);
-                LOG_INFO(Debug,
-                         "[BLOODBORNE SEAMLESS HEALTH LOCATOR] profile={} scope=full "
-                         "begin=0x01e00000 end=0x02100000 matches={} candidates={}",
-                         initial_seamless_profile->name, full_matches.size(),
-                         FormatEbootSignatureMatches(full_matches));
-                if (full_matches.size() == 1) {
-                    runtime_sp_effect_param_lookup_offset = full_matches.front();
-                } else {
-                    const size_t logged_count = std::min<size_t>(full_matches.size(), 12);
-                    for (size_t index = 0; index < logged_count; ++index) {
-                        const u64 candidate = full_matches[index];
-                        const u64 before = candidate >= 16 ? candidate - 16 : 0;
-                        LOG_INFO(Debug,
-                                 "[BLOODBORNE SEAMLESS HEALTH LOCATOR] profile={} "
-                                 "candidate_index={} candidate={:#x} bytes_before={} "
-                                 "bytes_at={} bytes_after={}",
-                                 initial_seamless_profile->name, index, candidate,
-                                 ReadDiagnosticBytes(image_base,
-                                                     MemoryPatcher::g_eboot_image_size, before,
-                                                     static_cast<size_t>(candidate - before)),
-                                 ReadDiagnosticBytes(image_base,
-                                                     MemoryPatcher::g_eboot_image_size, candidate,
-                                                     32),
-                                 ReadDiagnosticBytes(image_base,
-                                                     MemoryPatcher::g_eboot_image_size,
-                                                     candidate + 32, 32));
-                    }
-                }
-            }
-        }
-        if (runtime_sp_effect_param_lookup_offset == 0 ||
-            !MatchesEstablishedTravelBytes(runtime_sp_effect_param_lookup_offset, expected)) {
-            LOG_ERROR(Debug,
-                      "[BLOODBORNE SEAMLESS HEALTH] result=disabled "
-                      "reason=lookup_signature_missing_or_ambiguous offset={:#x} expected={}",
-                      runtime_sp_effect_param_lookup_offset, BytesToHex(expected));
-            LOG_ERROR(Debug,
-                      "[BLOODBORNE PROFILE RESOLVE] feature=health profile={} address={:#x} "
-                      "validated=false reason=signature_missing_or_ambiguous",
-                      initial_seamless_profile->name, runtime_sp_effect_param_lookup_offset);
-            return;
-        }
-        LOG_INFO(Debug,
-                 "[BLOODBORNE PROFILE RESOLVE] feature=health profile={} address={:#x} "
-                 "validated=true resolution={}",
-                 initial_seamless_profile->name, runtime_sp_effect_param_lookup_offset,
-                 lookup_site.offset == 0 ? "unique_signature_scan" : "profile_offset");
+
+        // The active SpEffect list already gives us the exact SpEffectParam row at
+        // node+0x48. That is stronger than locating a version-specific lookup routine:
+        // the row is accepted only from an active 9006/9026 node and is validated below.
         seamless_guest_health_lookup_ready = true;
+        LOG_INFO(Debug,
+                 "[BLOODBORNE PROFILE RESOLVE] feature=health profile={} address=0x0 "
+                 "validated=true resolution=active_effect_param_pointer",
+                 initial_seamless_profile->name);
     }
-    if (!seamless_guest_health_lookup_ready) {
+    if (!seamless_guest_health_lookup_ready)
         return;
-    }
 
     struct GuestHealthEffect {
         SeamlessPeerRole role;
@@ -2555,40 +2518,39 @@ void ApplySeamlessGuestParamPolicy() {
     constexpr float VanillaGuestMaxHpRate = 0.7F;
     constexpr float SeamlessGuestMaxHpRate = 1.0F;
 
-    using SpEffectLookup = void PS4_SYSV_ABI (*)(SpEffectParamLookupResult*, s32);
-    const auto lookup =
-        reinterpret_cast<SpEffectLookup>(image_base + runtime_sp_effect_param_lookup_offset);
+    const u64 player = GetLocalPlayer();
+    if (player < 0x10000)
+        return;
+
     for (size_t index = 0; index < effects.size(); ++index) {
         const auto& effect = effects[index];
-        if (!ShouldRestoreSeamlessGuestHealth(effect.role)) {
+        if (!ShouldRestoreSeamlessGuestHealth(effect.role))
             continue;
-        }
-        const auto policy = SelectSeamlessGuestParamPolicy(effect.role);
-        if (!policy.has_value()) {
-            continue;
-        }
 
-        SpEffectParamLookupResult result{};
-        lookup(&result, policy->activeEffectId);
-        const u64 row = result.row;
-        if (row < 0x10000 ||
-            !HasMemoryAccess(row, UseSpEffectEffectOffset + sizeof(u8), MemoryProt::CpuRead)) {
+        const auto policy = SelectSeamlessGuestParamPolicy(effect.role);
+        if (!policy.has_value())
             continue;
-        }
+
+        const auto active = FindActivePlayerEffectParam(player, policy->activeEffectId);
+        if (!active.has_value())
+            continue;
+
+        const u64 row = active->row;
+        if (!HasMemoryAccess(row, UseSpEffectEffectOffset + sizeof(u8), MemoryProt::CpuRead))
+            continue;
+
+        const u16 state_info = ReadValue<u16>(row, StateInfoOffset);
         const u8 effect_flags = ReadValue<u8>(row, UseSpEffectEffectOffset);
         const bool uses_sp_effect_visual = (effect_flags & UseSpEffectEffectMask) != 0;
-        const bool row_was_patched = seamless_guest_health_patched_rows[index] == row;
-        const bool visual_contract_valid =
-            uses_sp_effect_visual ||
-            (effect.role == SeamlessPeerRole::Cooperator && row_was_patched);
-        if (ReadValue<u16>(row, StateInfoOffset) != policy->stateInfo || !visual_contract_valid) {
+        if (state_info != policy->stateInfo) {
             if (!seamless_guest_health_error_logged[index]) {
                 seamless_guest_health_error_logged[index] = true;
                 LOG_ERROR(Debug,
-                          "[BLOODBORNE SEAMLESS HEALTH] role={} effect={} result=disabled "
-                          "reason=param_contract_mismatch state_info={} effect_flags={:#x}",
-                          effect.roleName, policy->activeEffectId,
-                          ReadValue<u16>(row, StateInfoOffset), effect_flags);
+                          "[BLOODBORNE SEAMLESS HEALTH] role={} effect={} node={:#x} row={:#x} "
+                          "result=disabled reason=param_contract_mismatch state_info={} "
+                          "expected_state_info={} effect_flags={:#x}",
+                          effect.roleName, policy->activeEffectId, active->node, row, state_info,
+                          policy->stateInfo, effect_flags);
             }
             continue;
         }
@@ -2600,25 +2562,23 @@ void ApplySeamlessGuestParamPolicy() {
             if (!seamless_guest_health_error_logged[index]) {
                 seamless_guest_health_error_logged[index] = true;
                 LOG_ERROR(Debug,
-                          "[BLOODBORNE SEAMLESS HEALTH] role={} effect={} result=disabled "
-                          "reason=unexpected_max_hp_rate value={}",
-                          effect.roleName, policy->activeEffectId, current_rate);
+                          "[BLOODBORNE SEAMLESS HEALTH] role={} effect={} node={:#x} row={:#x} "
+                          "result=disabled reason=unexpected_max_hp_rate value={}",
+                          effect.roleName, policy->activeEffectId, active->node, row, current_rate);
             }
             continue;
-        } else {
-            if (!seamless_guest_health_row_logged[index]) {
-                seamless_guest_health_row_logged[index] = true;
-                LOG_INFO(Debug,
-                         "[BLOODBORNE SEAMLESS HEALTH] state=VanillaPenaltyRowValidated "
-                         "profile={} role={} summon_type={} sp_effect_id={} row={:#x} "
-                         "max_hp_rate_offset={:#x} original_max_hp_rate={} "
-                         "expected_vanilla_max_hp_rate={} policy_scope=seamless_only "
-                         "traditional_mode=untouched health_field_write=maxHpRate_only",
-                         initial_seamless_profile->name, effect.roleName,
-                         effect.role == SeamlessPeerRole::Invader ? 2 : 0, policy->activeEffectId,
-                         row, MaxHpRateOffset, current_rate, VanillaGuestMaxHpRate);
-            }
+        } else if (!seamless_guest_health_row_logged[index]) {
+            seamless_guest_health_row_logged[index] = true;
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SEAMLESS HEALTH] state=VanillaPenaltyRowValidated "
+                     "profile={} role={} summon_type={} sp_effect_id={} node={:#x} row={:#x} "
+                     "max_hp_rate_offset={:#x} original_max_hp_rate={} "
+                     "expected_vanilla_max_hp_rate={} locator=active_effect_param_pointer",
+                     initial_seamless_profile->name, effect.roleName,
+                     effect.role == SeamlessPeerRole::Invader ? 2 : 0, policy->activeEffectId,
+                     active->node, row, MaxHpRateOffset, current_rate, VanillaGuestMaxHpRate);
         }
+
         if (std::bit_cast<u32>(current_rate) == std::bit_cast<u32>(VanillaGuestMaxHpRate) &&
             (!WriteValue(row, MaxHpRateOffset, SeamlessGuestMaxHpRate) ||
              std::bit_cast<u32>(ReadValue<float>(row, MaxHpRateOffset)) !=
@@ -2626,34 +2586,32 @@ void ApplySeamlessGuestParamPolicy() {
             if (!seamless_guest_health_error_logged[index]) {
                 seamless_guest_health_error_logged[index] = true;
                 LOG_ERROR(Debug,
-                          "[BLOODBORNE SEAMLESS HEALTH] role={} effect={} result=disabled "
-                          "reason=param_write_rejected row={:#x} "
+                          "[BLOODBORNE SEAMLESS HEALTH] role={} effect={} node={:#x} row={:#x} "
+                          "result=disabled reason=param_write_rejected "
                           "original_max_hp_rate={} requested_max_hp_rate={}",
-                          effect.roleName, policy->activeEffectId, row, current_rate,
+                          effect.roleName, policy->activeEffectId, active->node, row, current_rate,
                           SeamlessGuestMaxHpRate);
             }
             continue;
         }
+
         if (std::bit_cast<u32>(current_rate) == std::bit_cast<u32>(VanillaGuestMaxHpRate)) {
             seamless_guest_health_patched_rows[index] = row;
             LOG_INFO(Debug,
                      "[BLOODBORNE SEAMLESS HEALTH] profile={} role={} summon_type={} "
-                     "seamless=true base_max_hp=unavailable "
-                     "vanilla_scaled_max_hp=unavailable "
-                     "requested_max_hp=unavailable final_max_hp=unavailable "
-                     "vanilla_max_hp_rate={} requested_max_hp_rate={} final_max_hp_rate={} "
-                     "sp_effect_id={} row={:#x} max_hp_rate_offset={:#x} "
-                     "original_max_hp_rate={} new_max_hp_rate={} state_info={} "
-                     "source=SpEffectParam health_field_write=maxHpRate_only "
-                     "policy_scope=seamless_only traditional_mode=untouched "
-                     "current_hp_write=false ratio_preservation=game_owned result=applied",
+                     "seamless=true sp_effect_id={} node={:#x} row={:#x} "
+                     "max_hp_rate_offset={:#x} original_max_hp_rate={} new_max_hp_rate={} "
+                     "state_info={} source=ActiveSpEffectNodeParam "
+                     "health_field_write=maxHpRate_only current_hp_write=false "
+                     "ratio_preservation=game_owned result=applied",
                      initial_seamless_profile->name, effect.roleName,
-                     effect.role == SeamlessPeerRole::Invader ? 2 : 0, VanillaGuestMaxHpRate,
-                     policy->maxHpRate, ReadValue<float>(row, MaxHpRateOffset),
-                     policy->activeEffectId, row, MaxHpRateOffset, current_rate,
-                     ReadValue<float>(row, MaxHpRateOffset), policy->stateInfo);
+                     effect.role == SeamlessPeerRole::Invader ? 2 : 0, policy->activeEffectId,
+                     active->node, row, MaxHpRateOffset, current_rate,
+                     ReadValue<float>(row, MaxHpRateOffset), state_info);
         }
 
+        // Keep the existing cooperator appearance normalization, but it no longer gates
+        // health restoration. HP is validated by active effect id + stateInfo + maxHpRate.
         if (policy->normalizeAppearance && uses_sp_effect_visual) {
             const u8 normalized_effect_flags = effect_flags & ~UseSpEffectEffectMask;
             if (!WriteValue(row, UseSpEffectEffectOffset, normalized_effect_flags) ||
