@@ -843,6 +843,9 @@ bool ApplyBloodborneSeamlessRoute(SendRequestPlan& plan) {
     }
     RewriteHostHeader(plan);
     plan.headers.emplace_back("X-ShadPS4-Bloodborne-Seamless", "1");
+    if (IsBloodborneSummonSearchPath(plan.path)) {
+        Core::Bloodborne::NotifySeamlessSummonSearchObserved();
+    }
     if (IsBloodborneSummonRequestPath(plan.path) || IsBloodborneSummonSearchPath(plan.path)) {
         if (const auto placement = Core::Bloodborne::GetSeamlessHostPlacementHeader()) {
             plan.headers.emplace_back(BloodborneHostPlacementHeader, *placement);
