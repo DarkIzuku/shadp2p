@@ -286,7 +286,7 @@ struct HunterDreamInteractionTraceSite {
 // documentation until runtime evidence establishes stronger semantics.
 constexpr std::array HunterDreamInteractionTraceSites{
     HunterDreamInteractionTraceSite{"Event.Instruction.Dispatch",
-                                    0x017B90B0,
+                                    0x017B93A0,
                                     HunterDreamInteractionHook::EventInstruction,
                                     {0x55, 0x48, 0x89, 0xE5, 0x53, 0x50},
                                     6},
