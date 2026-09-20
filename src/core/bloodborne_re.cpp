@@ -2479,7 +2479,10 @@ void ApplySeamlessGuestParamPolicy() {
                      FormatEbootSignatureMatches(nearby_matches));
             if (nearby_matches.size() == 1) {
                 runtime_sp_effect_param_lookup_offset = nearby_matches.front();
-            } else if (nearby_matches.empty()) {
+            } else {
+                // If the near-legacy window is empty or ambiguous, scan the full bounded
+                // executable range as a diagnostic. We still fail closed unless exactly
+                // one candidate exists; no legacy address is guessed into the D65 profile.
                 const auto full_matches =
                     FindEbootSignatureMatches(expected, 0x01E00000, 0x02100000);
                 LOG_INFO(Debug,
@@ -2487,8 +2490,29 @@ void ApplySeamlessGuestParamPolicy() {
                          "begin=0x01e00000 end=0x02100000 matches={} candidates={}",
                          initial_seamless_profile->name, full_matches.size(),
                          FormatEbootSignatureMatches(full_matches));
-                if (full_matches.size() == 1)
+                if (full_matches.size() == 1) {
                     runtime_sp_effect_param_lookup_offset = full_matches.front();
+                } else {
+                    const size_t logged_count = std::min<size_t>(full_matches.size(), 12);
+                    for (size_t index = 0; index < logged_count; ++index) {
+                        const u64 candidate = full_matches[index];
+                        const u64 before = candidate >= 16 ? candidate - 16 : 0;
+                        LOG_INFO(Debug,
+                                 "[BLOODBORNE SEAMLESS HEALTH LOCATOR] profile={} "
+                                 "candidate_index={} candidate={:#x} bytes_before={} "
+                                 "bytes_at={} bytes_after={}",
+                                 initial_seamless_profile->name, index, candidate,
+                                 ReadDiagnosticBytes(image_base,
+                                                     MemoryPatcher::g_eboot_image_size, before,
+                                                     static_cast<size_t>(candidate - before)),
+                                 ReadDiagnosticBytes(image_base,
+                                                     MemoryPatcher::g_eboot_image_size, candidate,
+                                                     32),
+                                 ReadDiagnosticBytes(image_base,
+                                                     MemoryPatcher::g_eboot_image_size,
+                                                     candidate + 32, 32));
+                    }
+                }
             }
         }
         if (runtime_sp_effect_param_lookup_offset == 0 ||
@@ -4293,18 +4317,20 @@ u64 ReadInteractionCallerOffset(const GuestRegisterSnapshot& registers,
 
 bool ShouldApplyHunterDreamLocalWorldOverride(
     const HunterDreamInteractionRuntimeContext& context) {
-    if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP") || !context.matching.inRoom)
+    if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP") || !context.matching.inRoom ||
+        !context.inHuntersDream) {
         return false;
+    }
 
-    // Priority 1: preserve host interaction/travel while a guest is connected.
+    // Keep this override strictly scoped to Hunter's Dream. The host gets local-world
+    // interaction semantics only here while a guest is connected; outside the Dream
+    // all vanilla multiplayer restrictions remain untouched.
     if (context.snapshot.role == HunterDreamInteractionRole::Host)
         return true;
 
-    // Experimental local-world role: in the Dream only, let a cooperator pass
-    // local action/presentation gates without changing Matching2, CSMultiPlayMan,
-    // SummonType, faction, or network ownership.
-    return context.inHuntersDream &&
-           context.snapshot.role == HunterDreamInteractionRole::Cooperator;
+    // Experimental local-world role for the cooperator in the Dream only. Matching2,
+    // CSMultiPlayMan, SummonType, faction and network ownership remain unchanged.
+    return context.snapshot.role == HunterDreamInteractionRole::Cooperator;
 }
 
 void ApplyHunterDreamLocalWorldOverride(const HunterDreamInteractionTraceSite& site,
