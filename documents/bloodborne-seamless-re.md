@@ -2145,6 +2145,15 @@ the game's native recalculation own current-HP ratio preservation and logs
 `current_hp_write=false ratio_preservation=game_owned`; runtime comparison is
 still required to confirm the displayed HP behavior.
 
+Runtime diagnostics report the observed and expected eboot SHA-256, each of the
+five profile-selection signatures, the selected profile, and the installed and
+rejected interaction-observer totals. The health diagnostic identifies the
+active SpEffect id, resolved row address, `maxHpRate` offset, original `0.7`
+value, and new `1.0` value. It also records
+`health_field_write=maxHpRate_only`, `policy_scope=seamless_only`, and
+`traditional_mode=untouched`; these are enforced by the existing Seamless
+environment guard rather than by weakening any byte or row validation.
+
 The guest's gameplay phantom/specter state remains instrumentation-only in this
 build. Interaction and NPC records now include the local presence of effects
 `9001`, `9005`, `9006`, `9025`, and `9026`, while unknown NPC ownership,

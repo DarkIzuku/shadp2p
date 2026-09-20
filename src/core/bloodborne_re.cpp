@@ -1545,6 +1545,7 @@ bool seamless_guest_health_signature_checked{};
 bool seamless_guest_health_lookup_ready{};
 std::array<u64, 2> seamless_guest_health_patched_rows{};
 std::array<bool, 2> seamless_guest_health_error_logged{};
+std::array<bool, 2> seamless_guest_health_row_logged{};
 thread_local u64 responder_availability_frame{};
 thread_local s32 responder_availability_goods{-1};
 std::mutex hunter_dream_interaction_trace_mutex;
@@ -2480,32 +2481,54 @@ void ApplySeamlessGuestParamPolicy() {
                           effect.roleName, policy->activeEffectId, current_rate);
             }
             continue;
-        } else if (!WriteValue(row, MaxHpRateOffset, SeamlessGuestMaxHpRate) ||
-                   std::bit_cast<u32>(ReadValue<float>(row, MaxHpRateOffset)) !=
-                       std::bit_cast<u32>(SeamlessGuestMaxHpRate)) {
+        } else {
+            if (!seamless_guest_health_row_logged[index]) {
+                seamless_guest_health_row_logged[index] = true;
+                LOG_INFO(Debug,
+                         "[BLOODBORNE SEAMLESS HEALTH] state=VanillaPenaltyRowValidated "
+                         "profile={} role={} summon_type={} sp_effect_id={} row={:#x} "
+                         "max_hp_rate_offset={:#x} original_max_hp_rate={} "
+                         "expected_vanilla_max_hp_rate={} policy_scope=seamless_only "
+                         "traditional_mode=untouched health_field_write=maxHpRate_only",
+                         initial_seamless_profile->name, effect.roleName,
+                         effect.role == SeamlessPeerRole::Invader ? 2 : 0,
+                         policy->activeEffectId, row, MaxHpRateOffset, current_rate,
+                         VanillaGuestMaxHpRate);
+            }
+        }
+        if (std::bit_cast<u32>(current_rate) == std::bit_cast<u32>(VanillaGuestMaxHpRate) &&
+            (!WriteValue(row, MaxHpRateOffset, SeamlessGuestMaxHpRate) ||
+             std::bit_cast<u32>(ReadValue<float>(row, MaxHpRateOffset)) !=
+                 std::bit_cast<u32>(SeamlessGuestMaxHpRate))) {
             if (!seamless_guest_health_error_logged[index]) {
                 seamless_guest_health_error_logged[index] = true;
                 LOG_ERROR(Debug,
                           "[BLOODBORNE SEAMLESS HEALTH] role={} effect={} result=disabled "
-                          "reason=param_write_rejected",
-                          effect.roleName, policy->activeEffectId);
+                          "reason=param_write_rejected row={:#x} "
+                          "original_max_hp_rate={} requested_max_hp_rate={}",
+                          effect.roleName, policy->activeEffectId, row, current_rate,
+                          SeamlessGuestMaxHpRate);
             }
             continue;
-        } else {
+        }
+        if (std::bit_cast<u32>(current_rate) == std::bit_cast<u32>(VanillaGuestMaxHpRate)) {
             seamless_guest_health_patched_rows[index] = row;
             LOG_INFO(Debug,
                      "[BLOODBORNE SEAMLESS HEALTH] profile={} role={} summon_type={} "
                      "seamless=true base_max_hp=unavailable "
                      "vanilla_scaled_max_hp=unavailable "
                      "requested_max_hp=unavailable final_max_hp=unavailable "
-                     "vanilla_max_hp_rate={} requested_max_hp_rate={} "
-                     "final_max_hp_rate={} "
-                     "effect={} state_info={} source=SpEffectParam "
+                     "vanilla_max_hp_rate={} requested_max_hp_rate={} final_max_hp_rate={} "
+                     "sp_effect_id={} row={:#x} max_hp_rate_offset={:#x} "
+                     "original_max_hp_rate={} new_max_hp_rate={} state_info={} "
+                     "source=SpEffectParam health_field_write=maxHpRate_only "
+                     "policy_scope=seamless_only traditional_mode=untouched "
                      "current_hp_write=false ratio_preservation=game_owned result=applied",
                      initial_seamless_profile->name, effect.roleName,
                      effect.role == SeamlessPeerRole::Invader ? 2 : 0, VanillaGuestMaxHpRate,
                      policy->maxHpRate, ReadValue<float>(row, MaxHpRateOffset),
-                     policy->activeEffectId, policy->stateInfo);
+                     policy->activeEffectId, row, MaxHpRateOffset, current_rate,
+                     ReadValue<float>(row, MaxHpRateOffset), policy->stateInfo);
         }
 
         if (policy->normalizeAppearance && uses_sp_effect_visual) {
@@ -8241,14 +8264,23 @@ bool InstallEstablishedTravelHooks(const EstablishedTravelProfile& profile) {
 
 void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
                                         std::string_view eboot_sha256) {
-    if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_INTERACT_TRACE"))
+    if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_INTERACT_TRACE")) {
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS INTERACT STATE] enabled=false profile={} "
+                 "actual_sha256={} expected_sha256={} reason=env_disabled "
+                 "hooks_installed=0 hooks_rejected=0 hooks_total={}",
+                 profile.name, eboot_sha256, HunterDreamInteractionEbootSha256,
+                 HunterDreamInteractionTraceSites.size());
         return;
+    }
     if (profile.name != "cusa03173-109-user-eboot-6764938b") {
         LOG_ERROR(Debug,
                   "[BLOODBORNE SEAMLESS INTERACT STATE] enabled=false profile={} "
                   "reason=exact_user_eboot_profile_required actual_sha256={} "
-                  "expected_sha256={}",
-                  profile.name, eboot_sha256, HunterDreamInteractionEbootSha256);
+                  "expected_sha256={} hooks_installed=0 hooks_rejected={} hooks_total={}",
+                  profile.name, eboot_sha256, HunterDreamInteractionEbootSha256,
+                  HunterDreamInteractionTraceSites.size(),
+                  HunterDreamInteractionTraceSites.size());
         return;
     }
 
@@ -8263,6 +8295,7 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
     }
 
     size_t installed_count = 0;
+    size_t rejected_count = 0;
     for (size_t index = 0; index < HunterDreamInteractionTraceSites.size(); ++index) {
         const auto& site = HunterDreamInteractionTraceSites[index];
         if (site.hook == HunterDreamInteractionHook::AvailabilityGate &&
@@ -8300,6 +8333,7 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
         if (!ShouldInstallBloodborneVerifiedHook(
                 profile.name == "cusa03173-109-user-eboot-6764938b",
                 MatchesEstablishedTravelBytes(site.offset, expected))) {
+            ++rejected_count;
             LOG_ERROR(Debug,
                       "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} eboot_offset={:#x} "
                       "expected_bytes={} observed_bytes={} "
@@ -8309,6 +8343,7 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
         }
         if (!InstallGuestCodeHook(reinterpret_cast<void*>(image_base + site.offset), expected,
                                   index, HunterDreamInteractionTraceEntry)) {
+            ++rejected_count;
             LOG_ERROR(Debug,
                       "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} eboot_offset={:#x} "
                       "expected_bytes={} observed_bytes={} result=observer_install_failed",
@@ -8324,9 +8359,10 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
     }
     LOG_INFO(Debug,
              "[BLOODBORNE SEAMLESS INTERACT STATE] enabled=true verbose={} profile={} "
-             "actual_sha256={} expected_sha256={} hooks={}/{} behavior_changes=false",
+             "actual_sha256={} expected_sha256={} hooks_installed={} hooks_rejected={} "
+             "hooks_total={} behavior_changes=false",
              hunter_dream_interaction_trace_verbose, profile.name, eboot_sha256,
-             HunterDreamInteractionEbootSha256, installed_count,
+             HunterDreamInteractionEbootSha256, installed_count, rejected_count,
              HunterDreamInteractionTraceSites.size());
 }
 
