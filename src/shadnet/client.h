@@ -95,6 +95,7 @@ enum class CommandType : u16 {
     GetUserInfoList = 113,
     GetRoomMemberDataExternalList = 114,
     SendRoomMessage = 115,
+    SeamlessControl = 116,
 };
 
 enum class NotificationType : u16 {
@@ -105,6 +106,7 @@ enum class NotificationType : u16 {
     RoomEvent = 10,
     RoomMessage = 11,
     WebApiPushEvent = 17, // Generic NP WebApi push event
+    SeamlessControl = 18,
 };
 
 enum class ErrorType : uint8_t {
@@ -250,6 +252,33 @@ struct NotifyRoomMessage {
     std::vector<u8> msg;
 };
 
+struct SeamlessTravelEvent {
+    u32 protocolVersion = 1;
+    u32 phase = 0;
+    std::string partyId;
+    u64 generation = 0;
+    u64 sequenceId = 0;
+    u64 leaderUserId = 0;
+    std::string leaderNpid;
+    u64 activeRoomId = 0;
+    u32 sourceMap = 0;
+    u32 destinationMap = 0;
+    s32 warpParamId = -1;
+    u32 mode = 0;
+    float positionX = 0.0F;
+    float positionY = 0.0F;
+    float positionZ = 0.0F;
+    float orientation = 0.0F;
+    s64 timestampMs = 0;
+    std::string failureReason;
+};
+
+struct NotifySeamlessControl {
+    SeamlessTravelEvent event;
+    u64 sourceUserId = 0;
+    std::string sourceNpid;
+};
+
 // ShadNetClient
 
 class ShadNetClient {
@@ -278,6 +307,7 @@ public:
     u32 GetAddrLocal() const;
     u32 GetAddrServer() const;
     bool IsMatching2Enabled() const;
+    bool IsBloodborneSeamlessControlEnabled() const;
     u32 GetNumFriends() const;
     std::optional<std::string> GetFriendNpid(u32 index) const;
 
@@ -291,6 +321,7 @@ public:
     std::function<void(const NotifyFriendStatus&)> onFriendStatus;
     std::function<void(const NotifyRoomEvent&)> onRoomEvent;
     std::function<void(const NotifyRoomMessage&)> onRoomMessage;
+    std::function<void(const NotifySeamlessControl&)> onSeamlessControl;
     std::function<void(const NotifyWebApiPushEvent&)> onWebApiPushEvent;
     // Async reply callback.
     //   cmd    —command this reply is for (matches the request's cmd)
@@ -374,6 +405,7 @@ private:
     std::atomic<u32> m_addr_server{0};
     std::atomic<u32> m_server_protocol_version{0};
     std::atomic<bool> m_matching2_enabled{false};
+    std::atomic<bool> m_bloodborne_seamless_control_enabled{false};
     std::atomic<bool> m_server_features_received{false};
 
     mutable std::mutex m_mutex_friends;

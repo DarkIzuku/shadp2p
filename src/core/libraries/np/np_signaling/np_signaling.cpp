@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "common/logging/log.h"
 #include "common/singleton.h"
+#include "core/bloodborne_re.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/network/net.h"
@@ -432,6 +434,8 @@ s32 PS4_SYSV_ABI sceNpSignalingActivateConnectionA(
 
 s32 PS4_SYSV_ABI sceNpSignalingDeactivateConnection(OrbisNpSignalingContextId ctxId,
                                                     OrbisNpSignalingConnectionId connId) {
+    std::string peer_online_id;
+    s32 connection_status = ORBIS_NP_SIGNALING_CONN_STATUS_INACTIVE;
     {
         SignalingMutexGuard lock;
         if (!g_initialized) {
@@ -446,8 +450,20 @@ s32 PS4_SYSV_ABI sceNpSignalingDeactivateConnection(OrbisNpSignalingContextId ct
             return ORBIS_NP_SIGNALING_ERROR_CONN_NOT_FOUND;
         }
 
+        peer_online_id = OnlineIdToString(it->second.online_id);
+        connection_status = it->second.status;
         LOG_INFO(Lib_NpSignaling, "t={} ctxId={} connId={} peer='{}' status={}", NowMs(), ctxId,
-                 connId, OnlineIdToString(it->second.online_id), it->second.status);
+                 connId, peer_online_id, connection_status);
+    }
+#if defined(__GNUC__) || defined(__clang__)
+    const auto return_address = reinterpret_cast<std::uintptr_t>(
+        __builtin_extract_return_addr(__builtin_return_address(0)));
+#else
+    constexpr std::uintptr_t return_address = 0;
+#endif
+    if (Core::Bloodborne::TraceAndGuardSeamlessSignalingDeactivate(
+            return_address, ctxId, connId, peer_online_id, connection_status)) {
+        return ORBIS_OK;
     }
     DeactivateConnectionFaithful(connId);
     return ORBIS_OK;

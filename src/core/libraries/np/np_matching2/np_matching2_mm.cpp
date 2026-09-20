@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/logging/log.h"
+#include "core/bloodborne_re.h"
 #include "core/libraries/network/net.h"
 #include "core/libraries/network/net_upnp.h"
 #include "core/libraries/network/sockets.h"
@@ -32,6 +33,7 @@ struct PendingRequest {
     OrbisNpMatching2RequestId req_id = 0;
     OrbisNpMatching2Event req_event{};
     bool a_variant = false;
+    u64 seamless_generation = 0;
     OrbisNpMatching2RequestCallback request_cb = nullptr;
     void* request_cb_arg = nullptr;
 };
@@ -49,6 +51,11 @@ struct MmClientState {
     std::mutex sig_mutex;
     std::condition_variable sig_cv;
     std::map<u64, std::pair<ShadNet::ErrorType, std::vector<u8>>> sig_replies;
+
+    std::mutex seamless_mutex;
+    std::map<u64, Core::Bloodborne::SeamlessTravelPhase> seamless_replies;
+    SeamlessNotificationHandler seamless_notification_handler;
+    SeamlessReplyHandler seamless_reply_handler;
 };
 
 MmClientState g_mm;
@@ -152,6 +159,31 @@ std::string ExtractProtoBytes(const std::vector<u8>& payload, size_t offset = 0)
     return std::string(reinterpret_cast<const char*>(payload.data() + offset + 4), len);
 }
 
+void NotifySeamlessRoomJoinedFromDetails(ContextObject& ctx,
+                                         const shadnet::CreateJoinRoomResponse& details,
+                                         u64 generation) {
+    const auto room_id = static_cast<OrbisNpMatching2RoomId>(details.room_data().room_id());
+    const auto local_member = static_cast<OrbisNpMatching2RoomMemberId>(details.me_member_id());
+    OrbisNpMatching2RoomMemberId peer_member = 0;
+    std::string peer_npid;
+    for (const auto& member : details.members()) {
+        if (member.member_id() == details.me_member_id())
+            continue;
+        if (member.member_id() == details.owner_member_id() || peer_member == 0) {
+            peer_member = static_cast<OrbisNpMatching2RoomMemberId>(member.member_id());
+            peer_npid = member.npid();
+        }
+        if (member.member_id() == details.owner_member_id())
+            break;
+    }
+    // A non-seamless room must clear any generation left by an earlier room on
+    // the same NP context; otherwise later signaling could be misclassified as
+    // belonging to the completed summon.
+    ctx.seamless_generation = generation;
+    Core::Bloodborne::NotifySeamlessSummonRoomJoinedForPeer(room_id, local_member, peer_member,
+                                                            peer_npid, generation);
+}
+
 void DispatchRequestComplete(const PendingRequest& pr, ShadNet::ErrorType error,
                              const std::vector<u8>& body) {
     ContextObject* ctx = ContextManager::Instance().Get(pr.ctx_id);
@@ -187,6 +219,7 @@ void DispatchRequestComplete(const PendingRequest& pr, ShadNet::ErrorType error,
             if (reply.ParseFromString(proto) && reply.has_details()) {
                 request_data = pr.a_variant ? BuildCreateJoinRoomPayloadA(*ctx, reply.details())
                                             : BuildCreateJoinRoomPayload(*ctx, reply.details());
+                NotifySeamlessRoomJoinedFromDetails(*ctx, reply.details(), pr.seamless_generation);
             }
         } else if (pr.req_event == ORBIS_NP_MATCHING2_REQUEST_EVENT_JOIN_ROOM ||
                    pr.req_event == ORBIS_NP_MATCHING2_REQUEST_EVENT_JOIN_ROOM_A) {
@@ -194,6 +227,7 @@ void DispatchRequestComplete(const PendingRequest& pr, ShadNet::ErrorType error,
             if (reply.ParseFromString(proto) && reply.has_details()) {
                 request_data = pr.a_variant ? BuildCreateJoinRoomPayloadA(*ctx, reply.details())
                                             : BuildCreateJoinRoomPayload(*ctx, reply.details());
+                NotifySeamlessRoomJoinedFromDetails(*ctx, reply.details(), pr.seamless_generation);
             }
         } else if (pr.req_event == ORBIS_NP_MATCHING2_REQUEST_EVENT_LEAVE_ROOM) {
             shadnet::LeaveRoomReply reply;
@@ -385,6 +419,10 @@ void HandleRoomEvent(const ShadNet::NotifyRoomEvent& n) {
         pi.port = mc.port;
         SetNpOnlineId(pi.online_id, n.member_npid);
         ctx->peers[member_id] = pi;
+        if (member_id != ctx->my_member_id) {
+            Core::Bloodborne::NotifySeamlessSummonRoomJoinedForPeer(
+                room_id, ctx->my_member_id, member_id, n.member_npid, ctx->seamless_generation);
+        }
 
         BuildMemberUpdate(p, room_it->second, mc, cause, ctx->a_variant);
         break;
@@ -628,6 +666,46 @@ void HandleRoomMessage(const ShadNet::NotifyRoomMessage& n) {
 
 void OnMatchingReply(ShadNet::CommandType cmd, u64 pkt_id, ShadNet::ErrorType error,
                      const std::vector<u8>& body) {
+    if (cmd == ShadNet::CommandType::SeamlessControl) {
+        Core::Bloodborne::SeamlessTravelPhase requested_phase{};
+        SeamlessReplyHandler handler;
+        {
+            std::lock_guard lock(g_mm.seamless_mutex);
+            const auto pending = g_mm.seamless_replies.find(pkt_id);
+            if (pending == g_mm.seamless_replies.end()) {
+                LOG_WARNING(Lib_NpMatching2, "seamless reply pkt_id={} has no pending request",
+                            pkt_id);
+                return;
+            }
+            requested_phase = pending->second;
+            g_mm.seamless_replies.erase(pending);
+            handler = g_mm.seamless_reply_handler;
+        }
+        bool accepted = false;
+        std::string reason = "transport_error";
+        std::string party_id;
+        u64 generation = 0;
+        u64 sequence_id = 0;
+        auto state = Core::Bloodborne::SeamlessTravelState::Disconnected;
+        if (error == ShadNet::ErrorType::NoError) {
+            shadnet::SeamlessControlReply reply;
+            const std::string proto = ExtractProtoBytes(body);
+            if (!proto.empty() && reply.ParseFromString(proto)) {
+                accepted = reply.accepted();
+                reason = reply.reason();
+                party_id = reply.party_id();
+                generation = reply.generation();
+                sequence_id = reply.travel_sequence_id();
+                state = static_cast<Core::Bloodborne::SeamlessTravelState>(reply.state());
+            } else {
+                reason = "malformed_reply";
+            }
+        }
+        if (handler) {
+            handler(requested_phase, accepted, reason, party_id, generation, sequence_id, state);
+        }
+        return;
+    }
     if (cmd == ShadNet::CommandType::RequestSignalingInfos) {
         std::lock_guard lock(g_mm.sig_mutex);
         g_mm.sig_replies[pkt_id] = {error, body};
@@ -703,6 +781,15 @@ void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
     }
     client->onRoomEvent = [](const ShadNet::NotifyRoomEvent& n) { HandleRoomEvent(n); };
     client->onRoomMessage = [](const ShadNet::NotifyRoomMessage& n) { HandleRoomMessage(n); };
+    client->onSeamlessControl = [](const ShadNet::NotifySeamlessControl& n) {
+        SeamlessNotificationHandler handler;
+        {
+            std::lock_guard lock(g_mm.seamless_mutex);
+            handler = g_mm.seamless_notification_handler;
+        }
+        if (handler)
+            handler(n);
+    };
 }
 
 void ClearMmShadNetClient() {
@@ -718,6 +805,7 @@ void ClearMmShadNetClient() {
     if (old_client) {
         old_client->onRoomEvent = nullptr;
         old_client->onRoomMessage = nullptr;
+        old_client->onSeamlessControl = nullptr;
     }
     NpSignaling::Stubs::SetTransportHooks({});
     NpSignaling::Stubs::SetPeerResolver(nullptr);
@@ -728,12 +816,92 @@ void ClearMmShadNetClient() {
         std::lock_guard lock(g_mm.pending_mutex);
         g_mm.pending.clear();
     }
+    {
+        std::lock_guard lock(g_mm.seamless_mutex);
+        g_mm.seamless_replies.clear();
+    }
     g_mm.sig_cv.notify_all();
 }
 
 bool IsMmClientRunning() {
     std::lock_guard lock(g_mm.mutex);
     return g_mm.client && g_mm.client->IsAuthenticated();
+}
+
+void SetSeamlessControlHandlers(SeamlessNotificationHandler notification_handler,
+                                SeamlessReplyHandler reply_handler) {
+    std::lock_guard lock(g_mm.seamless_mutex);
+    g_mm.seamless_notification_handler = std::move(notification_handler);
+    g_mm.seamless_reply_handler = std::move(reply_handler);
+}
+
+Core::Bloodborne::SeamlessMatchingSnapshot GetSeamlessMatchingSnapshot() {
+    Core::Bloodborne::SeamlessMatchingSnapshot snapshot;
+    std::shared_ptr<ShadNet::ShadNetClient> client;
+    {
+        std::lock_guard lock(g_mm.mutex);
+        client = g_mm.client;
+    }
+    if (client) {
+        snapshot.controlConnected = client->IsAuthenticated();
+        snapshot.serverSupportsControl = client->IsBloodborneSeamlessControlEnabled();
+        snapshot.localUserId = client->GetUserId();
+    }
+    snapshot.explicitDisconnect = !snapshot.controlConnected;
+    for (u32 id = 1; id <= ContextManager::kMaxContexts; ++id) {
+        ContextObject* ctx =
+            ContextManager::Instance().Get(static_cast<OrbisNpMatching2ContextId>(id));
+        if (!ctx || !ctx->started || ctx->room_id == 0)
+            continue;
+        snapshot.inRoom = true;
+        snapshot.roomOwner = ctx->is_room_owner;
+        snapshot.roomId = ctx->room_id;
+        break;
+    }
+    return snapshot;
+}
+
+bool MmSendSeamlessControl(const Core::Bloodborne::SeamlessTravelEvent& event) {
+    std::shared_ptr<ShadNet::ShadNetClient> client;
+    {
+        std::lock_guard lock(g_mm.mutex);
+        client = g_mm.client;
+    }
+    if (!client || !client->IsAuthenticated() || !client->IsBloodborneSeamlessControlEnabled()) {
+        return false;
+    }
+
+    shadnet::SeamlessControlRequest request;
+    auto* output = request.mutable_event();
+    output->set_protocol_version(event.protocolVersion);
+    output->set_phase(static_cast<u32>(event.phase));
+    output->set_party_id(event.partyId);
+    output->set_generation(event.generation);
+    output->set_travel_sequence_id(event.sequenceId);
+    output->set_leader_user_id(event.leaderUserId);
+    output->set_leader_npid(event.leaderNpid);
+    output->set_active_room_id(event.activeRoomId);
+    output->set_source_map(event.sourceMap);
+    output->set_destination_map(event.destinationMap);
+    output->set_warp_param_id(event.warpParamId);
+    output->set_mode(event.mode);
+    output->set_position_x(event.positionX);
+    output->set_position_y(event.positionY);
+    output->set_position_z(event.positionZ);
+    output->set_orientation(event.orientation);
+    output->set_timestamp_ms(event.timestampMs);
+    output->set_failure_reason(event.failureReason);
+
+    {
+        // Hold this lock across enqueue + correlation. A very fast server reply then blocks in
+        // OnMatchingReply until its pending phase is visible instead of being misclassified as
+        // an unsolicited reply.
+        std::lock_guard lock(g_mm.seamless_mutex);
+        const u64 pkt_id =
+            client->SubmitRequest(ShadNet::CommandType::SeamlessControl, MakeProtoPayload(request));
+        g_mm.seamless_replies[pkt_id] = event.phase;
+    }
+    return true;
 }
 
 void MmContextStart(OrbisNpMatching2ContextId ctx_id) {
@@ -755,7 +923,7 @@ s32 MmContextStop(OrbisNpMatching2ContextId ctx_id) {
 
 s32 MmSubmitRequest(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
                     OrbisNpMatching2Event req_event, MmCommand cmd, const std::vector<u8>& payload,
-                    bool a_variant) {
+                    bool a_variant, u64 seamless_generation) {
     std::shared_ptr<ShadNet::ShadNetClient> client;
     {
         std::lock_guard lock(g_mm.mutex);
@@ -824,8 +992,9 @@ s32 MmSubmitRequest(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId 
     const u64 pkt_id = client->SubmitRequest(static_cast<ShadNet::CommandType>(cmd), payload);
     {
         std::lock_guard lock(g_mm.pending_mutex);
-        g_mm.pending[pkt_id] = {ctx_id,        req_id, req_event, a_variant, request_cb.callback,
-                                request_cb.arg};
+        g_mm.pending[pkt_id] = {
+            ctx_id,        req_id, req_event, a_variant, seamless_generation, request_cb.callback,
+            request_cb.arg};
     }
     LOG_DEBUG(Lib_NpMatching2, "submit cmd={} pkt_id={} ctx={} reqId={}", static_cast<u16>(cmd),
               pkt_id, ctx_id, req_id);
@@ -880,8 +1049,10 @@ s32 MmCreateJoinRoom(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId
         req.set_sig_flag(request.signalingParam->flag);
         req.set_sig_main_member(request.signalingParam->memberId);
     }
+    const u64 seamless_generation = Core::Bloodborne::NotifySeamlessSummonRoomJoinStarted(0);
     return MmSubmitRequest(ctx_id, req_id, ORBIS_NP_MATCHING2_REQUEST_EVENT_CREATE_JOIN_ROOM,
-                           MmCommand::CreateRoom, MakeProtoPayload(req));
+                           MmCommand::CreateRoom, MakeProtoPayload(req), false,
+                           seamless_generation);
 }
 
 s32 MmCreateJoinRoomA(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
@@ -932,8 +1103,9 @@ s32 MmCreateJoinRoomA(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestI
         req.set_sig_flag(request.signalingParam->flag);
         req.set_sig_main_member(request.signalingParam->memberId);
     }
+    const u64 seamless_generation = Core::Bloodborne::NotifySeamlessSummonRoomJoinStarted(0);
     return MmSubmitRequest(ctx_id, req_id, ORBIS_NP_MATCHING2_REQUEST_EVENT_CREATE_JOIN_ROOM_A,
-                           MmCommand::CreateRoom, MakeProtoPayload(req), true);
+                           MmCommand::CreateRoom, MakeProtoPayload(req), true, seamless_generation);
 }
 
 s32 MmJoinRoom(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
@@ -955,8 +1127,10 @@ s32 MmJoinRoom(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_i
     }
     req.set_room_password_present(request.roomPasswd != nullptr);
     req.set_join_group_label_present(request.joinGroupLabel != nullptr);
+    const u64 seamless_generation =
+        Core::Bloodborne::NotifySeamlessSummonRoomJoinStarted(request.roomId);
     return MmSubmitRequest(ctx_id, req_id, ORBIS_NP_MATCHING2_REQUEST_EVENT_JOIN_ROOM,
-                           MmCommand::JoinRoom, MakeProtoPayload(req));
+                           MmCommand::JoinRoom, MakeProtoPayload(req), false, seamless_generation);
 }
 
 s32 MmJoinRoomA(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
@@ -978,8 +1152,10 @@ s32 MmJoinRoomA(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_
     }
     req.set_room_password_present(request.roomPasswd != nullptr);
     req.set_join_group_label_present(request.joinGroupLabel != nullptr);
+    const u64 seamless_generation =
+        Core::Bloodborne::NotifySeamlessSummonRoomJoinStarted(request.roomId);
     return MmSubmitRequest(ctx_id, req_id, ORBIS_NP_MATCHING2_REQUEST_EVENT_JOIN_ROOM_A,
-                           MmCommand::JoinRoom, MakeProtoPayload(req), true);
+                           MmCommand::JoinRoom, MakeProtoPayload(req), true, seamless_generation);
 }
 
 s32 MmLeaveRoom(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,

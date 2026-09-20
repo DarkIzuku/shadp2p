@@ -15,6 +15,7 @@ set(TEST_TARGETS
     shadps4_gcn_test
     shadps4_p2p_test
     shadps4_readback_optimizer_test
+    shadps4_bloodborne_seamless_state_test
 )
 
 set(P2P_TEST_SOURCES
@@ -24,6 +25,11 @@ set(P2P_TEST_SOURCES
 
 set(READBACK_OPTIMIZER_TEST_SOURCES
     video_core/test_readback_optimizer.cpp
+)
+
+set(BLOODBORNE_SEAMLESS_STATE_TEST_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/core/bloodborne_seamless_state.cpp
+    core/test_bloodborne_seamless_state.cpp
 )
 
 set(SETTINGS_TEST_SOURCES
@@ -174,6 +180,7 @@ add_executable(shadps4_ngs2_test ${NGS2_TEST_SOURCES})
 add_executable(shadps4_gcn_test ${GCN_TEST_SOURCES})
 add_executable(shadps4_p2p_test ${P2P_TEST_SOURCES})
 add_executable(shadps4_readback_optimizer_test ${READBACK_OPTIMIZER_TEST_SOURCES})
+add_executable(shadps4_bloodborne_seamless_state_test ${BLOODBORNE_SEAMLESS_STATE_TEST_SOURCES})
 
 foreach(t ${TEST_TARGETS})
     target_include_directories(${t} PRIVATE
@@ -218,6 +225,9 @@ target_link_libraries(shadps4_p2p_test PRIVATE
     fmt::fmt
 )
 target_link_libraries(shadps4_readback_optimizer_test PRIVATE
+    GTest::gtest_main
+)
+target_link_libraries(shadps4_bloodborne_seamless_state_test PRIVATE
     GTest::gtest_main
 )
 

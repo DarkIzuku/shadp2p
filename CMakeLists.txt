@@ -952,6 +952,8 @@ if (ARCHITECTURE STREQUAL "x86_64")
     set(CORE ${CORE}
              src/core/bloodborne_re.cpp
              src/core/bloodborne_re.h
+             src/core/bloodborne_seamless_state.cpp
+             src/core/bloodborne_seamless_state.h
              src/core/cpu_patches.cpp
              src/core/cpu_patches.h
              ${FIBER_LIB})

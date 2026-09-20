@@ -7,15 +7,19 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 ## Scope and executable identity
 
-The current analysis targets the European GOTY executable CUSA03173, app
-version 01.09. The analyzed `eboot.bin` SHA-256 is:
+The current implementation targets the European GOTY executable CUSA03173,
+app version 01.09. The executable observed in the failing two-client runtime
+and selected by the current exact profile has SHA-256:
 
 ```text
-d65f0b4f01d59166aed16f8604196d8b7dd805abbf0758b356e8f1354c9429f9
+D65F0B4F01D59166AED16F8604196D8B7DD805ABBF0758B356E8F1354C9429F9
 ```
 
 Runtime hooks are additionally protected by exact instruction signatures. A
 version label alone is not accepted as proof that an offset is compatible.
+The older `6764938B...` executable remains a separate legacy profile; its SHA
+never selects offsets from the D65 profile, and D65 never falls back to the
+legacy offsets.
 
 ## Responsibility boundary
 
@@ -55,10 +59,14 @@ shadPS4 adds a bounded version-1 `X-ShadPS4-Bloodborne-Host-Placement` header
 to the native `/summon_messenger/request`; shadNet stores it with the claim and
 returns it on the responder's native `/summon_messenger/create` response. The
 header contains a packed map, four IEEE-754 bit patterns, and signed SOS area;
-it does not alter the game's JSON schema. The guest validates and caches the
-header, then the post-copy game hook supplies it to the native placement
-setters. An independent create/request/create probe confirmed byte-for-byte
-header relay through shadNet.
+it does not alter the game's JSON schema. The same response carries the private
+`X-ShadPS4-Bloodborne-Claim-Accepted: 1` acknowledgement. The guest validates
+and caches the destination but does not move yet. Matching2 room creation/join
+and signaling advance an emulator-owned pending-summon state machine. Only the
+game-thread insertion hook may commit the cached descriptor to the native
+forced-placement and stage-transition path. An independent
+create/request/create probe confirmed byte-for-byte placement relay through
+shadNet.
 
 ## Confirmed native paths
 
@@ -1693,3 +1701,487 @@ Remaining general runtime locators retain their existing behavior, but console
 and JSONL diagnostics store at most the first five ambiguous candidates plus
 the total match count and selected candidate. Parser instrumentation produces
 no executable-wide candidate array.
+
+## Single-load initial summon iteration
+
+The earlier runtime build used a two-stage cross-map sequence: shadNet hid an
+eligible candidate in `Preparing`, the responder received the host placement,
+warped before matchmaking, rang the bell again in the destination, and then
+entered Bloodborne's normal summon reload. That ordering explains the observed
+double loading screen. It also made a valid candidate temporarily disappear
+after the broker had already accepted every matchmaking filter.
+
+The replacement sequence keeps the responder in the source world:
+
+```text
+CandidateFound -> CrossMapPlacementDeferred -> ClaimAccepted
+  -> RoomJoinStarted -> RoomJoined -> SignalingEstablished
+  -> CrossMapCommit -> ForcedPlacementApplied -> SingleReloadStarted
+  -> WorldReady -> RemoteInserted -> Complete
+```
+
+`PendingCrossMapSummonStateMachine` owns a monotonically increasing generation,
+the target packed map, role, accepted-claim state, selected Matching2 room,
+signaling state, one reload counter, and a bounded deadline. A signaling event
+must belong to the room produced by the same join. A stale room, target, or
+generation cannot commit a warp. Once the counter reaches one, another native
+handoff for the same generation returns `DuplicateReload` and logs
+`DuplicateReloadSuppressed`; it cannot issue another stage transition. A
+same-map handoff completes with zero artificial reloads.
+
+The first runtime attempt exposed two ordering holes in that design. Bloodborne
+could reach `CSMultiPlayerIns.CrossMapGuestHandoff` before signaling, and in the
+latest capture no native handoff was observed at all after claim, room join, and
+signaling completed. Requiring that optional observation therefore left a fully
+valid pending summon permanently waiting in the source map.
+
+The state machine now latches claim, room, and signaling facts even when they
+arrive before the placement record. `TryAdvancePendingCrossMapSummon` is driven
+from the existing periodic game-thread hook and reevaluates whenever any fact
+changes. A commit requires a current generation, finite target placement,
+accepted claim, the expected room, signaling for that room/peer, an unexpired
+deadline, and an unclaimed commit token. Native handoff remains useful trace
+evidence but is not an independent prerequisite. The commit token and reload
+counter make the path idempotent: a callback or hook repeated for the same
+generation cannot issue a second reload. Network callbacks still make no
+Bloodborne memory reads or native calls, and an expired generation fails with
+zero reloads.
+
+shadNet now returns every eligible cross-map advertisement immediately. The
+captured protocol is asymmetric: the Small/Sinister Resonant user publishes
+`SummonDataCreateRequest`, while the Beckoning host performs `GetList` and the
+claim request. Consequently the advertiser's placement is source-world
+diagnostic data, not the summon destination. The Beckoning requester's exact
+placement becomes the destination only when a particular candidate/session is
+claimed. A `GetList` can observe but cannot write placement into an
+advertisement, so an unrelated or repeated search cannot replace the target.
+The claim binds requester, candidate session, placement, and a monotonically
+increasing placement generation; advertisement removal/expiry/consumption
+clears that association. The server delivers that claim-bound destination to
+the responder while the responder is still in the source world. `Preparing`,
+pre-match `StageTransition`, automatic bell reuse, and destination-world
+re-advertisement are no longer part of the active path.
+The server trace records one textual reason for every candidate that is not
+returned, including filter mismatch, consumed/unavailable state, another
+requester's active claim, and `GetCount` truncation.
+
+All Bloodborne memory reads and native calls remain on the game thread. HTTP,
+Matching2, and signaling callbacks only advance the mutex-protected pending
+state. The existing profile-specific native functions and exact byte checks
+remain unchanged; this iteration adds no new executable patch and no global
+NOP.
+
+### Hunter's Dream interactions and guest appearance audit
+
+The exact CUSA03173 01.09 Healing Fountain update still proves that object
+byte `+0x49` is the multiplayer availability reason. In the user eboot the
+verified hook is `0x012F870E` with original bytes
+`41 80 7D 48 00`. The final update at `0x012F8F48` checks all four bytes
+`+0x48..+0x4B`, and `0x012F925F` publishes the result through native action
+state setter `0x0146E640`. Previous paired runtime evidence showed all four
+bytes zero after the scoped host override and still no prompt. Therefore a
+second selection/presentation gate exists downstream. No headstone, Doll,
+Workshop, shop, storage, or guest-role offset has yet been demonstrated with
+an exact byte signature. This build deliberately does not replace those
+unknown gates with a global multiplayer NOP.
+
+The role-state function at user-eboot `0x01507A70` selects SpEffect `9006`
+for a regular cooperative guest and `9026` for an invader. Exact extraction of
+the shipped 01.09 `gameparam.parambnd.dcx` isolated the relevant differences:
+
+```text
+effect  maxHpRate  stateInfo  useSpEffectEffect
+9005       1.0        188            0
+9006       0.7        272            1
+9025       1.0        190            0
+9026       0.7        276            1
+```
+
+Rows `9006` and `9026` otherwise retain `1.0` for the inspected stamina,
+attack, defense, stamina-consumption, and vial-healing multipliers. Their only
+mutual difference among the inspected fields is `stateInfo` (`272` versus
+`276`). The 30% guest HP reduction therefore comes from `maxHpRate`, rather
+than from a generic character-stat write.
+
+The exact param lookup is `0x01F28D20`, validated by the original 14-byte
+prologue `55 48 89 E5 41 57 41 56 41 54 53 44 89 E6`. Its result stores the
+row pointer at `+0x08`; the verified row fields are `maxHpRate` at `+0x10`,
+`stateInfo` at `+0x156`, and `useSpEffectEffect` bit `0x08` at byte `+0x160`.
+Only on the periodic game thread and only for the exact seamless profile, the
+policy changes `maxHpRate` from the verified vanilla value `0.7` to `1.0` for
+both cooperative and invasion guest rows. This follows the explicit project
+policy that neither seamless guest role receives the vanilla health penalty.
+It does not write current HP, heal repeatedly, replace the SpEffect, or alter
+role/team/faction state.
+
+For the cooperative row only, the visual-use bit is cleared while preserving
+`stateInfo=272` and the complete cooperative state. The invasion row keeps its
+visual-use bit and `stateInfo=276`, so the invader remains the native red,
+hostile role while receiving full max HP. Effect `9005` and effect `9025`
+remain untouched. Any unexpected state, flag, value, profile, or byte signature
+fails closed and emits one diagnostic instead of applying a guessed patch.
+
+The runtime `unsupported_profile` result was caused before this policy ran:
+the mounted D65 executable had no exact SHA profile and fell through to the old
+generic `cusa03173-109-reference` label. Selection now requires the exact D65
+SHA plus the five core signatures, while the SpEffect lookup and every other
+feature keep their own independent validation. The separate 676 executable
+retains its own exact legacy profile; there is no generic fallback. Applied
+logs report profile, role, summon type, the verified old/new rates,
+`source=SpEffectParam`, and `result=applied`. Absolute per-character HP values
+are not fabricated because this scoped patch operates on the native parameter
+row rather than a live player-stat field.
+
+Decoded Hunter's Dream events also identify a separate guest travel gate.
+Event `12107000` (normal headstones) and event `12107100` (Chalice headstones)
+both begin with `END IF Multiplayer State: Client`; event `12107200` performs
+the later dungeon warp without that initial check. This is useful evidence for
+why a guest cannot use those travel objects, but it is not by itself a safe
+runtime patch: the host prompt failure occurs earlier in native interaction
+selection, and globally changing the event interpreter would affect unrelated
+events. This iteration therefore keeps the existing exact Healing Fountain
+override and documents the remaining prompt/selection gate instead of adding a
+global multiplayer NOP.
+
+## Established-session travel iteration 1
+
+This iteration starts from client commit
+`f6bad6292aad40404413363cf40dd860356f3336` and server commit
+`79a5fe74ef4ec524530aa22cbc7e59280fa330cb`. It deliberately predates the
+discarded matchmaking-regression builds. The Wozzardman implementations remain
+reference material; this work extends the native cross-map summon path already
+present in these cumulative bases.
+
+### Audit result
+
+The existing seamless code handles initial cross-map placement before a guest
+joins. It transports the host placement, selects the summoned placement, and
+uses Bloodborne's native stage-transition functions. It did not have a durable
+party independent of a vanilla advertisement, an established-session travel
+protocol, or protection for the later `CSMultiPlayMan::Stop` issued by
+`SprjSessionManager::OnMatchingCheck` while `WorldChrMan` is rebuilding the
+remote character. The already-known stage-destructor bypass alone therefore
+cannot preserve a session through a later lantern or headstone warp.
+
+### Private control protocol and states
+
+shadNet command 116 and notification 18 carry a versioned private control
+message outside Bloodborne's vanilla room-message callback. The phases are
+`TravelBegin`, `TravelReady`, `TravelCommit`, `TravelArrived`, and
+`TravelFailed`, with heartbeat and explicit leave reserved for party lifetime.
+Every travel carries a server-issued party id, party generation, monotonic
+sequence id, leader identity, active room id, source and destination packed
+maps, the exact signed `WarpParam` id, mode, finite placement, and timestamp.
+
+The client state machine is explicit: `Connected`, `TravelPreparing`,
+`Traveling`, `WorldLoading`, `Rebinding`, `RecoveringRoom`, `RecoveringPeer`,
+and `Disconnected`. Old sequences, mismatched parties/generations, invalid
+destinations, non-finite placements, and events outside the bounded time window
+are rejected. The server derives membership only from the real Matching2 room;
+it does not accept client-invented members. A vanilla leave or temporary room
+loss does not delete the control party or cancel an in-flight travel.
+
+### Native travel and byte-verified guard
+
+The host observes the native `WarpParam` request and the following native
+`StageTransition`, then sends the actual destination and `WarpParam` selected
+by Bloodborne. After all connected guests acknowledge readiness, the guest
+calls the same native `WarpParam` path on the periodic game thread. No position
+`memcpy`, artificial sleep, or global Precise-style fallback is used.
+
+Two exact CUSA03173 01.09 profiles are accepted. The active runtime executable
+`SHA-256 D65F0B4F01D59166AED16F8604196D8B7DD805ABBF0758B356E8F1354C9429F9`
+uses profile `cusa03173-109-d65f0b4f` and these five independently validated
+layout anchors:
+
+```text
+WarpParam                     0x013CDF30  55 48 89 E5 41 57
+StageTransition               0x013CDE30  55 48 89 E5 41 57
+periodic game-thread tick     0x01872360  55 48 89 E5 41 57
+stage Stop call               0x019471B1  E8 EA 95 58 00
+OnMatchingCheck Stop call     0x013809B7  E8 E4 FD B4 00
+```
+
+All hook installation requires CUSA03173, app version 01.09, the full expected
+function prologues, and the exact call bytes. An unknown executable fails
+closed. The conditional call trampoline preserves guest GPRs, flags, MXCSR,
+YMM registers, stack and original call/return semantics. It suppresses a Stop
+only while seamless is enabled, a validated travel is active, shadNet control
+is connected, no explicit disconnect exists, and the transition deadline has
+not expired. Traditional mode never installs these hooks.
+
+### First-build boundary
+
+This build is specifically for an already-connected host and guest traveling
+from Great Bridge to Hunter's Dream, followed by the reverse/headstone cases.
+It attempts to keep the existing Matching2 room alive through the scoped Stop
+guard. Arrival currently treats a stable in-room multiplayer state as the
+first-build rebind signal; it does not yet claim a separately verified
+`WorldChrMan` remote-entity insertion. Automatic room recreation, explicit
+remote insertion, lantern prompt restoration, death/respawn continuity, and
+boss continuity remain later phases. If Bloodborne destroys the room through
+another path, the server keeps the SeamlessParty and logs recovery state, but
+automatic room reconstruction is not part of this iteration.
+
+## Legacy 676-profile initial summon and PvP evidence
+
+The offsets below are retained as historical evidence for the distinct
+`cusa03173-109-user-eboot-6764938b` compatibility profile. They are not used by
+the current D65 runtime profile. The initial cross-map path remains selected
+independently from established travel, and every selected profile carries its
+own patch sites, native call targets, global pointers, and original bytes.
+
+Initial bell/candidate/build sites in the user eboot:
+
+```text
+Beckoning area comparison          0x0157FAE8  0F 87 90 00 00 00
+Beckoning area result              0x0157FB80  34 01
+Responder bell area result         0x0157F8F1  88 C3
+Responder bell common result       0x0157F8F3  4C 89 F7 E8 E5 A2 34 00
+Active bell area comparison        0x01506B6B  77 4A
+Active bell area result            0x01506BAC  88 C3 80 F3 01
+Responder search area range        0x0191AD03  18 C9 20 C1 EB 02
+SOS status area restriction        0x018705E3  84 C0 41 BD FF FF FF FF ...
+Summon candidate area restriction  0x014B755A  0F 85 C0 03 00 00
+Summon build entry                 0x01874C20  55 48 89 E5 41 57
+Summon build world restriction     0x01874EF8  0F 85 48 01 00 00
+Summon build negative restriction  0x01874F00  0F 88 40 01 00 00
+Summon build area restriction      0x01875089  74 0D
+Healing-fountain availability      0x012F870E  41 80 7D 48 00
+```
+
+Host-placement handoff and native reload sites:
+
+```text
+Cross-map guest/invader handoff    0x01E5012A  48 8D 83 ED 00 00 00
+Deferred summon reload tick        0x01872870  55 48 89 E5 41 57
+Stage descriptor finalize          0x01945363  B8 00 00 00 FF
+SetForcedSummonMap                 0x0156D130
+SetForcedSummonPosition            0x0156D140
+SetForcedSummonOrientation         0x0156D160
+SetForcedSummonWarp                0x0156D180
+SelectSummonedPlacement            0x01332F60
+SummonedMapReload                  0x01336F30
+SetSummonReloadState               0x0178DBC0
+UseItemNativeApply                 0x018F9B50
+role metadata table                0x0553D720
+summon build role table            0x0556E530
+```
+
+The same native builder and handoff are used for the captured cooperative and
+Sinister paths. The contract evidence is explicit: Small Resonant advertises
+`SummonType=0`, while Sinister Resonant advertises `SummonType=2`. The client
+does not overwrite that field or a role table. It detects an active Sinister
+effect (`9025`) before the pre-match warp and resumes goods `225` after the
+world is ready; cooperative responders resume effect `9005`/goods `205`.
+Consequently the game-owned builder remains responsible for red-phantom
+faction and native invasion placement.
+
+The server keeps search/claim intents separated by the requested summon type.
+It models host, cooperator, and invader explicitly, excludes a known invader
+from the persistent cooperative party, and consumes the PvP advertisement on
+the normal invasion-end removal path. This lets a cooperative party survive
+PvP cleanup. Unknown summon values are never guessed into either role.
+
+These changes are byte-verified and build-tested, but cross-map co-op, Hunter's
+Dream bell use, red-phantom creation, and runtime invasion cleanup still require
+the Izuku/Hiryu game tests before they can be described as runtime confirmed.
+
+## Hunter's Dream Interaction RE
+
+This iteration is instrumentation only. It does not force an interaction result,
+change a role or event flag, hide multiplayer from the game, disable
+`CSMultiPlayMan`, or alter travel. The observers are disabled unless
+`SHADPS4_BLOODBORNE_INTERACT_TRACE=1` is present. The optional
+`SHADPS4_BLOODBORNE_INTERACT_TRACE_VERBOSE=1` includes otherwise unrelated
+event instructions, the first four raw argument words, and a bounded four-frame
+caller chain. Seamless itself continues to use its independent
+`SHADPS4_BLOODBORNE_SEAMLESS_COOP` switch.
+
+The trace profile is restricted to CUSA03173, app version 01.09, and the exact
+`cusa03173-109-d65f0b4f` layout whose SHA-256 is
+`D65F0B4F01D59166AED16F8604196D8B7DD805ABBF0758B356E8F1354C9429F9`.
+Every observer separately checks the complete original instruction sequence
+shown below before installing and fails closed if any byte differs:
+
+```text
+Event instruction dispatcher       0x017B90B0  55 48 89 E5 53 50
+Healing-fountain registration      0x0133B030  55 48 89 E5 41 57
+RE_InteractionAvailability gates   0x012F836E  41 80 7D 48 00
+RE_ActionCandidate transition      0x012F83F9  4D 8D 75 2C 44 39 3E
+RE_Prompt state                    0x012F8813  B8 6F A0 FE FF
+RE_Availability downstream gates   0x012F8BA8  41 80 7D 48 00
+RE_Availability blocked target     0x012F8E7A  41 C7 45 60 00 00 00 00
+RE_Availability publish            0x012F8EB3  41 8B 7D 20 41 0F BE 55 28
+Warp respawn-point parameter       0x013CDF30  55 48 89 E5 41 57
+```
+
+The `RE_` function labels are inferred names, not recovered symbols. Static
+analysis establishes that the availability object carries four byte gates at
+`+0x48..+0x4B`; `0x012F83F9` compares a value at `+0x2C` while moving through
+candidate selection; `0x012F8813` selects prompt state `0xFFFEA06F`;
+`0x012F8BA8` consumes the same four gates later in the pipeline;
+`0x012F8E7A` is a blocked target which clears object state at `+0x60`; and
+`0x012F8EB3` prepares the native availability publication call. Runtime evidence
+is still required before assigning higher-level semantics to gates `48`, `4A`,
+or `4B`. Gate `49` is labelled `multiplayer_gate_49` in a blocked trace only to
+make the known host-effect path easy to compare; its complete native policy is
+not yet claimed as proven.
+
+The event dispatcher reads the real bank and command from the instruction
+definition and decodes only layouts established by the event command contract:
+
+```text
+bank 3, command 0       event-flag condition
+bank 3, command 5       target entity, entity id, help-message id
+bank 3, command 24      action-button parameter and entity id
+bank 1003, 5/6/105      requested multiplayer-state condition
+bank 2003, command 49   Warp Player to Respawn Point
+bank 2009, command 5    Register Healing Fountain
+```
+
+The decoded `m21_00_00_00` event data gives the following confirmed Dream
+identities. Normal headstones are entities `2100950..2100953` and event
+`12107000`. Chalice headstones are entities `2100954..2100960` and events
+`12107100`/`12107200`; slot flags `9020..9026` occur in that path. Both
+`12107000` and `12107100` begin with a client-multiplayer-state condition, while
+the later `12107200` path does not begin with the same condition. This describes
+the event scripts only; it does not yet prove which native branch suppresses the
+host prompt.
+
+The normal trace is limited to Hunter's Dream packed map `0x15000000`, confirmed
+headstone/event routes, multiplayer-state commands, healing-fountain
+registration, and the native WarpParam entry. It records state changes and then
+suppresses identical observations for 30 seconds. Entries expire after two
+minutes and are bounded to 512 identities. Moving to another packed map, leaving
+the Matching2 room, or starting a new trace clears stale observations. Verbose
+mode can observe the same hook set outside the Dream for comparison.
+
+Each `[BLOODBORNE SEAMLESS INTERACT ...]` record includes a timestamp and logical
+counter, native thread name, phase, known interaction class, exact role, packed
+map and region, entity/action/prompt IDs, object address, Seamless party and
+Matching2 state, room/member IDs, signaling state, `CSMultiPlayMan` state, the
+four availability gates, decoded event fields, respawn parameter, exact eboot
+and caller offsets, validated original bytes, result, and local placement when
+available. The hook runs synchronously inside guest code; the log deliberately
+uses `hook_context=guest_code_synchronous` rather than claiming every observed
+dispatcher call is the periodic game thread. Verbose records add raw arguments
+and the bounded caller chain.
+
+The exact current event instance ID is not yet resolved from the interpreter
+context and is therefore emitted as `event_id=-1`; the known event numbers above
+come from static event-script analysis. Static `m21` evidence strongly associates
+entity `2100700` with the Doll's insight-dependent animation and player-facing
+behavior, but this is not yet a runtime-proven NPC contract. The trace therefore
+labels it `DollCandidate`, never simply `Doll`, and emits a deduplicated
+`[BLOODBORNE SEAMLESS NPC]` record at candidate, prompt, and block transitions.
+Unknown NPC-param, ownership, phantom-presentation, team, and SpEffect fields are
+reported as unavailable instead of being read from guessed offsets. Workshop,
+Storage, Bath Messenger, and Memory Altar identifiers remain unknown until the
+runtime capture identifies them. The broad action-button and event hooks will
+expose their entity, prompt, flag, role, and caller data without inventing a
+contract. The next comparison must determine whether the guest Doll phantom is
+created by network ownership, native visual presentation, an SpEffect, or a
+separate NPC instance, and whether each interaction fails during candidate
+generation, prompt publication, selection, event dispatch, menu opening, or the
+final WarpParam path. No interaction bypass has been added in this iteration.
+
+### D65 exact profile, room/signaling convergence, and health build
+
+The failing runtime loaded
+`D65F0B4F01D59166AED16F8604196D8B7DD805ABBF0758B356E8F1354C9429F9`, but the
+old selector knew only the distinct `6764938B...` exact profile. D65 therefore
+fell through to the generic `cusa03173-109-reference` label. This disabled both
+the interaction observers and the full-health policy before either feature
+reached its own byte validation. Substituting only the SHA would have been
+unsafe because all five 676 core sites fail on D65.
+
+Layout selection now selects D65 only when both the mounted eboot SHA-256 and
+five core sites validate: `WarpParam`,
+`StageTransition`, the periodic game-thread tick, the stage-transition Stop
+call, and the OnMatchingCheck Stop call. There is no generic reference fallback:
+an unknown SHA or one failed core site disables the profile. This does not
+weaken patch safety: every observer, hook, native call, or data write still
+validates its own complete expected bytes immediately before use and fails
+closed on a mismatch. Startup logs the mounted eboot's actual and expected
+SHA-256, the selected profile, all five selection signatures, and expected plus
+observed bytes at every interaction observer site.
+
+The matchmaking regression was in client event propagation, not shadNet.
+`PendingCrossMapSummon` learned about signaling only from the custom Matching2
+handshake, while the observed session established through generic
+`sceNpSignaling`. Room completion was also inferred from a later callback
+payload rather than bound explicitly to the request generation, room member,
+and peer. The client now records generation on Create/Join, publishes
+`RoomJoined` directly from the successful room reply, forwards generic and
+Matching2 signaling establishment, and lets either ordering converge through
+the same idempotent state machine. Generic signaling may be retained by NPID
+before the room callback, but cannot commit until the exact room/peer joins.
+Stale generations, wrong rooms, and wrong peers are rejected with a textual
+reason.
+
+`sceNpSignalingDeactivateConnection` remains the normal cleanup path. It is
+now traced with caller, connection, room, peer, and generation. Cleanup is
+suppressed only after placement, claim, exact room join, and signaling are all
+confirmed for the same live pending peer, and only until that bounded summon
+finishes or expires. There is no global signaling or `CSMultiPlayMan::Stop`
+bypass.
+
+The final-placement bug was separate. Once a cross-map reload reached the
+host's packed map, the old state machine returned `same_map_no_reload` and
+completed without applying the host's stored X/Y/Z/orientation. The state
+machine now has explicit `ApplyPlacement`, `VerifyPlacement`, and
+`PlacementComplete` stages. It still requires the current generation's claim,
+room, signaling, and advertiser placement. It then applies the placement once
+from the game-thread tick and reads the local placement back before completion.
+Duplicate and stale callbacks cannot claim that apply step.
+
+The native application path is the existing `PlayerWarpTool` dispatcher, not a
+raw player-structure write:
+
+```text
+PlayerWarp.NativeDispatch (D65 eboot)    0x0154EA30
+original bytes                          55 48 89 E5 41 57 41 56
+                                        41 55 41 54 53 48 81 EC
+arguments                               position*, orientation*,
+                                        camera_orientation*, packed_map*
+```
+
+For a same-map summon this performs zero artificial reloads. For a cross-map
+summon, the existing forced-summon path still performs at most one reload; once
+the target map is current, the dispatcher applies the exact final transform
+without requesting a second reload. Completion requires the readback to match
+the packed map, position within 1.5 game units, and heading within 0.15 radians.
+The log sequence is `TargetPlacementApplied`, optionally one deduplicated
+`TargetPlacementVerificationPending`, `TargetPlacementVerified`, and
+`Complete placement_verified=true`.
+
+The D65 profile resolves the SpEffect lookup only when its full 14-byte
+prologue has exactly one match in the bounded executable search region. The
+legacy 676 profile retains its separately validated fixed lookup at
+`0x01F28D20`. The active Seamless cooperator row `9006` and invader row `9026`
+use the verified `maxHpRate` field at row offset `+0x10`; the health policy
+changes only the vanilla `0.7` value to `1.0`. Traditional mode remains
+untouched.
+The build does not guess a current-HP address or write HP every frame. It lets
+the game's native recalculation own current-HP ratio preservation and logs
+`current_hp_write=false ratio_preservation=game_owned`; runtime comparison is
+still required to confirm the displayed HP behavior.
+
+Runtime diagnostics report the observed and expected eboot SHA-256, each of the
+five profile-selection signatures, the selected profile, and the installed and
+rejected interaction-observer totals. The health diagnostic identifies the
+active SpEffect id, resolved row address, `maxHpRate` offset, original `0.7`
+value, and new `1.0` value. It also records
+`health_field_write=maxHpRate_only`, `policy_scope=seamless_only`, and
+`traditional_mode=untouched`; these are enforced by the existing Seamless
+environment guard rather than by weakening any byte or row validation.
+
+The guest's gameplay phantom/specter state remains instrumentation-only in this
+build. Interaction and NPC records now include the local presence of effects
+`9001`, `9005`, `9006`, `9025`, and `9026`, while unknown NPC ownership,
+authority, team, and phantom-presentation fields remain explicitly
+`unresolved`. No network role, faction, team, NPC locality, material, or
+SpEffect is changed. The Izuku/Hiryu runtime capture must identify the exact
+presentation and authority branch before any scoped visual/gameplay correction
+is attempted.

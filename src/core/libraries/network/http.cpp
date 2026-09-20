@@ -58,7 +58,8 @@ struct HttpSettings {
     bool auto_redirect = true;
     bool inflate_gzip = true;                     // Auto-decompress response body if gzipped
     bool accept_encoding_gzip = true;             // Send "Accept-Encoding: gzip" request header
-    u32 ssl_flags = ORBIS_HTTPS_FLAG_SDK_DEFAULT; // SSL flag mask. Bitmask of OrbisHttpsFlags.
+    u32 ssl_flags = ORBIS_HTTPS_FLAG_SDK_DEFAULT; // SSL flag mask. Bitmask of
+                                                  // OrbisHttpsFlags.
     bool nonblock = false; // false = blocking (default), true = nonblock (EAGAIN)
     // (0 = no proxy, 1 = manual host:port, 2 = automatic/PAC).
     std::string proxy_host;
@@ -178,7 +179,8 @@ static int DecodeEpollHandle(OrbisHttpEpollHandle eh) {
     return static_cast<int>(reinterpret_cast<intptr_t>(eh));
 }
 
-// Resolve the (epoll_id*, epoll_user_arg*) pair on a template/connection/request
+// Resolve the (epoll_id*, epoll_user_arg*) pair on a
+// template/connection/request
 static bool ResolveEpollBinding(int id, int*& epoll_id_out, void**& user_arg_out,
                                 const char*& level) {
     if (auto it = g_state.templates.find(id); it != g_state.templates.end()) {
@@ -218,7 +220,8 @@ static std::string HttpStatusLabel(int sc);
 //   1. "scheme://host:port/path" - matches that endpoint and path prefix
 //   2. "scheme://host:port"      - matches that exact endpoint
 //   3. "host:port"               - matches host+port on any scheme
-//   4. "host"                    - matches host on any scheme/port (most common)
+//   4. "host"                    - matches host on any scheme/port (most
+//   common)
 //   5. "*"                       - catch-all fallback
 //
 // Replacement value is a URL with scheme + host + optional port. When port is
@@ -227,7 +230,8 @@ static std::string HttpStatusLabel(int sc);
 struct HostOverrideTarget {
     std::string scheme; // "http", "https", or "" to mean "preserve original"
     std::string host;
-    u16 port = 0; // 0 means "preserve original (or default-for-scheme if scheme changed)"
+    u16 port = 0; // 0 means "preserve original (or default-for-scheme if scheme
+                  // changed)"
 };
 
 // Parse a JSON string into a hostname to target map
@@ -570,11 +574,14 @@ static void LogSendRequestSettings(const HttpRequest& req, int reqId, u64 body_s
     }
 
     // Timeouts and basic flags
-    LOG_INFO(Lib_Http, "  timeouts: connect={}us send={}us recv={}us resolve={}us resolve_retry={}",
+    LOG_INFO(Lib_Http,
+             "  timeouts: connect={}us send={}us recv={}us resolve={}us "
+             "resolve_retry={}",
              s.connect_timeout_us, s.send_timeout_us, s.recv_timeout_us, s.resolve_timeout_us,
              s.resolve_retry);
     LOG_INFO(Lib_Http,
-             "  flags: auto_redirect={} inflate_gzip={} accept_encoding_gzip={} nonblock={}",
+             "  flags: auto_redirect={} inflate_gzip={} accept_encoding_gzip={} "
+             "nonblock={}",
              s.auto_redirect, s.inflate_gzip, s.accept_encoding_gzip, s.nonblock);
     LOG_INFO(Lib_Http, "  buffers: recv_block_size={} response_header_max={}", s.recv_block_size,
              s.response_header_max);
@@ -684,6 +691,9 @@ bool IsBloodborneSummonPath(std::string_view path) {
 }
 
 constexpr std::string_view BloodborneHostPlacementHeader = "X-ShadPS4-Bloodborne-Host-Placement";
+constexpr std::string_view BloodborneAdvertiserPlacementHeader =
+    "X-ShadPS4-Bloodborne-Advertiser-Placement";
+constexpr std::string_view BloodborneClaimAcceptedHeader = "X-ShadPS4-Bloodborne-Claim-Accepted";
 
 bool IsBloodborneSummonRequestPath(std::string_view path) {
     return path.find("/summon_messenger/request") != std::string_view::npos;
@@ -777,6 +787,8 @@ void CaptureBloodborneSummon(const SendRequestPlan& plan, const HttpResponse& re
     for (const auto& [name, value] : plan.headers) {
         if (HeaderNameMatches(name, BloodborneHostPlacementHeader)) {
             metadata_file << "host_placement_request=" << value << '\n';
+        } else if (HeaderNameMatches(name, BloodborneAdvertiserPlacementHeader)) {
+            metadata_file << "advertiser_placement_request=" << value << '\n';
         }
     }
     if (const auto placement =
@@ -811,8 +823,8 @@ bool ApplyBloodborneSeamlessRoute(SendRequestPlan& plan) {
     const std::string base_url = EmulatorSettings.GetShadNetWebApiServer();
     const HostOverrideTarget target = ParseHostOverrideTarget(base_url);
     if (target.host.empty()) {
-        LOG_WARNING(Lib_Http,
-                    "Bloodborne seamless route requested, but shadNet WebAPI server is empty");
+        LOG_WARNING(Lib_Http, "Bloodborne seamless route requested, but shadNet "
+                              "WebAPI server is empty");
         return false;
     }
 
@@ -834,6 +846,18 @@ bool ApplyBloodborneSeamlessRoute(SendRequestPlan& plan) {
     if (IsBloodborneSummonRequestPath(plan.path) || IsBloodborneSummonSearchPath(plan.path)) {
         if (const auto placement = Core::Bloodborne::GetSeamlessHostPlacementHeader()) {
             plan.headers.emplace_back(BloodborneHostPlacementHeader, *placement);
+            LOG_INFO(Lib_Http,
+                     "[BLOODBORNE SEAMLESS SUMMON] state=HostPlacementAttached "
+                     "path={} bytes={}",
+                     plan.path, placement->size());
+        }
+    } else if (IsBloodborneSummonCreatePath(plan.path)) {
+        if (const auto placement = Core::Bloodborne::GetSeamlessHostPlacementHeader()) {
+            plan.headers.emplace_back(BloodborneAdvertiserPlacementHeader, *placement);
+            LOG_INFO(Lib_Http,
+                     "[BLOODBORNE SEAMLESS PLACEMENT] "
+                     "state=AdvertiserPlacementCaptured path={} bytes={}",
+                     plan.path, placement->size());
         }
     }
 
@@ -929,7 +953,8 @@ static s32 RunRealHttpRequest(const SendRequestPlan& plan_in, HttpResponse& out_
              plan_in.scheme, plan_in.host, plan_in.path);
     return ORBIS_HTTP_ERROR_RESOLVER_ENODNS;
 #else
-    // Mutable copy: PS4-faithful redirect loop rewrites scheme/host/port/path/method.
+    // Mutable copy: PS4-faithful redirect loop rewrites
+    // scheme/host/port/path/method.
     SendRequestPlan plan = plan_in;
 
     auto pick_timeout_seconds = [](u32 us, u32 default_s) -> std::chrono::seconds {
@@ -1072,7 +1097,8 @@ static s32 RunRealHttpRequest(const SendRequestPlan& plan_in, HttpResponse& out_
         }
         if (depth >= MaxRedirects) {
             LOG_INFO(Lib_Http,
-                     "redirect depth limit ({}) reached; returning final response status={}",
+                     "redirect depth limit ({}) reached; returning final response "
+                     "status={}",
                      MaxRedirects, out_res.status_code);
             break;
         }
@@ -1348,7 +1374,9 @@ int PS4_SYSV_ABI sceHttpCacheRedirectedConnectionEnabled(int id, int isEnable) {
 
 int PS4_SYSV_ABI sceHttpCookieExport(int libhttpCtxId, void* buffer, u64 bufferSize,
                                      u64* exportSize) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called libhttpCtxId={}, buffer={}, bufferSize={}, exportSize={}",
+    LOG_ERROR(Lib_Http,
+              "(STUBBED) called libhttpCtxId={}, buffer={}, bufferSize={}, "
+              "exportSize={}",
               libhttpCtxId, fmt::ptr(buffer), bufferSize, fmt::ptr(exportSize));
     return ORBIS_OK;
 }
@@ -1366,7 +1394,9 @@ int PS4_SYSV_ABI sceHttpCookieImport(int libhttpCtxId, const void* buffer, u64 b
 
 int PS4_SYSV_ABI sceHttpCreateConnection(int tmplId, const char* serverName, const char* scheme,
                                          u16 port, int isEnableKeepalive) {
-    LOG_INFO(Lib_Http, "called tmplId={}, serverName={}, scheme={}, port={}, isEnableKeepalive={}",
+    LOG_INFO(Lib_Http,
+             "called tmplId={}, serverName={}, scheme={}, port={}, "
+             "isEnableKeepalive={}",
              tmplId, serverName ? serverName : "(null)", scheme ? scheme : "(null)", port,
              isEnableKeepalive);
     std::lock_guard<std::mutex> lock(g_state.m_mutex);
@@ -1643,7 +1673,8 @@ int PS4_SYSV_ABI sceHttpGetConnectionStat() {
 int PS4_SYSV_ABI sceHttpGetCookie(int libhttpCtxId, const char* url, char* cookie, u64* required,
                                   u64 prepared, int isSecure) {
     LOG_ERROR(Lib_Http,
-              "(STUBBED) called libhttpCtxId={}, url={}, cookie={}, required={}, prepared={}, "
+              "(STUBBED) called libhttpCtxId={}, url={}, cookie={}, required={}, "
+              "prepared={}, "
               "isSecure={}",
               libhttpCtxId, url ? url : "(null)", fmt::ptr(cookie), fmt::ptr(required), prepared,
               isSecure);
@@ -1804,6 +1835,13 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
                 LOG_WARNING(Lib_Http, "Ignored invalid Bloodborne host-placement header");
             } else if (!placement.has_value() && IsBloodborneSummonCreatePath(plan.path)) {
                 Core::Bloodborne::ClearSeamlessHostPlacementHeader();
+            }
+            if (IsBloodborneSummonCreatePath(plan.path)) {
+                const auto claim =
+                    FindResponseHeader(local_res.all_headers_blob, BloodborneClaimAcceptedHeader);
+                if (claim.has_value() && *claim == "1") {
+                    Core::Bloodborne::NotifySeamlessSummonClaimAccepted();
+                }
             }
         }
 
@@ -2028,7 +2066,8 @@ int PS4_SYSV_ABI sceHttpsLoadCert(int libhttpCtxId, int caCertNum, const void** 
     g_state.contexts_with_loaded_certs.insert(libhttpCtxId);
     LOG_ERROR(Lib_Http,
               "ctxId={} marked as using custom CAs; subsequent HTTPS requests on this "
-              "context will bypass cert verification (libSceSsl integration not implemented)",
+              "context will bypass cert verification (libSceSsl integration not "
+              "implemented)",
               libhttpCtxId);
     return ORBIS_OK;
 }
@@ -3275,7 +3314,8 @@ int PS4_SYSV_ABI sceHttpParseStatusLine(const char* statusLine, u64 lineLen, int
                                         int32_t* httpMinorVer, int32_t* responseCode,
                                         const char** reasonPhrase, u64* phraseLen) {
     LOG_INFO(Lib_Http,
-             "called statusLine={}, lineLen={}, httpMajorVer={}, httpMinorVer={}, responseCode={}, "
+             "called statusLine={}, lineLen={}, httpMajorVer={}, "
+             "httpMinorVer={}, responseCode={}, "
              "reasonPhrase={}, phraseLen={}",
              fmt::ptr(statusLine), lineLen, fmt::ptr(httpMajorVer), fmt::ptr(httpMinorVer),
              fmt::ptr(responseCode), fmt::ptr(reasonPhrase), fmt::ptr(phraseLen));
@@ -3596,8 +3636,8 @@ int PS4_SYSV_ABI sceHttpUriBuild(char* out, u64* require, u64 prepare,
         built.append(hostname);
     }
 
-    // Port: only if (a) we have one, (b) it isn't the scheme's default, and (c) scheme isn't
-    // mailto.
+    // Port: only if (a) we have one, (b) it isn't the scheme's default, and (c)
+    // scheme isn't mailto.
     if ((option & ORBIS_HTTP_URI_BUILD_WITH_PORT) && srcElement->port != 0) {
         const uint16_t def = schemeDefaultPort();
         const bool skip = (def != 0 || isMailto) && (def == srcElement->port);
@@ -3700,7 +3740,8 @@ int PS4_SYSV_ABI sceHttpUriEscape(char* out, u64* require, u64 prepare, const ch
 int PS4_SYSV_ABI sceHttpUriMerge(char* mergedUrl, char* url, char* relativeUri, u64* require,
                                  u64 prepare, u32 option) {
     LOG_TRACE(Lib_Http,
-              "called mergedUrl={}, url={}, relativeUri={}, require={}, prepare={}, option={:#x}",
+              "called mergedUrl={}, url={}, relativeUri={}, require={}, "
+              "prepare={}, option={:#x}",
               fmt::ptr(mergedUrl), url ? url : "(null)", relativeUri ? relativeUri : "(null)",
               fmt::ptr(require), prepare, option);
 

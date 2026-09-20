@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-name: Bloodborne Optimized v2 - Windows x64
+name: Bloodborne Seamless Travel - Windows x64
 
 on:
   pull_request:
-    branches: [bloodborne-readback-p2p-port]
+    branches: [bloodborne-readback-optimized-v2]
   workflow_dispatch:
 
 permissions:
@@ -135,7 +135,7 @@ jobs:
       - name: Upload Windows x64 artifact
         uses: actions/upload-artifact@v7
         with:
-          name: shadps4-windows-x64-optimized-v2
+          name: shadps4-windows-x64-seamless-travel
           path: ${{ github.workspace }}/artifact/windows-x64/
           if-no-files-found: error
           retention-days: 14

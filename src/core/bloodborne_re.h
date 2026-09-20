@@ -13,6 +13,21 @@ namespace Core::Bloodborne {
 std::optional<std::string> GetSeamlessHostPlacementHeader();
 bool SetSeamlessHostPlacementHeader(std::string_view value);
 void ClearSeamlessHostPlacementHeader();
+void NotifySeamlessSummonClaimAccepted();
+std::uint64_t NotifySeamlessSummonRoomJoinStarted(std::uint64_t room_id);
+void NotifySeamlessSummonRoomJoined(std::uint64_t room_id);
+void NotifySeamlessSummonSignalingEstablished(std::uint64_t room_id);
+void NotifySeamlessSummonRoomJoinedForPeer(std::uint64_t room_id, std::uint16_t local_member_id,
+                                           std::uint16_t peer_member_id, std::string_view peer_npid,
+                                           std::uint64_t generation = 0);
+void NotifySeamlessSummonSignalingEstablishedForPeer(std::uint64_t room_id,
+                                                     std::uint16_t peer_member_id,
+                                                     std::string_view peer_npid,
+                                                     std::uint64_t generation = 0);
+void NotifySeamlessNpSignalingEstablished(std::int32_t connection_id, std::string_view peer_npid);
+bool TraceAndGuardSeamlessSignalingDeactivate(std::uintptr_t return_address,
+                                              std::int32_t context_id, std::int32_t connection_id,
+                                              std::string_view peer_npid, std::int32_t status);
 void TraceMatching2LeaveRoom(std::uintptr_t return_address, std::uint64_t room_id);
 void InstallSeamlessCoopPatches();
 void RecordReverseEngineeringImageStage(std::string_view stage, std::uintptr_t image_base,
