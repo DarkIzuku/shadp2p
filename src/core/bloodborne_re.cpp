@@ -1578,6 +1578,8 @@ std::array<std::atomic<u64>, HunterDreamInteractionTraceSites.size()>
 constexpr size_t MaxHunterDreamEventDispatcherProbeCandidates = 64;
 std::array<u64, MaxHunterDreamEventDispatcherProbeCandidates>
     hunter_dream_event_dispatch_probe_offsets{};
+std::array<std::atomic<u64>, MaxHunterDreamEventDispatcherProbeCandidates>
+    hunter_dream_event_dispatch_candidate_hits{};
 size_t hunter_dream_event_dispatch_probe_count{};
 std::atomic<u64> hunter_dream_event_dispatch_selected_offset{};
 std::atomic<u32> hunter_dream_event_dispatch_selected_register{
@@ -4398,12 +4400,19 @@ void PS4_SYSV_ABI HunterDreamEventDispatcherProbeEntry(
         // until the strong anchor has been observed.
         const bool strong_anchor = event.bank == 2003 && event.command == 49;
         if (selected == 0 && !strong_anchor) {
-            LOG_INFO(Debug,
-                     "[BLOODBORNE SEAMLESS INTERACT LOCATOR] hook=Event.Instruction.Dispatch "
-                     "result=runtime_candidate offset={:#x} context_register={} "
-                     "event_bank={} event_command={} event_context={:#x}",
-                     offset, HunterDreamEventContextRegisterName(context_register), event.bank,
-                     event.command, context);
+            const u64 candidate_hit =
+                hunter_dream_event_dispatch_candidate_hits[tag].fetch_add(
+                    1, std::memory_order_relaxed) +
+                1;
+            if (candidate_hit <= 3) {
+                LOG_INFO(Debug,
+                         "[BLOODBORNE SEAMLESS INTERACT LOCATOR] "
+                         "hook=Event.Instruction.Dispatch result=runtime_candidate "
+                         "offset={:#x} context_register={} event_bank={} event_command={} "
+                         "event_context={:#x} candidate_hit={}",
+                         offset, HunterDreamEventContextRegisterName(context_register), event.bank,
+                         event.command, context, candidate_hit);
+            }
             return;
         }
 
@@ -8730,6 +8739,8 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
     hunter_dream_interaction_trace_sequence.store(0, std::memory_order_relaxed);
     hunter_dream_interaction_session_active = false;
     hunter_dream_event_dispatch_probe_count = 0;
+    for (auto& hit : hunter_dream_event_dispatch_candidate_hits)
+        hit.store(0, std::memory_order_relaxed);
     hunter_dream_event_dispatch_selected_offset.store(0, std::memory_order_relaxed);
     hunter_dream_event_dispatch_selected_register.store(std::numeric_limits<u32>::max(),
                                                         std::memory_order_relaxed);
