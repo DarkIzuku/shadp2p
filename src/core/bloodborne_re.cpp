@@ -4391,6 +4391,22 @@ void PS4_SYSV_ABI HunterDreamEventDispatcherProbeEntry(
         if (!event.valid || !IsRelevantInteractionEvent(event))
             continue;
 
+        // Do not permanently select a candidate from a generic action-state hit.
+        // Warp Player to Respawn Point (bank 2003 / command 49) is a high-confidence
+        // semantic anchor already correlated with the native WarpParam hook. Use that
+        // event to lock the dispatcher/ABI; weaker relevant events are only diagnostic
+        // until the strong anchor has been observed.
+        const bool strong_anchor = event.bank == 2003 && event.command == 49;
+        if (selected == 0 && !strong_anchor) {
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SEAMLESS INTERACT LOCATOR] hook=Event.Instruction.Dispatch "
+                     "result=runtime_candidate offset={:#x} context_register={} "
+                     "event_bank={} event_command={} event_context={:#x}",
+                     offset, HunterDreamEventContextRegisterName(context_register), event.bank,
+                     event.command, context);
+            return;
+        }
+
         u64 expected_selected = 0;
         if (selected == 0 &&
             hunter_dream_event_dispatch_selected_offset.compare_exchange_strong(
@@ -4400,8 +4416,9 @@ void PS4_SYSV_ABI HunterDreamEventDispatcherProbeEntry(
                 static_cast<u32>(context_register), std::memory_order_release);
             LOG_INFO(Debug,
                      "[BLOODBORNE SEAMLESS INTERACT LOCATOR] hook=Event.Instruction.Dispatch "
-                     "result=runtime_selected offset={:#x} context_register={} "
-                     "event_bank={} event_command={} event_context={:#x}",
+                     "result=runtime_selected anchor=warp_player_to_respawn_point "
+                     "offset={:#x} context_register={} event_bank={} event_command={} "
+                     "event_context={:#x}",
                      offset, HunterDreamEventContextRegisterName(context_register), event.bank,
                      event.command, context);
         } else {
