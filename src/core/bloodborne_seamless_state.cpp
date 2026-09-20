@@ -120,6 +120,8 @@ PendingCrossMapSummonStateMachine::PendingCrossMapSummonStateMachine()
 PendingCrossMapSummonStateMachine::PendingCrossMapSummonStateMachine(Options options)
     : m_options(options) {
     m_options.timeoutMs = std::max<s64>(5'000, m_options.timeoutMs);
+    m_options.preRoomSignalingGuardMs =
+        std::clamp<s64>(m_options.preRoomSignalingGuardMs, 5'000, m_options.timeoutMs);
 }
 
 void PendingCrossMapSummonStateMachine::SetEnabled(bool enabled) {
@@ -132,6 +134,7 @@ void PendingCrossMapSummonStateMachine::Reset() {
     m_unbound = {};
     m_deadlineMs = 0;
     m_unboundDeadlineMs = 0;
+    m_signalingGuardDeadlineMs = 0;
     m_lastEventReason = "reset";
 }
 
@@ -338,6 +341,9 @@ bool PendingCrossMapSummonStateMachine::OnRoomJoinedForPeer(s64 nowMs, u64 roomI
         m_pending.expectedPeerMemberId = expectedPeerMemberId;
     if (!expectedPeerNpid.empty())
         m_pending.expectedPeerNpid = expectedPeerNpid;
+    if (m_pending.signalingEstablished) {
+        m_signalingGuardDeadlineMs = nowMs + m_options.preRoomSignalingGuardMs;
+    }
     AdvanceReadyPhase();
     RefreshDeadline(nowMs);
     m_lastEventReason = "accepted";
@@ -380,6 +386,7 @@ bool PendingCrossMapSummonStateMachine::OnSignalingEstablishedForPeer(s64 nowMs,
         m_unbound.expectedPeerMemberId = peerMemberId;
         m_unbound.expectedPeerNpid = peerNpid;
         m_unboundDeadlineMs = nowMs + m_options.timeoutMs;
+        m_signalingGuardDeadlineMs = nowMs + m_options.preRoomSignalingGuardMs;
         m_lastEventReason = roomId == 0 ? "accepted_unbound_without_room" : "accepted_unbound";
         return true;
     }
@@ -413,6 +420,7 @@ bool PendingCrossMapSummonStateMachine::OnSignalingEstablishedForPeer(s64 nowMs,
         m_pending.expectedPeerMemberId = peerMemberId;
     if (!peerNpid.empty())
         m_pending.expectedPeerNpid = peerNpid;
+    m_signalingGuardDeadlineMs = nowMs + m_options.preRoomSignalingGuardMs;
     AdvanceReadyPhase();
     RefreshDeadline(nowMs);
     m_lastEventReason = roomId == 0 ? "accepted_pending_without_room" : "accepted";
@@ -556,13 +564,52 @@ bool PendingCrossMapSummonStateMachine::ShouldRetainPlacementOnMissingCreate(s64
 
 bool PendingCrossMapSummonStateMachine::ShouldGuardSignalingDeactivate(std::string_view peerNpid,
                                                                        s64 nowMs) const {
-    return m_enabled && !peerNpid.empty() && !m_pending.expectedPeerNpid.empty() &&
-           peerNpid == m_pending.expectedPeerNpid && !IsExpired(nowMs) &&
-           m_pending.phase != PendingCrossMapSummonPhase::Idle &&
-           m_pending.phase != PendingCrossMapSummonPhase::Complete &&
-           m_pending.phase != PendingCrossMapSummonPhase::Failed && m_pending.roomId != 0 &&
-           m_pending.placementReady && m_pending.claimAccepted && m_pending.roomJoined &&
-           m_pending.signalingEstablished;
+    if (!m_enabled || peerNpid.empty() || m_signalingGuardDeadlineMs == 0 ||
+        nowMs > m_signalingGuardDeadlineMs) {
+        return false;
+    }
+
+    // The native game may request cleanup after generic sceNpSignaling reaches
+    // MUTUAL_ACTIVATED but before the HTTP claim and Matching2 room callbacks
+    // converge. Guard only that exact peer and only while the retained signaling
+    // fact belongs to an unfinished summon.
+    if (m_pending.phase != PendingCrossMapSummonPhase::Idle) {
+        return m_pending.phase != PendingCrossMapSummonPhase::Complete &&
+               m_pending.phase != PendingCrossMapSummonPhase::Failed &&
+               m_pending.signalingEstablished && !m_pending.expectedPeerNpid.empty() &&
+               peerNpid == m_pending.expectedPeerNpid;
+    }
+
+    return m_unbound.signalingEstablished && !m_unbound.expectedPeerNpid.empty() &&
+           peerNpid == m_unbound.expectedPeerNpid;
+}
+
+bool PendingCrossMapSummonStateMachine::OnSignalingDeactivated(std::string_view peerNpid,
+                                                               s64 nowMs) {
+    if (!m_enabled || peerNpid.empty())
+        return false;
+
+    bool changed = false;
+    if (m_pending.phase != PendingCrossMapSummonPhase::Idle &&
+        !m_pending.expectedPeerNpid.empty() && peerNpid == m_pending.expectedPeerNpid &&
+        m_pending.signalingEstablished) {
+        m_pending.signalingEstablished = false;
+        AdvanceReadyPhase();
+        RefreshDeadline(nowMs);
+        changed = true;
+    }
+
+    if (!m_unbound.expectedPeerNpid.empty() && peerNpid == m_unbound.expectedPeerNpid &&
+        m_unbound.signalingEstablished) {
+        m_unbound.signalingEstablished = false;
+        changed = true;
+    }
+
+    if (changed) {
+        m_signalingGuardDeadlineMs = 0;
+        m_lastEventReason = "signaling_deactivated";
+    }
+    return changed;
 }
 
 std::string_view PendingCrossMapSummonStateMachine::LastEventReason() const {
