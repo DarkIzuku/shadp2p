@@ -243,6 +243,10 @@ class PendingCrossMapSummonStateMachine {
 public:
     struct Options {
         s64 timeoutMs = 120'000;
+        // Generic sceNpSignaling can become established several seconds before the
+        // game finishes the summon claim / Matching2 room path. Keep only the exact
+        // peer alive for this bounded convergence window.
+        s64 preRoomSignalingGuardMs = 35'000;
     };
 
     PendingCrossMapSummonStateMachine();
@@ -273,6 +277,7 @@ public:
     bool MarkRemoteInserted(u64 generation);
     bool ShouldRetainPlacementOnMissingCreate(s64 nowMs) const;
     bool ShouldGuardSignalingDeactivate(std::string_view peerNpid, s64 nowMs) const;
+    bool OnSignalingDeactivated(std::string_view peerNpid, s64 nowMs);
     std::string_view LastEventReason() const;
     PendingCrossMapSummonSnapshot Snapshot() const;
     void Reset();
@@ -291,6 +296,7 @@ private:
     u64 m_nextGeneration = 0;
     s64 m_deadlineMs = 0;
     s64 m_unboundDeadlineMs = 0;
+    s64 m_signalingGuardDeadlineMs = 0;
     std::string_view m_lastEventReason{"not_observed"};
 };
 
