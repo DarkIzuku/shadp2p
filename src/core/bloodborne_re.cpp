@@ -5843,6 +5843,10 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (healing_fountain_host_availability_hook_installed &&
         site.offset == HealingFountainAvailabilityOffset) {
         ApplyHealingFountainHostAvailability(*registers);
+        ApplyHunterDreamLocalWorldOverride(
+            HunterDreamInteractionTraceSites[static_cast<size_t>(
+                HunterDreamInteractionHook::AvailabilityGate)],
+            registers);
     }
     std::optional<MaintenanceSourceRecord> maintenance_source;
     u64 early_hit{};
