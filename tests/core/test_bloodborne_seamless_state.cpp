@@ -189,7 +189,14 @@ TEST(BloodborneSeamlessState, CrossMapSummonCommitsOnceAfterSignaling) {
     EXPECT_FALSE(machine.MarkReloadStarted(generation));
     EXPECT_EQ(machine.Evaluate(0x18010000, 0x15000000, 142),
               PendingCrossMapSummonDecision::DuplicateReload);
-    EXPECT_TRUE(machine.MarkWorldReady(0x15000000, generation));
+    EXPECT_EQ(machine.Evaluate(0x15000000, 0x15000000, 143),
+              PendingCrossMapSummonDecision::ApplyPlacement);
+    EXPECT_TRUE(machine.BeginPlacementApply(generation));
+    EXPECT_EQ(machine.Evaluate(0x15000000, 0x15000000, 144),
+              PendingCrossMapSummonDecision::VerifyPlacement);
+    EXPECT_TRUE(machine.MarkPlacementVerified(0x15000000, generation));
+    EXPECT_EQ(machine.Evaluate(0x15000000, 0x15000000, 145),
+              PendingCrossMapSummonDecision::PlacementComplete);
     EXPECT_TRUE(machine.MarkRemoteInserted(generation));
     const auto result = machine.Snapshot();
     EXPECT_EQ(result.phase, PendingCrossMapSummonPhase::Complete);
@@ -292,9 +299,56 @@ TEST(BloodborneSeamlessState, SameMapSummonNeverRequestsArtificialReload) {
     machine.SetEnabled(true);
     const u64 generation = machine.OnPlacementDeferred(0x18010000, 100);
     ASSERT_NE(generation, 0);
+    ASSERT_TRUE(machine.OnClaimAccepted(101, generation));
+    ASSERT_TRUE(machine.OnRoomJoined(102, 17, generation));
+    ASSERT_TRUE(machine.OnSignalingEstablished(103, 17, generation));
     EXPECT_EQ(machine.Evaluate(0x18010000, 0x18010000, 101),
-              PendingCrossMapSummonDecision::SameMap);
+              PendingCrossMapSummonDecision::ApplyPlacement);
+    EXPECT_TRUE(machine.BeginPlacementApply(generation));
+    EXPECT_FALSE(machine.BeginPlacementApply(generation));
+    EXPECT_EQ(machine.Evaluate(0x18010000, 0x18010000, 104),
+              PendingCrossMapSummonDecision::VerifyPlacement);
+    EXPECT_TRUE(machine.MarkPlacementVerified(0x18010000, generation));
+    EXPECT_EQ(machine.Evaluate(0x18010000, 0x18010000, 105),
+              PendingCrossMapSummonDecision::PlacementComplete);
+    EXPECT_TRUE(machine.MarkRemoteInserted(generation));
     EXPECT_EQ(machine.Snapshot().reloadCount, 0);
+    EXPECT_TRUE(machine.Snapshot().placementApplied);
+    EXPECT_TRUE(machine.Snapshot().placementVerified);
+}
+
+TEST(BloodborneSeamlessState, SameMapPlacementWaitsForClaimRoomAndSignaling) {
+    PendingCrossMapSummonStateMachine machine;
+    machine.SetEnabled(true);
+    const u64 generation = machine.OnPlacementDeferred(0x18010000, 100);
+    EXPECT_EQ(machine.Evaluate(0x18010000, 0x18010000, 101),
+              PendingCrossMapSummonDecision::WaitForClaim);
+    ASSERT_TRUE(machine.OnClaimAccepted(102, generation));
+    EXPECT_EQ(machine.Evaluate(0x18010000, 0x18010000, 103),
+              PendingCrossMapSummonDecision::WaitForRoom);
+    ASSERT_TRUE(machine.OnRoomJoined(104, 17, generation));
+    EXPECT_EQ(machine.Evaluate(0x18010000, 0x18010000, 105),
+              PendingCrossMapSummonDecision::WaitForSignaling);
+    ASSERT_TRUE(machine.OnSignalingEstablished(106, 17, generation));
+    EXPECT_EQ(machine.Evaluate(0x18010000, 0x18010000, 107),
+              PendingCrossMapSummonDecision::ApplyPlacement);
+}
+
+TEST(BloodborneSeamlessState, OldGenerationCannotApplyOrVerifyPlacement) {
+    PendingCrossMapSummonStateMachine machine;
+    machine.SetEnabled(true);
+    const u64 oldGeneration = machine.OnPlacementDeferred(0x15000000, 100);
+    const u64 generation = machine.OnPlacementDeferred(0x18010000, 110);
+    ASSERT_GT(generation, oldGeneration);
+    ASSERT_TRUE(machine.OnClaimAccepted(111, generation));
+    ASSERT_TRUE(machine.OnRoomJoined(112, 17, generation));
+    ASSERT_TRUE(machine.OnSignalingEstablished(113, 17, generation));
+    ASSERT_EQ(machine.Evaluate(0x18010000, 0x18010000, 114),
+              PendingCrossMapSummonDecision::ApplyPlacement);
+    EXPECT_FALSE(machine.BeginPlacementApply(oldGeneration));
+    EXPECT_TRUE(machine.BeginPlacementApply(generation));
+    EXPECT_FALSE(machine.MarkPlacementVerified(0x18010000, oldGeneration));
+    EXPECT_TRUE(machine.MarkPlacementVerified(0x18010000, generation));
 }
 
 TEST(BloodborneSeamlessState, StaleSummonGenerationCannotCommitOrReload) {
@@ -313,6 +367,24 @@ TEST(BloodborneSeamlessState, StaleSummonGenerationCannotCommitOrReload) {
 TEST(BloodborneSeamlessState, ExactUserEbootSupportsGuestParamPolicy) {
     EXPECT_TRUE(IsSeamlessGuestParamProfileSupported("cusa03173-109-user-eboot-6764938b"));
     EXPECT_FALSE(IsSeamlessGuestParamProfileSupported("cusa03173-109-reference"));
+}
+
+TEST(BloodborneSeamlessState, ExactEbootHashAndCoreSignaturesSelectUserProfile) {
+    EXPECT_TRUE(IsExpectedBloodborneEbootSha256(
+        "6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80"));
+    EXPECT_FALSE(IsExpectedBloodborneEbootSha256(
+        "0000000000000000000000000000000000000000000000000000000000000000"));
+    EXPECT_TRUE(ShouldSelectExactBloodborneProfile(true, true));
+    EXPECT_FALSE(ShouldSelectExactBloodborneProfile(false, true));
+    EXPECT_FALSE(ShouldSelectExactBloodborneProfile(true, false));
+    EXPECT_FALSE(ShouldSelectExactBloodborneProfile(false, false));
+}
+
+TEST(BloodborneSeamlessState, InvalidSignatureNeverInstallsVerifiedHook) {
+    EXPECT_TRUE(ShouldInstallBloodborneVerifiedHook(true, true));
+    EXPECT_FALSE(ShouldInstallBloodborneVerifiedHook(true, false));
+    EXPECT_FALSE(ShouldInstallBloodborneVerifiedHook(false, true));
+    EXPECT_FALSE(ShouldInstallBloodborneVerifiedHook(false, false));
 }
 
 TEST(BloodborneSeamlessState, MissingCreateHeaderRetainsOnlyAcceptedInFlightPlacement) {

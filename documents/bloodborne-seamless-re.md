@@ -2084,3 +2084,72 @@ created by network ownership, native visual presentation, an SpEffect, or a
 separate NPC instance, and whether each interaction fails during candidate
 generation, prompt publication, selection, event dispatch, menu opening, or the
 final WarpParam path. No interaction bypass has been added in this iteration.
+
+### Exact-profile, final-placement, and health correction build
+
+The first instrumentation build selected `cusa03173-109-reference` on the
+user's exact executable even though its mounted eboot SHA-256 is
+`6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80`. The
+selector had coupled layout identification to a nine-helper initial-summon
+fingerprint. A helper that had already been independently patched could make
+that aggregate fingerprint false and therefore mislabel the executable. This
+disabled both the interaction observers and the full-health policy before
+either feature reached its own byte validation.
+
+Layout selection now prefers the exact user profile only when both the mounted
+eboot SHA-256 matches and five core sites validate: `WarpParam`,
+`StageTransition`, the periodic game-thread tick, the stage-transition Stop
+call, and the OnMatchingCheck Stop call. The fallback reference profile is
+considered only if that exact identity does not match. This does not weaken
+patch safety: every observer, hook, native call, or data write still validates
+its own complete expected bytes immediately before use and fails closed on a
+mismatch. Startup logs the mounted eboot's actual and expected SHA-256, the
+selected profile, all five selection signatures, and expected plus observed
+bytes at every interaction observer site.
+
+The final-placement bug was separate. Once a cross-map reload reached the
+host's packed map, the old state machine returned `same_map_no_reload` and
+completed without applying the host's stored X/Y/Z/orientation. The state
+machine now has explicit `ApplyPlacement`, `VerifyPlacement`, and
+`PlacementComplete` stages. It still requires the current generation's claim,
+room, signaling, and advertiser placement. It then applies the placement once
+from the game-thread tick and reads the local placement back before completion.
+Duplicate and stale callbacks cannot claim that apply step.
+
+The native application path is the existing `PlayerWarpTool` dispatcher, not a
+raw player-structure write:
+
+```text
+PlayerWarp.NativeDispatch (exact eboot)  0x0154EC50
+original bytes                          55 48 89 E5 41 57 41 56
+                                        41 55 41 54 53 48 81 EC
+arguments                               position*, orientation*,
+                                        camera_orientation*, packed_map*
+```
+
+For a same-map summon this performs zero artificial reloads. For a cross-map
+summon, the existing forced-summon path still performs at most one reload; once
+the target map is current, the dispatcher applies the exact final transform
+without requesting a second reload. Completion requires the readback to match
+the packed map, position within 1.5 game units, and heading within 0.15 radians.
+The log sequence is `TargetPlacementApplied`, optionally one deduplicated
+`TargetPlacementVerificationPending`, `TargetPlacementVerified`, and
+`Complete placement_verified=true`.
+
+The exact profile also enables the already byte-validated SpEffect lookup at
+`0x01F28D20`. Seamless cooperator rows `9005/9006` and invader rows
+`9025/9026` use the verified `maxHpRate` field at row offset `+0x10`; only the
+vanilla `0.7` value is changed to `1.0`. Traditional mode remains untouched.
+The build does not guess a current-HP address or write HP every frame. It lets
+the game's native recalculation own current-HP ratio preservation and logs
+`current_hp_write=false ratio_preservation=game_owned`; runtime comparison is
+still required to confirm the displayed HP behavior.
+
+The guest's gameplay phantom/specter state remains instrumentation-only in this
+build. Interaction and NPC records now include the local presence of effects
+`9001`, `9005`, `9006`, `9025`, and `9026`, while unknown NPC ownership,
+authority, team, and phantom-presentation fields remain explicitly
+`unresolved`. No network role, faction, team, NPC locality, material, or
+SpEffect is changed. The Izuku/Hiryu runtime capture must identify the exact
+presentation and authority branch before any scoped visual/gameplay correction
+is attempted.

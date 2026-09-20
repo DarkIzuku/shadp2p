@@ -331,14 +331,7 @@ PendingCrossMapSummonDecision PendingCrossMapSummonStateMachine::Evaluate(u32 cu
     }
     if (targetMap != m_pending.targetMap)
         return PendingCrossMapSummonDecision::StaleTarget;
-    if (currentMap == targetMap) {
-        m_pending.phase = m_pending.reloadCount == 0 ? PendingCrossMapSummonPhase::Complete
-                                                     : PendingCrossMapSummonPhase::WorldReady;
-        return PendingCrossMapSummonDecision::SameMap;
-    }
     m_pending.sourceMap = currentMap;
-    if (m_pending.reloadCount != 0 || m_pending.commitIssued)
-        return PendingCrossMapSummonDecision::DuplicateReload;
     if (!m_pending.placementReady)
         return PendingCrossMapSummonDecision::WaitForPlacement;
     if (!m_pending.claimAccepted)
@@ -347,9 +340,54 @@ PendingCrossMapSummonDecision PendingCrossMapSummonStateMachine::Evaluate(u32 cu
         return PendingCrossMapSummonDecision::WaitForRoom;
     if (!m_pending.signalingEstablished)
         return PendingCrossMapSummonDecision::WaitForSignaling;
+    if (currentMap == targetMap) {
+        if (!m_pending.placementApplied) {
+            m_pending.phase = PendingCrossMapSummonPhase::CrossMapCommit;
+            RefreshDeadline(nowMs);
+            return PendingCrossMapSummonDecision::ApplyPlacement;
+        }
+        if (!m_pending.placementVerified)
+            return PendingCrossMapSummonDecision::VerifyPlacement;
+        m_pending.phase = PendingCrossMapSummonPhase::WorldReady;
+        return PendingCrossMapSummonDecision::PlacementComplete;
+    }
+    if (m_pending.reloadCount != 0 || m_pending.commitIssued)
+        return PendingCrossMapSummonDecision::DuplicateReload;
     m_pending.phase = PendingCrossMapSummonPhase::CrossMapCommit;
     RefreshDeadline(nowMs);
     return PendingCrossMapSummonDecision::Commit;
+}
+
+bool PendingCrossMapSummonStateMachine::BeginPlacementApply(u64 generation) {
+    if (!m_enabled || !MatchesGeneration(generation) || m_pending.placementApplied ||
+        m_pending.phase != PendingCrossMapSummonPhase::CrossMapCommit) {
+        return false;
+    }
+    m_pending.commitIssued = true;
+    m_pending.placementApplied = true;
+    return true;
+}
+
+bool PendingCrossMapSummonStateMachine::MarkPlacementVerified(u32 currentMap, u64 generation) {
+    if (!MatchesGeneration(generation) || !m_pending.placementApplied ||
+        currentMap != m_pending.targetMap ||
+        (m_pending.phase != PendingCrossMapSummonPhase::CrossMapCommit &&
+         m_pending.phase != PendingCrossMapSummonPhase::ReloadStarted &&
+         m_pending.phase != PendingCrossMapSummonPhase::WorldReady)) {
+        return false;
+    }
+    m_pending.placementVerified = true;
+    m_pending.phase = PendingCrossMapSummonPhase::WorldReady;
+    return true;
+}
+
+bool PendingCrossMapSummonStateMachine::MarkPlacementFailed(u64 generation) {
+    if (!MatchesGeneration(generation) || m_pending.placementVerified ||
+        m_pending.phase != PendingCrossMapSummonPhase::CrossMapCommit) {
+        return false;
+    }
+    m_pending.phase = PendingCrossMapSummonPhase::Failed;
+    return true;
 }
 
 bool PendingCrossMapSummonStateMachine::BeginCommit(u64 generation) {
@@ -399,7 +437,7 @@ bool PendingCrossMapSummonStateMachine::MarkWorldReady(u32 currentMap, u64 gener
 }
 
 bool PendingCrossMapSummonStateMachine::MarkRemoteInserted(u64 generation) {
-    if (!MatchesGeneration(generation) ||
+    if (!MatchesGeneration(generation) || !m_pending.placementVerified ||
         (m_pending.phase != PendingCrossMapSummonPhase::WorldReady &&
          m_pending.phase != PendingCrossMapSummonPhase::ReloadStarted)) {
         return false;

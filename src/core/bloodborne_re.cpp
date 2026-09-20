@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -18,6 +19,7 @@
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <numbers>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -25,6 +27,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <openssl/sha.h>
 
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
@@ -34,11 +38,15 @@
 #include "core/cpu_patches.h"
 #include "core/debugger.h"
 #include "core/file_format/psf.h"
+#include "core/file_sys/fs.h"
 #include "core/libraries/np/np_matching2/np_matching2_mm.h"
 #include "core/memory.h"
 #include "shadnet/client.h"
 
 namespace Core::Bloodborne {
+
+bool MatchesEstablishedTravelBytes(u64 offset, std::span<const u8> expected);
+
 namespace {
 
 enum class TraceKind : u8 {
@@ -720,6 +728,7 @@ struct InitialSeamlessProfile {
     u64 cross_map_guest_handoff;
     u64 healing_fountain_availability;
     NativeCallSignature sp_effect_param_lookup;
+    NativeCallSignature local_placement_dispatch;
     std::array<NativeCallSignature, 9> native_calls;
 };
 
@@ -755,6 +764,7 @@ constexpr InitialSeamlessProfile InitialSeamlessProfiles[] = {
      CrossMapGuestHandoffOffset,
      HealingFountainAvailabilityOffset,
      {"SpEffectParam.Lookup", 0, {}, 0},
+     {"PlayerWarp.NativeDispatch", 0x0154EA30, StandardR15Prologue, 6},
      CrossMapNativeCalls},
     {"cusa03173-109-user-eboot-6764938b",
      0x05556648,
@@ -790,6 +800,11 @@ constexpr InitialSeamlessProfile InitialSeamlessProfiles[] = {
       0x01F28D20,
       {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x44, 0x89, 0xE6},
       14},
+     {"PlayerWarp.NativeDispatch",
+      0x0154EC50,
+      {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81,
+       0xEC},
+      16},
      {{{"SetForcedSummonMap",
         0x0156D130,
         {0x48, 0x8B, 0x05, 0x11, 0x95, 0xFE, 0x03, 0x8B, 0x0F, 0x89, 0x88, 0xF0, 0x14, 0x00, 0x00,
@@ -1607,6 +1622,7 @@ u64 pending_evaluation_logged_generation{};
 u32 pending_evaluation_logged_bits{std::numeric_limits<u32>::max()};
 PendingCrossMapSummonDecision pending_evaluation_logged_decision{
     PendingCrossMapSummonDecision::None};
+u64 placement_verification_pending_logged_generation{};
 std::atomic<u32> pending_summon_reload_map{};
 std::atomic<u32> pending_summon_reload_state_map{};
 
@@ -2484,7 +2500,8 @@ void ApplySeamlessGuestParamPolicy() {
                      "requested_max_hp=unavailable final_max_hp=unavailable "
                      "vanilla_max_hp_rate={} requested_max_hp_rate={} "
                      "final_max_hp_rate={} "
-                     "effect={} state_info={} source=SpEffectParam result=applied",
+                     "effect={} state_info={} source=SpEffectParam "
+                     "current_hp_write=false ratio_preservation=game_owned result=applied",
                      initial_seamless_profile->name, effect.roleName,
                      effect.role == SeamlessPeerRole::Invader ? 2 : 0, VanillaGuestMaxHpRate,
                      policy->maxHpRate, ReadValue<float>(row, MaxHpRateOffset),
@@ -2511,6 +2528,22 @@ void ApplySeamlessGuestParamPolicy() {
                      policy->activeEffectId, policy->stateInfo);
         }
     }
+}
+
+std::string MountedEbootSha256() {
+    const auto bytes =
+        Common::Singleton<Core::FileSys::MntPoints>::Instance()->ReadFile("/app0/eboot.bin");
+    if (!bytes.has_value() || bytes->empty())
+        return "unavailable";
+
+    std::array<u8, SHA256_DIGEST_LENGTH> digest{};
+    if (::SHA256(bytes->data(), bytes->size(), digest.data()) == nullptr)
+        return "unavailable";
+    std::string value = BytesToHex(digest);
+    std::ranges::transform(value, value.begin(), [](unsigned char character) {
+        return static_cast<char>(std::toupper(character));
+    });
+    return value;
 }
 
 bool WriteTransportedSummonPlacement(u64 state, const SummonPlacementDescriptor& placement) {
@@ -3086,7 +3119,9 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot* registers) {
                                (static_cast<u32>(snapshot.roomJoined) << 2) |
                                (static_cast<u32>(snapshot.signalingEstablished) << 3) |
                                (static_cast<u32>(record.current_map == record.received_map) << 4) |
-                               (static_cast<u32>(snapshot.commitIssued) << 5);
+                               (static_cast<u32>(snapshot.commitIssued) << 5) |
+                               (static_cast<u32>(snapshot.placementApplied) << 6) |
+                               (static_cast<u32>(snapshot.placementVerified) << 7);
         if (pending_evaluation_logged_generation != summon_generation ||
             pending_evaluation_logged_bits != state_bits ||
             pending_evaluation_logged_decision != handoff_decision) {
@@ -3102,8 +3137,13 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot* registers) {
                     ? "waiting_for_room"
                 : handoff_decision == PendingCrossMapSummonDecision::WaitForSignaling
                     ? "waiting_for_signaling"
+                : handoff_decision == PendingCrossMapSummonDecision::ApplyPlacement
+                    ? "ready_to_apply_target_placement"
+                : handoff_decision == PendingCrossMapSummonDecision::VerifyPlacement
+                    ? "waiting_for_target_placement_verification"
+                : handoff_decision == PendingCrossMapSummonDecision::PlacementComplete
+                    ? "target_placement_verified"
                 : handoff_decision == PendingCrossMapSummonDecision::Commit  ? "ready_to_commit"
-                : handoff_decision == PendingCrossMapSummonDecision::SameMap ? "same_map_no_reload"
                 : handoff_decision == PendingCrossMapSummonDecision::DuplicateReload
                     ? "already_committed"
                 : handoff_decision == PendingCrossMapSummonDecision::TimedOut    ? "timeout"
@@ -3113,26 +3153,144 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot* registers) {
                      "[BLOODBORNE SEAMLESS SUMMON] generation={} "
                      "state=PendingStateEvaluation placement={} claim={} room={} "
                      "signaling={} "
-                     "world_ready={} committed={} native_handoff={} reason={}",
+                     "world_ready={} committed={} placement_applied={} "
+                     "placement_verified={} native_handoff={} reason={}",
                      summon_generation, snapshot.placementReady, snapshot.claimAccepted,
                      snapshot.roomJoined, snapshot.signalingEstablished,
                      record.current_map == record.received_map, snapshot.commitIssued,
+                     snapshot.placementApplied, snapshot.placementVerified,
                      snapshot.nativeHandoffObserved, reason);
         }
     }
-    if (handoff_decision == PendingCrossMapSummonDecision::SameMap) {
-        record.result = "same_map";
-        bool completed_cross_map = false;
+    if (handoff_decision == PendingCrossMapSummonDecision::ApplyPlacement) {
+        if (initial_seamless_profile == nullptr) {
+            {
+                std::scoped_lock lock{seamless_placement_mutex};
+                pending_cross_map_summon.MarkPlacementFailed(summon_generation);
+            }
+            record.result = "local_placement_profile_missing";
+            LOG_ERROR(Debug,
+                      "[BLOODBORNE SEAMLESS SUMMON] generation={} state=Failed "
+                      "reason=local_placement_profile_missing",
+                      summon_generation);
+            return;
+        }
+        const auto& dispatch_site = initial_seamless_profile->local_placement_dispatch;
+        const auto expected =
+            std::span<const u8>{dispatch_site.prologue.data(), dispatch_site.prologue_size};
+        if (!MatchesEstablishedTravelBytes(dispatch_site.offset, expected)) {
+            {
+                std::scoped_lock lock{seamless_placement_mutex};
+                pending_cross_map_summon.MarkPlacementFailed(summon_generation);
+            }
+            record.result = "local_placement_signature_mismatch";
+            LOG_ERROR(Debug,
+                      "[BLOODBORNE SEAMLESS SUMMON] generation={} state=Failed "
+                      "reason=local_placement_signature_mismatch eboot_offset={:#x} "
+                      "expected={} observed={}",
+                      summon_generation, dispatch_site.offset, BytesToHex(expected),
+                      ReadDiagnosticBytes(image_base, MemoryPatcher::g_eboot_image_size,
+                                          dispatch_site.offset, expected.size()));
+            return;
+        }
         {
             std::scoped_lock lock{seamless_placement_mutex};
-            const auto snapshot = pending_cross_map_summon.Snapshot();
-            completed_cross_map = snapshot.reloadCount == 1;
-            seamless_received_host_placement_consumed = true;
-            if (completed_cross_map) {
-                pending_cross_map_summon.MarkRemoteInserted(summon_generation);
+            if (!pending_cross_map_summon.BeginPlacementApply(summon_generation)) {
+                record.result = "duplicate_placement_suppressed";
+                return;
             }
         }
-        if (completed_cross_map) {
+
+        const std::array<float, 4> position{transported_host->x, transported_host->y,
+                                            transported_host->z, 1.0F};
+        const std::array<float, 4> orientation{0.0F, transported_host->heading, 0.0F, 0.0F};
+        const std::array<float, 4> camera_orientation = orientation;
+        const u32 target_map = transported_host->packed_region;
+        using PlayerWarpDispatch =
+            void PS4_SYSV_ABI (*)(const void*, const void*, const void*, const void*);
+        const auto apply_local_placement =
+            reinterpret_cast<PlayerWarpDispatch>(image_base + dispatch_site.offset);
+        apply_local_placement(position.data(), orientation.data(), camera_orientation.data(),
+                              &target_map);
+        record.result = "target_placement_applied";
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS SUMMON] generation={} "
+                 "state=TargetPlacementApplied map={:#x} position=[{},{},{}] "
+                 "orientation={} source=PlayerWarp.NativeDispatch reloads={}",
+                 summon_generation, target_map, transported_host->x, transported_host->y,
+                 transported_host->z, transported_host->heading, pending_snapshot.reloadCount);
+        handoff_decision = PendingCrossMapSummonDecision::VerifyPlacement;
+    }
+    if (handoff_decision == PendingCrossMapSummonDecision::VerifyPlacement) {
+        SummonPlacementDescriptor observed{};
+        std::string_view observed_result;
+        if (!ReadLocalSummonPlacement(observed, observed_result)) {
+            record.result = "waiting_for_target_placement_readback";
+            return;
+        }
+        const float dx = observed.x - transported_host->x;
+        const float dy = observed.y - transported_host->y;
+        const float dz = observed.z - transported_host->z;
+        const float position_delta = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const float heading_delta = std::abs(std::remainder(
+            observed.heading - transported_host->heading, 2.0F * std::numbers::pi_v<float>));
+        constexpr float PositionTolerance = 1.5F;
+        constexpr float HeadingTolerance = 0.15F;
+        if (observed.packed_region != transported_host->packed_region ||
+            position_delta > PositionTolerance || heading_delta > HeadingTolerance) {
+            record.result = "waiting_for_target_placement_verification";
+            bool should_log = false;
+            {
+                std::scoped_lock lock{seamless_placement_mutex};
+                if (placement_verification_pending_logged_generation != summon_generation) {
+                    placement_verification_pending_logged_generation = summon_generation;
+                    should_log = true;
+                }
+            }
+            if (should_log) {
+                LOG_INFO(Debug,
+                         "[BLOODBORNE SEAMLESS SUMMON] generation={} "
+                         "state=TargetPlacementVerificationPending target_map={:#x} "
+                         "observed_map={:#x} target_position=[{},{},{}] "
+                         "observed_position=[{},{},{}] position_delta={} "
+                         "target_orientation={} observed_orientation={} "
+                         "orientation_delta={}",
+                         summon_generation, transported_host->packed_region, observed.packed_region,
+                         transported_host->x, transported_host->y, transported_host->z, observed.x,
+                         observed.y, observed.z, position_delta, transported_host->heading,
+                         observed.heading, heading_delta);
+            }
+            return;
+        }
+        {
+            std::scoped_lock lock{seamless_placement_mutex};
+            if (!pending_cross_map_summon.MarkPlacementVerified(observed.packed_region,
+                                                                summon_generation)) {
+                record.result = "placement_verification_rejected";
+                return;
+            }
+        }
+        record.result = "target_placement_verified";
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS SUMMON] generation={} "
+                 "state=TargetPlacementVerified map={:#x} position=[{},{},{}] "
+                 "orientation={} position_delta={} orientation_delta={}",
+                 summon_generation, observed.packed_region, observed.x, observed.y, observed.z,
+                 observed.heading, position_delta, heading_delta);
+        handoff_decision = PendingCrossMapSummonDecision::PlacementComplete;
+    }
+    if (handoff_decision == PendingCrossMapSummonDecision::PlacementComplete) {
+        u32 reload_count = 0;
+        {
+            std::scoped_lock lock{seamless_placement_mutex};
+            reload_count = pending_cross_map_summon.Snapshot().reloadCount;
+            seamless_received_host_placement_consumed = true;
+            if (!pending_cross_map_summon.MarkRemoteInserted(summon_generation)) {
+                record.result = "remote_insert_completion_rejected";
+                return;
+            }
+        }
+        record.result = "complete";
             LOG_INFO(Debug,
                      "[BLOODBORNE SEAMLESS SUMMON] generation={} state=WorldReady "
                      "target_map={:#x}",
@@ -3141,14 +3299,10 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot* registers) {
                      "[BLOODBORNE SEAMLESS SUMMON] generation={} state=RemoteInserted "
                      "target_map={:#x}",
                      summon_generation, record.received_map);
-            LOG_INFO(Debug, "[BLOODBORNE SEAMLESS SUMMON] generation={} state=Complete reloads=1",
-                     summon_generation);
-        } else {
             LOG_INFO(Debug,
-                     "[BLOODBORNE SEAMLESS SUMMON] generation={} state=Complete "
-                     "reloads=0 reason=same_map",
-                     summon_generation);
-        }
+                 "[BLOODBORNE SEAMLESS SUMMON] generation={} state=Complete reloads={} "
+                 "placement_verified=true",
+                 summon_generation, reload_count);
         return;
     }
     if (handoff_decision == PendingCrossMapSummonDecision::DuplicateReload) {
@@ -3868,6 +4022,11 @@ struct HunterDreamInteractionRuntimeContext {
     bool signalingEstablished{};
     bool inHuntersDream{};
     bool transformValid{};
+    bool hostEffect9001{};
+    bool cooperatorBellEffect9005{};
+    bool cooperatorActiveEffect9006{};
+    bool invaderBellEffect9025{};
+    bool invaderActiveEffect9026{};
     SummonPlacementDescriptor placement{};
 };
 
@@ -3886,12 +4045,17 @@ HunterDreamInteractionRuntimeContext BuildHunterDreamInteractionContext() {
     context.signalingEstablished = context.matching.inRoom && context.multiPlayState == 6;
 
     const u64 player = GetLocalPlayer();
-    const bool host_effect = HasPlayerEffect(player, 9001);
-    const bool cooperator_effect = HasPlayerEffect(player, 9005) || HasPlayerEffect(player, 9006);
-    const bool invader_effect = HasPlayerEffect(player, 9025) || HasPlayerEffect(player, 9026);
-    context.snapshot.role =
-        ClassifyHunterDreamInteractionRole(context.matching.inRoom, context.matching.roomOwner,
-                                           host_effect, cooperator_effect, invader_effect);
+    context.hostEffect9001 = HasPlayerEffect(player, 9001);
+    context.cooperatorBellEffect9005 = HasPlayerEffect(player, 9005);
+    context.cooperatorActiveEffect9006 = HasPlayerEffect(player, 9006);
+    context.invaderBellEffect9025 = HasPlayerEffect(player, 9025);
+    context.invaderActiveEffect9026 = HasPlayerEffect(player, 9026);
+    const bool cooperator_effect =
+        context.cooperatorBellEffect9005 || context.cooperatorActiveEffect9006;
+    const bool invader_effect = context.invaderBellEffect9025 || context.invaderActiveEffect9026;
+    context.snapshot.role = ClassifyHunterDreamInteractionRole(
+        context.matching.inRoom, context.matching.roomOwner, context.hostEffect9001,
+        cooperator_effect, invader_effect);
 
     {
         std::scoped_lock lock{established_travel_mutex};
@@ -4193,6 +4357,11 @@ void EmitHunterDreamInteractionTrace(const HunterDreamInteractionTraceSite& site
         << " signaling=" << context.signalingEstablished
         << " csmultiplay_state=" << context.multiPlayState
         << " multiplayer_active=" << context.matching.inRoom
+        << " host_effect_9001=" << context.hostEffect9001
+        << " coop_bell_effect_9005=" << context.cooperatorBellEffect9005
+        << " coop_active_effect_9006=" << context.cooperatorActiveEffect9006
+        << " invader_bell_effect_9025=" << context.invaderBellEffect9025
+        << " invader_active_effect_9026=" << context.invaderActiveEffect9026
         << " travel_state=" << static_cast<u32>(context.travelState)
         << " gates=" << static_cast<u32>(snapshot.gates[0]) << ','
         << static_cast<u32>(snapshot.gates[1]) << ',' << static_cast<u32>(snapshot.gates[2]) << ','
@@ -4248,13 +4417,17 @@ void EmitHunterDreamInteractionTrace(const HunterDreamInteractionTraceSite& site
                  "[BLOODBORNE SEAMLESS NPC] state=InteractionCandidate service={} "
                  "entity={} "
                  "actor_role={} map={:#x} area_region_id={} action_button={} prompt={} "
-                 "network_authority=unavailable remote=unavailable phantom=unavailable "
+                 "network_authority=unresolved remote=unresolved phantom=unresolved "
                  "npc_param=unavailable team=unavailable speffects=unavailable "
-                 "talk_enabled=unavailable result={} "
+                 "local_host_effect_9001={} local_coop_effect_9005={} "
+                 "local_coop_effect_9006={} local_invader_effect_9025={} "
+                 "local_invader_effect_9026={} talk_enabled=unavailable result={} "
                  "source=event_or_interaction_observer",
                  HunterDreamServiceName(snapshot), snapshot.entityId,
                  InteractionRoleName(snapshot.role), snapshot.map, snapshot.areaRegion,
-                 snapshot.actionButtonId, snapshot.promptId, result);
+                 snapshot.actionButtonId, snapshot.promptId, context.hostEffect9001,
+                 context.cooperatorBellEffect9005, context.cooperatorActiveEffect9006,
+                 context.invaderBellEffect9025, context.invaderActiveEffect9026, result);
     }
 }
 
@@ -7905,23 +8078,91 @@ bool MatchesInitialSeamlessFingerprint(std::string_view profileName) {
     });
 }
 
-const EstablishedTravelProfile* SelectEstablishedTravelProfile() {
+bool LogProfileSignature(std::string_view profile, std::string_view site, u64 offset,
+                         std::span<const u8> expected,
+                         std::span<const u8> accepted_alternative = {}) {
+    const bool primary_match = MatchesEstablishedTravelBytes(offset, expected);
+    const bool alternative_match = !accepted_alternative.empty() &&
+                                   MatchesEstablishedTravelBytes(offset, accepted_alternative);
+    LOG_INFO(
+        Debug,
+        "[BLOODBORNE EBOOT PROFILE] profile={} site={} eboot_offset={:#x} "
+        "expected={} alternative={} observed={} result={}",
+        profile, site, offset, BytesToHex(expected),
+        accepted_alternative.empty() ? "none" : BytesToHex(accepted_alternative),
+        ReadDiagnosticBytes(image_base, MemoryPatcher::g_eboot_image_size, offset, expected.size()),
+        primary_match ? "matched" : (alternative_match ? "matched_alternative" : "mismatch"));
+    return primary_match || alternative_match;
+}
+
+bool ValidateEstablishedTravelProfile(const EstablishedTravelProfile& profile) {
     const auto standard_r15 = std::span<const u8>{StandardR15Prologue.data(), 6};
-    const EstablishedTravelProfile* generic_match = nullptr;
-    for (const auto& profile : EstablishedTravelProfiles) {
-        if (MatchesEstablishedTravelBytes(profile.warp_param, standard_r15) &&
-            MatchesEstablishedTravelBytes(profile.stage_transition, standard_r15) &&
-            MatchesEstablishedTravelBytes(profile.periodic_tick, standard_r15) &&
-            MatchesEstablishedTravelBytes(profile.stage_stop_call, profile.stage_stop_expected) &&
-            MatchesEstablishedTravelBytes(profile.matching_check_stop_call,
-                                          profile.matching_check_stop_expected)) {
-            if (MatchesInitialSeamlessFingerprint(profile.name))
-                return &profile;
-            if (generic_match == nullptr)
-                generic_match = &profile;
-        }
+    const bool warp =
+        LogProfileSignature(profile.name, "WarpParam", profile.warp_param, standard_r15);
+    const bool transition = LogProfileSignature(profile.name, "StageTransition",
+                                                profile.stage_transition, standard_r15);
+    const bool periodic =
+        LogProfileSignature(profile.name, "PeriodicTick", profile.periodic_tick, standard_r15);
+    const bool stage_stop =
+        LogProfileSignature(profile.name, "StageTransition.StopCall", profile.stage_stop_call,
+                            profile.stage_stop_expected, profile.stage_keep_expected);
+    const bool matching_stop =
+        LogProfileSignature(profile.name, "OnMatchingCheck.StopCall",
+                            profile.matching_check_stop_call, profile.matching_check_stop_expected);
+    return warp && transition && periodic && stage_stop && matching_stop;
+}
+
+const EstablishedTravelProfile* SelectEstablishedTravelProfile(std::string_view eboot_sha256) {
+    if (established_travel_profile != nullptr)
+        return established_travel_profile;
+
+    // Prefer the exact user layout. The previous selector required every unrelated
+    // native helper to retain its pristine bytes; one independently patched helper
+    // therefore mislabeled the verified eboot as the generic reference layout. The
+    // five core sites below identify the layout, while every hook/write still
+    // validates its own complete signature immediately before installation.
+    const auto exact = std::ranges::find_if(EstablishedTravelProfiles, [](const auto& profile) {
+        return profile.name == "cusa03173-109-user-eboot-6764938b";
+    });
+    const bool exact_hash = IsExpectedBloodborneEbootSha256(eboot_sha256);
+    const bool exact_core = exact != std::end(EstablishedTravelProfiles) &&
+                            ValidateEstablishedTravelProfile(*exact);
+    if (exact != std::end(EstablishedTravelProfiles) &&
+        ShouldSelectExactBloodborneProfile(exact_hash, exact_core)) {
+        LOG_INFO(Debug,
+                 "[BLOODBORNE EBOOT PROFILE] profile={} result=selected "
+                 "selection=sha256_and_core_signatures initial_fingerprint={}",
+                 exact->name, MatchesInitialSeamlessFingerprint(exact->name));
+        return &*exact;
     }
-    return generic_match;
+    if (exact_hash) {
+        LOG_ERROR(Debug,
+                  "[BLOODBORNE EBOOT PROFILE] profile={} result=rejected "
+                  "selection=core_signature_mismatch actual_sha256={} expected_sha256={}",
+                  exact != std::end(EstablishedTravelProfiles) ? exact->name : "unavailable",
+                  eboot_sha256, HunterDreamInteractionEbootSha256);
+        return nullptr;
+    }
+    if (!exact_hash) {
+        LOG_ERROR(Debug,
+                  "[BLOODBORNE EBOOT PROFILE] profile={} result=rejected "
+                  "selection=exact_hash_mismatch actual_sha256={} expected_sha256={}",
+                  exact != std::end(EstablishedTravelProfiles) ? exact->name : "unavailable",
+                  eboot_sha256, HunterDreamInteractionEbootSha256);
+    }
+
+    const auto reference = std::ranges::find_if(EstablishedTravelProfiles, [](const auto& profile) {
+        return profile.name == "cusa03173-109-reference";
+    });
+    if (reference != std::end(EstablishedTravelProfiles) &&
+        ValidateEstablishedTravelProfile(*reference)) {
+        LOG_WARNING(Debug,
+                    "[BLOODBORNE EBOOT PROFILE] profile={} result=selected "
+                    "selection=reference_fallback exact_profile_matched=false",
+                    reference->name);
+        return &*reference;
+    }
+    return nullptr;
 }
 
 void SelectEstablishedTravelRuntimeLayout(const EstablishedTravelProfile& profile) {
@@ -7998,14 +8239,16 @@ bool InstallEstablishedTravelHooks(const EstablishedTravelProfile& profile) {
     return true;
 }
 
-void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile) {
+void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
+                                        std::string_view eboot_sha256) {
     if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_INTERACT_TRACE"))
         return;
     if (profile.name != "cusa03173-109-user-eboot-6764938b") {
         LOG_ERROR(Debug,
                   "[BLOODBORNE SEAMLESS INTERACT STATE] enabled=false profile={} "
-                  "reason=exact_user_eboot_profile_required expected_sha256={}",
-                  profile.name, HunterDreamInteractionEbootSha256);
+                  "reason=exact_user_eboot_profile_required actual_sha256={} "
+                  "expected_sha256={}",
+                  profile.name, eboot_sha256, HunterDreamInteractionEbootSha256);
         return;
     }
 
@@ -8028,9 +8271,12 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile)
             ++installed_count;
             LOG_INFO(Debug,
                      "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} eboot_offset={:#x} "
-                     "original_bytes={} result=reused_seamless_observer",
+                     "expected_bytes={} observed_bytes={} "
+                     "result=reused_seamless_observer",
                      site.name, site.offset,
-                     BytesToHex(std::span<const u8>{site.expected.data(), site.expectedSize}));
+                     BytesToHex(std::span<const u8>{site.expected.data(), site.expectedSize}),
+                     ReadDiagnosticBytes(image_base, MemoryPatcher::g_eboot_image_size, site.offset,
+                                         site.expectedSize));
             continue;
         }
         if (site.hook == HunterDreamInteractionHook::WarpParam &&
@@ -8039,39 +8285,47 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile)
             ++installed_count;
             LOG_INFO(Debug,
                      "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} eboot_offset={:#x} "
-                     "original_bytes={} result=reused_established_travel_observer",
+                     "expected_bytes={} observed_bytes={} "
+                     "result=reused_established_travel_observer",
                      site.name, site.offset,
-                     BytesToHex(std::span<const u8>{site.expected.data(), site.expectedSize}));
+                     BytesToHex(std::span<const u8>{site.expected.data(), site.expectedSize}),
+                     ReadDiagnosticBytes(image_base, MemoryPatcher::g_eboot_image_size, site.offset,
+                                         site.expectedSize));
             continue;
         }
 
         const auto expected = std::span<const u8>{site.expected.data(), site.expectedSize};
-        if (!MatchesEstablishedTravelBytes(site.offset, expected)) {
+        const std::string observed = ReadDiagnosticBytes(
+            image_base, MemoryPatcher::g_eboot_image_size, site.offset, expected.size());
+        if (!ShouldInstallBloodborneVerifiedHook(
+                profile.name == "cusa03173-109-user-eboot-6764938b",
+                MatchesEstablishedTravelBytes(site.offset, expected))) {
             LOG_ERROR(Debug,
                       "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} eboot_offset={:#x} "
-                      "expected_bytes={} result=signature_mismatch_not_installed",
-                      site.name, site.offset, BytesToHex(expected));
+                      "expected_bytes={} observed_bytes={} "
+                      "result=signature_mismatch_not_installed",
+                      site.name, site.offset, BytesToHex(expected), observed);
             continue;
         }
         if (!InstallGuestCodeHook(reinterpret_cast<void*>(image_base + site.offset), expected,
                                   index, HunterDreamInteractionTraceEntry)) {
             LOG_ERROR(Debug,
                       "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} eboot_offset={:#x} "
-                      "original_bytes={} result=observer_install_failed",
-                      site.name, site.offset, BytesToHex(expected));
+                      "expected_bytes={} observed_bytes={} result=observer_install_failed",
+                      site.name, site.offset, BytesToHex(expected), observed);
             continue;
         }
         hunter_dream_interaction_trace_hook_installed[index] = true;
         ++installed_count;
         LOG_INFO(Debug,
                  "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} eboot_offset={:#x} "
-                 "original_bytes={} result=read_only_observer_installed",
-                 site.name, site.offset, BytesToHex(expected));
+                 "expected_bytes={} observed_bytes={} result=read_only_observer_installed",
+                 site.name, site.offset, BytesToHex(expected), observed);
     }
     LOG_INFO(Debug,
              "[BLOODBORNE SEAMLESS INTERACT STATE] enabled=true verbose={} profile={} "
-             "expected_sha256={} hooks={}/{} behavior_changes=false",
-             hunter_dream_interaction_trace_verbose, profile.name,
+             "actual_sha256={} expected_sha256={} hooks={}/{} behavior_changes=false",
+             hunter_dream_interaction_trace_verbose, profile.name, eboot_sha256,
              HunterDreamInteractionEbootSha256, installed_count,
              HunterDreamInteractionTraceSites.size());
 }
@@ -8101,19 +8355,29 @@ void InstallSeamlessCoopPatches() {
     }
 
     image_base = MemoryPatcher::g_eboot_address;
-    const auto* profile = SelectEstablishedTravelProfile();
+    const std::string eboot_sha256 = MountedEbootSha256();
+    const auto* profile = SelectEstablishedTravelProfile(eboot_sha256);
     if (profile == nullptr) {
+        LOG_ERROR(Debug,
+                  "[BLOODBORNE EBOOT PROFILE] title=CUSA03173 app={} actual_sha256={} "
+                  "expected_sha256={} profile=none validation=core_signature_mismatch",
+                  app_version, eboot_sha256, HunterDreamInteractionEbootSha256);
         LOG_ERROR(Debug, "Bloodborne established travel disabled: no exact byte-verified 01.09 "
                          "profile matched");
         return;
     }
+    LOG_INFO(Debug,
+             "[BLOODBORNE EBOOT PROFILE] title=CUSA03173 app={} actual_sha256={} "
+             "expected_sha256={} hash_match={} profile={} validation=core_signatures_matched",
+             app_version, eboot_sha256, HunterDreamInteractionEbootSha256,
+             IsExpectedBloodborneEbootSha256(eboot_sha256), profile->name);
     SelectEstablishedTravelRuntimeLayout(*profile);
 
     const auto* initial_profile = FindInitialSeamlessProfile(profile->name);
     if (initial_profile != nullptr)
         SelectInitialSeamlessRuntimeLayout(*initial_profile);
     if (!seamless_enabled) {
-        InstallHunterDreamInteractionTrace(*profile);
+        InstallHunterDreamInteractionTrace(*profile, eboot_sha256);
         return;
     }
     if (initial_profile == nullptr) {
@@ -8134,7 +8398,7 @@ void InstallSeamlessCoopPatches() {
     Libraries::Np::NpMatching2::SetSeamlessControlHandlers(OnEstablishedTravelNotification,
                                                            OnEstablishedTravelReply);
     const bool hooks_ready = InstallEstablishedTravelHooks(*profile);
-    InstallHunterDreamInteractionTrace(*profile);
+    InstallHunterDreamInteractionTrace(*profile, eboot_sha256);
     {
         std::scoped_lock lock{established_travel_mutex};
         established_travel_state.SetEnabled(hooks_ready);

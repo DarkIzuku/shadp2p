@@ -207,7 +207,9 @@ enum class PendingCrossMapSummonDecision : u32 {
     WaitForClaim,
     WaitForRoom,
     WaitForSignaling,
-    SameMap,
+    ApplyPlacement,
+    VerifyPlacement,
+    PlacementComplete,
     Commit,
     DuplicateReload,
     StaleTarget,
@@ -223,6 +225,8 @@ struct PendingCrossMapSummonSnapshot {
     u32 targetMap = 0;
     u32 reloadCount = 0;
     bool placementReady = false;
+    bool placementApplied = false;
+    bool placementVerified = false;
     bool commitIssued = false;
     bool nativeHandoffObserved = false;
     bool claimAccepted = false;
@@ -252,6 +256,9 @@ public:
     PendingCrossMapSummonDecision Evaluate(u32 currentMap, u32 targetMap, s64 nowMs);
     bool BeginCommit(u64 generation);
     bool MarkCommitFailed(u64 generation);
+    bool BeginPlacementApply(u64 generation);
+    bool MarkPlacementVerified(u32 currentMap, u64 generation);
+    bool MarkPlacementFailed(u64 generation);
     bool MarkReloadStarted(u64 generation);
     bool MarkReloadFailed(u64 generation);
     bool MarkWorldReady(u32 currentMap, u64 generation);
@@ -277,6 +284,18 @@ private:
 };
 
 bool IsSeamlessGuestParamProfileSupported(std::string_view profileName);
+
+constexpr bool IsExpectedBloodborneEbootSha256(std::string_view sha256) {
+    return sha256 == "6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80";
+}
+
+constexpr bool ShouldSelectExactBloodborneProfile(bool hashMatched, bool coreSignaturesMatched) {
+    return hashMatched && coreSignaturesMatched;
+}
+
+constexpr bool ShouldInstallBloodborneVerifiedHook(bool exactProfile, bool signatureMatched) {
+    return exactProfile && signatureMatched;
+}
 
 enum class SeamlessTravelPhase : u32 {
     TravelBegin = 1,
