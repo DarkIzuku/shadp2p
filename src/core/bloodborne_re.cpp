@@ -1572,6 +1572,16 @@ std::array<bool, HunterDreamInteractionTraceSites.size()>
     hunter_dream_interaction_trace_hook_installed{};
 std::array<u64, HunterDreamInteractionTraceSites.size()>
     hunter_dream_interaction_trace_runtime_offsets{};
+std::array<std::atomic<u64>, HunterDreamInteractionTraceSites.size()>
+    hunter_dream_interaction_raw_hits{};
+
+constexpr size_t MaxHunterDreamEventDispatcherProbeCandidates = 64;
+std::array<u64, MaxHunterDreamEventDispatcherProbeCandidates>
+    hunter_dream_event_dispatch_probe_offsets{};
+size_t hunter_dream_event_dispatch_probe_count{};
+std::atomic<u64> hunter_dream_event_dispatch_selected_offset{};
+std::atomic<u32> hunter_dream_event_dispatch_selected_register{
+    std::numeric_limits<u32>::max()};
 
 struct HunterDreamInteractionOverrideState {
     u64 blocked_object{};
@@ -4195,15 +4205,16 @@ struct EventInstructionTraceRecord {
     s32 helpMessageId{-1};
 };
 
-EventInstructionTraceRecord ReadEventInstructionTrace(const GuestRegisterSnapshot& registers) {
+EventInstructionTraceRecord ReadEventInstructionTraceFromContext(u64 context) {
     EventInstructionTraceRecord record;
-    record.context = registers.rsi;
-    if (record.context < 0x10000 || !HasMemoryAccess(record.context, 0xC0, MemoryProt::CpuRead)) {
+    record.context = context;
+    if (record.context < 0x10000 || !HasMemoryAccess(record.context, 0xC0, MemoryProt::CpuRead))
         return record;
-    }
+
     const u64 definition = ReadValue<u64>(record.context, 0xB0);
     if (definition < 0x10000 || !HasMemoryAccess(definition, 0x18, MemoryProt::CpuRead))
         return record;
+
     record.bank = ReadValue<s32>(definition, 0);
     record.command = ReadValue<s32>(definition, 4);
     record.arguments = ReadValue<u64>(record.context, 0xB8);
@@ -4220,6 +4231,7 @@ EventInstructionTraceRecord ReadEventInstructionTrace(const GuestRegisterSnapsho
             }
         }
     }
+
     if (record.arguments < 0x10000 || !HasMemoryAccess(record.arguments, 16, MemoryProt::CpuRead) ||
         (record.bank == 3 && record.command == 5 &&
          !HasMemoryAccess(record.arguments, 28, MemoryProt::CpuRead))) {
@@ -4248,6 +4260,10 @@ EventInstructionTraceRecord ReadEventInstructionTrace(const GuestRegisterSnapsho
     return record;
 }
 
+EventInstructionTraceRecord ReadEventInstructionTrace(const GuestRegisterSnapshot& registers) {
+    return ReadEventInstructionTraceFromContext(registers.rsi);
+}
+
 bool IsRelevantInteractionEvent(const EventInstructionTraceRecord& event) {
     const bool dream_event_flag = event.eventFlag >= 72'100'000 && event.eventFlag <= 72'109'999;
     const bool chalice_slot_flag = event.eventFlag >= 9'020 && event.eventFlag <= 9'026;
@@ -4258,6 +4274,157 @@ bool IsRelevantInteractionEvent(const EventInstructionTraceRecord& event) {
            (event.bank == 2003 && event.command == 49) ||
            (event.bank == 2009 && event.command == 5);
 }
+
+void RecordHunterDreamInteractionRawHit(size_t index, u64 offset, std::string_view source) {
+    if (index >= hunter_dream_interaction_raw_hits.size())
+        return;
+    const u64 hit =
+        hunter_dream_interaction_raw_hits[index].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (hit <= 3) {
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS INTERACT RAW] hook={} offset={:#x} source={} hit={}",
+                 HunterDreamInteractionTraceSites[index].name, offset, source, hit);
+    }
+}
+
+enum class HunterDreamEventContextRegister : u32 {
+    Rdi = 0,
+    Rsi,
+    Rdx,
+    Rcx,
+    R8,
+    R9,
+    Rbx,
+    R12,
+    R13,
+    R14,
+    R15,
+};
+
+std::string_view HunterDreamEventContextRegisterName(HunterDreamEventContextRegister value) {
+    switch (value) {
+    case HunterDreamEventContextRegister::Rdi:
+        return "rdi";
+    case HunterDreamEventContextRegister::Rsi:
+        return "rsi";
+    case HunterDreamEventContextRegister::Rdx:
+        return "rdx";
+    case HunterDreamEventContextRegister::Rcx:
+        return "rcx";
+    case HunterDreamEventContextRegister::R8:
+        return "r8";
+    case HunterDreamEventContextRegister::R9:
+        return "r9";
+    case HunterDreamEventContextRegister::Rbx:
+        return "rbx";
+    case HunterDreamEventContextRegister::R12:
+        return "r12";
+    case HunterDreamEventContextRegister::R13:
+        return "r13";
+    case HunterDreamEventContextRegister::R14:
+        return "r14";
+    case HunterDreamEventContextRegister::R15:
+        return "r15";
+    }
+    return "unknown";
+}
+
+u64 ReadHunterDreamEventContextRegister(const GuestRegisterSnapshot& registers,
+                                        HunterDreamEventContextRegister value) {
+    switch (value) {
+    case HunterDreamEventContextRegister::Rdi:
+        return registers.rdi;
+    case HunterDreamEventContextRegister::Rsi:
+        return registers.rsi;
+    case HunterDreamEventContextRegister::Rdx:
+        return registers.rdx;
+    case HunterDreamEventContextRegister::Rcx:
+        return registers.rcx;
+    case HunterDreamEventContextRegister::R8:
+        return registers.r8;
+    case HunterDreamEventContextRegister::R9:
+        return registers.r9;
+    case HunterDreamEventContextRegister::Rbx:
+        return registers.rbx;
+    case HunterDreamEventContextRegister::R12:
+        return registers.r12;
+    case HunterDreamEventContextRegister::R13:
+        return registers.r13;
+    case HunterDreamEventContextRegister::R14:
+        return registers.r14;
+    case HunterDreamEventContextRegister::R15:
+        return registers.r15;
+    }
+    return 0;
+}
+
+void PS4_SYSV_ABI HunterDreamEventDispatcherProbeEntry(
+    u64 tag, const GuestRegisterSnapshot* registers) {
+    if (registers == nullptr || tag >= hunter_dream_event_dispatch_probe_count ||
+        tag >= hunter_dream_event_dispatch_probe_offsets.size()) {
+        return;
+    }
+
+    const u64 offset = hunter_dream_event_dispatch_probe_offsets[tag];
+    const u64 selected =
+        hunter_dream_event_dispatch_selected_offset.load(std::memory_order_acquire);
+    if (selected != 0 && selected != offset)
+        return;
+
+    // The fallback fan-out is intentionally Dream-only. It exists to identify the
+    // real event-dispatch function/ABI without changing game state.
+    if (GetCurrentPackedMap() != HuntersDreamPackedMap)
+        return;
+
+    constexpr std::array registers_to_probe{
+        HunterDreamEventContextRegister::Rdi, HunterDreamEventContextRegister::Rsi,
+        HunterDreamEventContextRegister::Rdx, HunterDreamEventContextRegister::Rcx,
+        HunterDreamEventContextRegister::R8,  HunterDreamEventContextRegister::R9,
+        HunterDreamEventContextRegister::Rbx, HunterDreamEventContextRegister::R12,
+        HunterDreamEventContextRegister::R13, HunterDreamEventContextRegister::R14,
+        HunterDreamEventContextRegister::R15,
+    };
+
+    for (const auto context_register : registers_to_probe) {
+        const u64 context = ReadHunterDreamEventContextRegister(*registers, context_register);
+        const auto event = ReadEventInstructionTraceFromContext(context);
+        if (!event.valid || !IsRelevantInteractionEvent(event))
+            continue;
+
+        u64 expected_selected = 0;
+        if (selected == 0 &&
+            hunter_dream_event_dispatch_selected_offset.compare_exchange_strong(
+                expected_selected, offset, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            hunter_dream_event_dispatch_selected_register.store(
+                static_cast<u32>(context_register), std::memory_order_release);
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SEAMLESS INTERACT LOCATOR] hook=Event.Instruction.Dispatch "
+                     "result=runtime_selected offset={:#x} context_register={} "
+                     "event_bank={} event_command={} event_context={:#x}",
+                     offset, HunterDreamEventContextRegisterName(context_register), event.bank,
+                     event.command, context);
+        } else {
+            const u64 now_selected =
+                hunter_dream_event_dispatch_selected_offset.load(std::memory_order_acquire);
+            if (now_selected != offset)
+                return;
+        }
+
+        RecordHunterDreamInteractionRawHit(
+            static_cast<size_t>(HunterDreamInteractionHook::EventInstruction), offset,
+            "runtime_dispatch_probe");
+        auto normalized = *registers;
+        normalized.rsi = context;
+        auto runtime_site =
+            HunterDreamInteractionTraceSites[static_cast<size_t>(
+                HunterDreamInteractionHook::EventInstruction)];
+        runtime_site.offset = offset;
+        EmitHunterDreamInteractionTrace(runtime_site, normalized);
+        return;
+    }
+}
+
 
 u64 ReadInteractionCallerOffset(const GuestRegisterSnapshot& registers,
                                 HunterDreamInteractionHook hook) {
@@ -4646,6 +4813,7 @@ void PS4_SYSV_ABI HunterDreamInteractionTraceEntry(u64 tag,
     if (tag >= HunterDreamInteractionTraceSites.size() || registers == nullptr)
         return;
     auto runtime_site = HunterDreamInteractionTraceSites[tag];
+    RecordHunterDreamInteractionRawHit(tag, runtime_site.offset, "direct_observer");
     if (hunter_dream_interaction_trace_runtime_offsets[tag] != 0)
         runtime_site.offset = hunter_dream_interaction_trace_runtime_offsets[tag];
     ApplyHunterDreamLocalWorldOverride(runtime_site, registers);
@@ -5805,6 +5973,9 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (hunter_dream_interaction_trace_enabled &&
         site.kind == TraceKind::HealingFountainAvailability &&
         site.offset == HealingFountainAvailabilityOffset) {
+        RecordHunterDreamInteractionRawHit(
+            static_cast<size_t>(HunterDreamInteractionHook::AvailabilityGate), site.offset,
+            "reused_healing_fountain_observer");
         EmitHunterDreamInteractionTrace(HunterDreamInteractionTraceSites[2], *registers);
     }
     if (summon_build_host_placement_hook_installed && site.offset == SummonBuildEntryOffset) {
@@ -8541,6 +8712,12 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
         trace_requested && EnvFlagEnabled("SHADPS4_BLOODBORNE_INTERACT_TRACE_VERBOSE");
     hunter_dream_interaction_trace_sequence.store(0, std::memory_order_relaxed);
     hunter_dream_interaction_session_active = false;
+    hunter_dream_event_dispatch_probe_count = 0;
+    hunter_dream_event_dispatch_selected_offset.store(0, std::memory_order_relaxed);
+    hunter_dream_event_dispatch_selected_register.store(std::numeric_limits<u32>::max(),
+                                                        std::memory_order_relaxed);
+    for (auto& hit : hunter_dream_interaction_raw_hits)
+        hit.store(0, std::memory_order_relaxed);
     {
         std::scoped_lock lock{hunter_dream_interaction_trace_mutex};
         hunter_dream_interaction_trace_state.SetEnabled(trace_requested);
@@ -8588,10 +8765,6 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
 
         if (!signature_matches &&
             site.hook == HunterDreamInteractionHook::EventInstruction) {
-            // The fixed D65 offset observed in the first runtime landed inside a different
-            // instruction stream. Relocate only within the narrow interpreter neighborhood
-            // bounded by the known Dream WarpParam caller (0x017C1CF5), and only when the
-            // exact entry signature has one unique match. Ambiguity remains fail-closed.
             constexpr u64 EventDispatcherSearchBegin = 0x017B0000;
             constexpr u64 EventDispatcherSearchEnd = 0x017C2000;
             const auto candidates =
@@ -8608,6 +8781,35 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
                 observed = ReadDiagnosticBytes(image_base, MemoryPatcher::g_eboot_image_size,
                                                resolved_offset, expected.size());
                 signature_matches = MatchesEstablishedTravelBytes(resolved_offset, expected);
+            } else if (trace_requested && !candidates.empty() &&
+                       candidates.size() <= MaxHunterDreamEventDispatcherProbeCandidates) {
+                size_t armed_count = 0;
+                hunter_dream_event_dispatch_probe_count = candidates.size();
+                for (size_t candidate_index = 0; candidate_index < candidates.size();
+                     ++candidate_index) {
+                    const u64 candidate = candidates[candidate_index];
+                    hunter_dream_event_dispatch_probe_offsets[candidate_index] = candidate;
+                    if (InstallGuestCodeHook(
+                            reinterpret_cast<void*>(image_base + candidate), expected,
+                            candidate_index, HunterDreamEventDispatcherProbeEntry)) {
+                        ++armed_count;
+                    } else {
+                        LOG_ERROR(Debug,
+                                  "[BLOODBORNE SEAMLESS INTERACT LOCATOR] hook={} "
+                                  "candidate={:#x} result=runtime_probe_install_failed",
+                                  site.name, candidate);
+                    }
+                }
+                if (armed_count != 0) {
+                    hunter_dream_interaction_trace_hook_installed[index] = true;
+                    ++installed_count;
+                    LOG_INFO(Debug,
+                             "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} "
+                             "static_offset={:#x} runtime_probe_candidates={} "
+                             "runtime_probe_armed={} result=runtime_dispatch_probe_armed",
+                             site.name, site.offset, candidates.size(), armed_count);
+                    continue;
+                }
             }
         }
 
@@ -8644,10 +8846,12 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
              "[BLOODBORNE SEAMLESS INTERACT STATE] enabled={} verbose={} behavior_override={} "
              "host_priority=true guest_dream_override=true profile={} "
              "actual_sha256={} expected_sha256={} hooks_installed={} hooks_rejected={} "
-             "hooks_total={}",
+             "hooks_total={} dispatcher_probe_candidates={} dispatcher_selected_offset={:#x}",
              trace_requested, hunter_dream_interaction_trace_verbose, seamless_behavior,
              profile.name, eboot_sha256, HunterDreamInteractionEbootSha256, installed_count,
-             rejected_count, HunterDreamInteractionTraceSites.size());
+             rejected_count, HunterDreamInteractionTraceSites.size(),
+             hunter_dream_event_dispatch_probe_count,
+             hunter_dream_event_dispatch_selected_offset.load(std::memory_order_relaxed));
     LOG_INFO(Debug,
              "[BLOODBORNE PROFILE RESOLVE] feature=interact_trace profile={} address={:#x} "
              "validated={} hooks_installed={} hooks_rejected={}",
