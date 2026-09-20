@@ -29,22 +29,22 @@ jobs:
       - name: Cache CMake configuration
         uses: actions/cache@v5
         with:
-          path: ${{ github.workspace }}/build-bb-dream
-          key: bb-dream-win-cmake-${{ hashFiles('**/CMakeLists.txt', 'cmake/**', '.gitmodules') }}
+          path: ${{ github.workspace }}/build
+          key: windows-sdl-ninja-cache-cmake-configuration-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
           restore-keys: |
-            bb-dream-win-cmake-
+            windows-sdl-ninja-cache-cmake-configuration-
 
       - name: Cache compiler output
         uses: hendrikmuhs/ccache-action@v1.2.21
         with:
           append-timestamp: false
-          key: bb-dream-win-ccache-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+          key: windows-sdl-cache-cmake-build-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
 
       - name: Configure
         shell: pwsh
         run: >-
           cmake --fresh -G Ninja
-          -B "${{ github.workspace }}/build-bb-dream"
+          -B "${{ github.workspace }}/build"
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
           -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=OFF
           -DCMAKE_C_COMPILER=clang-cl
@@ -55,7 +55,7 @@ jobs:
       - name: Build shadPS4
         shell: pwsh
         run: >-
-          cmake --build "${{ github.workspace }}/build-bb-dream"
+          cmake --build "${{ github.workspace }}/build"
           --config "${{ env.BUILD_TYPE }}"
           --target shadPS4
           --parallel $env:NUMBER_OF_PROCESSORS
@@ -64,6 +64,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: shadPS4-bb-dream-priority1-windows-x64
-          path: ${{ github.workspace }}/build-bb-dream/shadPS4.exe
+          path: ${{ github.workspace }}/build/shadPS4.exe
           if-no-files-found: error
           retention-days: 14
