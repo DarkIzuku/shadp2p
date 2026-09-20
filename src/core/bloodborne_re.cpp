@@ -1563,6 +1563,7 @@ HunterDreamInteractionTraceState hunter_dream_interaction_trace_state({.repeatAf
                                                                        .staleAfterMs = 120'000,
                                                                        .maxEntries = 512});
 std::atomic<u64> hunter_dream_interaction_trace_sequence{};
+std::atomic<s64> hunter_dream_host_search_active_until_ms{};
 bool hunter_dream_interaction_trace_enabled{};
 bool hunter_dream_interaction_trace_verbose{};
 bool hunter_dream_interaction_availability_uses_seamless_hook{};
@@ -4470,14 +4471,19 @@ u64 ReadInteractionCallerOffset(const GuestRegisterSnapshot& registers,
 
 bool ShouldApplyHunterDreamLocalWorldOverride(
     const HunterDreamInteractionRuntimeContext& context) {
-    if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP") || !context.matching.inRoom ||
-        !context.inHuntersDream) {
+    if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP") || !context.inHuntersDream)
         return false;
+
+    // The Beckoning-Bell requester is still outside Matching2 while polling
+    // /summon_messenger/get. Bloodborne already applies its multiplayer interaction
+    // restrictions at that point, so preserve Dream travel/services during the
+    // explicitly observed host-search window without changing ordinary solo play.
+    if (!context.matching.inRoom) {
+        return EstablishedTravelNowMs() <=
+               hunter_dream_host_search_active_until_ms.load(std::memory_order_acquire);
     }
 
-    // Keep this override strictly scoped to Hunter's Dream. The host gets local-world
-    // interaction semantics only here while a guest is connected; outside the Dream
-    // all vanilla multiplayer restrictions remain untouched.
+    // Once the room exists, keep the override scoped to the two cooperative roles.
     if (context.snapshot.role == HunterDreamInteractionRole::Host)
         return true;
 
@@ -7820,6 +7826,16 @@ void ClearSeamlessHostPlacementHeader() {
     pending_cross_map_summon.Reset();
 }
 
+void NotifySeamlessSummonSearchObserved() {
+    constexpr s64 HostSearchInteractionWindowMs = 30'000;
+    const s64 until = EstablishedTravelNowMs() + HostSearchInteractionWindowMs;
+    hunter_dream_host_search_active_until_ms.store(until, std::memory_order_release);
+    LOG_INFO(Debug,
+             "[BLOODBORNE SEAMLESS MATCH] state=HostSearchObserved "
+             "dream_interaction_override_until_ms={}",
+             until);
+}
+
 void NotifySeamlessSummonClaimAccepted() {
     std::scoped_lock lock{seamless_placement_mutex};
     if (pending_cross_map_summon.OnClaimAccepted(EstablishedTravelNowMs())) {
@@ -7902,24 +7918,31 @@ bool TraceAndGuardSeamlessSignalingDeactivate(std::uintptr_t return_address,
                                               std::int32_t context_id, std::int32_t connection_id,
                                               std::string_view peer_npid, std::int32_t status) {
     std::scoped_lock lock{seamless_placement_mutex};
-    const auto snapshot = pending_cross_map_summon.Snapshot();
+    const s64 now_ms = EstablishedTravelNowMs();
+    const auto before = pending_cross_map_summon.Snapshot();
     const u64 caller_offset = return_address >= image_base && return_address - image_base <
                                                                   MemoryPatcher::g_eboot_image_size
                                   ? return_address - image_base
                                   : 0;
-    const bool guarded = pending_cross_map_summon.ShouldGuardSignalingDeactivate(
-        peer_npid, EstablishedTravelNowMs());
+    const bool guarded =
+        pending_cross_map_summon.ShouldGuardSignalingDeactivate(peer_npid, now_ms);
+    const bool state_cleared =
+        !guarded && pending_cross_map_summon.OnSignalingDeactivated(peer_npid, now_ms);
+    const auto after = pending_cross_map_summon.Snapshot();
     LOG_INFO(
         Debug,
         "[BLOODBORNE SEAMLESS SIGNALING] event=deactivate_requested ctx_id={} conn_id={} "
         "peer={} status={} room_id={} expected_peer={} generation_active={} "
-        "placement={} claim={} room={} signaling={} committed={} caller={:#x} "
-        "caller_offset={:#x} guarded={} reason={}",
+        "placement={} claim={} room={} signaling_before={} signaling_after={} committed={} "
+        "caller={:#x} caller_offset={:#x} guarded={} state_cleared={} reason={}",
         context_id, connection_id, peer_npid.empty() ? "unknown" : peer_npid, status,
-        snapshot.roomId, snapshot.expectedPeerNpid.empty() ? "unknown" : snapshot.expectedPeerNpid,
-        snapshot.generation, snapshot.placementReady, snapshot.claimAccepted, snapshot.roomJoined,
-        snapshot.signalingEstablished, snapshot.commitIssued, return_address, caller_offset,
-        guarded, guarded ? "active_pending_exact_peer_room_generation" : "normal_cleanup");
+        before.roomId, before.expectedPeerNpid.empty() ? "unknown" : before.expectedPeerNpid,
+        before.generation, before.placementReady, before.claimAccepted, before.roomJoined,
+        before.signalingEstablished, after.signalingEstablished, before.commitIssued,
+        return_address, caller_offset, guarded, state_cleared,
+        guarded ? "early_exact_peer_signaling_convergence"
+                : (state_cleared ? "normal_cleanup_signaling_state_cleared"
+                                 : "normal_cleanup"));
     return guarded;
 }
 
