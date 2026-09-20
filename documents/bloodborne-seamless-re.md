@@ -8,15 +8,18 @@ SPDX-License-Identifier: GPL-2.0-or-later
 ## Scope and executable identity
 
 The current implementation targets the European GOTY executable CUSA03173,
-app version 01.09. The user executable used to validate every active profile
-offset has SHA-256:
+app version 01.09. The executable observed in the failing two-client runtime
+and selected by the current exact profile has SHA-256:
 
 ```text
-6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80
+D65F0B4F01D59166AED16F8604196D8B7DD805ABBF0758B356E8F1354C9429F9
 ```
 
 Runtime hooks are additionally protected by exact instruction signatures. A
 version label alone is not accepted as proof that an offset is compatible.
+The older `6764938B...` executable remains a separate legacy profile; its SHA
+never selects offsets from the D65 profile, and D65 never falls back to the
+legacy offsets.
 
 ## Responsibility boundary
 
@@ -1819,15 +1822,15 @@ remain untouched. Any unexpected state, flag, value, profile, or byte signature
 fails closed and emits one diagnostic instead of applying a guessed patch.
 
 The runtime `unsupported_profile` result was caused before this policy ran:
-profile selection accepted the generic `cusa03173-109-reference` entry before
-testing the exact user-eboot fingerprint. Selection now validates the SpEffect
-lookup prologue plus all nine native initial-summon call signatures and prefers
-`cusa03173-109-user-eboot-6764938b` when those bytes match. The generic fallback
-is still available for its own executable, but is intentionally not accepted by
-the user-eboot HP/visual policy. Applied logs report profile, role, summon type,
-the verified old/new rates, `source=SpEffectParam`, and `result=applied`. Absolute
-per-character HP values are not fabricated because this scoped patch operates
-on the native parameter row rather than a live player-stat field.
+the mounted D65 executable had no exact SHA profile and fell through to the old
+generic `cusa03173-109-reference` label. Selection now requires the exact D65
+SHA plus the five core signatures, while the SpEffect lookup and every other
+feature keep their own independent validation. The separate 676 executable
+retains its own exact legacy profile; there is no generic fallback. Applied
+logs report profile, role, summon type, the verified old/new rates,
+`source=SpEffectParam`, and `result=applied`. Absolute per-character HP values
+are not fabricated because this scoped patch operates on the native parameter
+row rather than a live player-stat field.
 
 Decoded Hunter's Dream events also identify a separate guest travel gate.
 Event `12107000` (normal headstones) and event `12107100` (Chalice headstones)
@@ -1886,17 +1889,17 @@ by Bloodborne. After all connected guests acknowledge readiness, the guest
 calls the same native `WarpParam` path on the periodic game thread. No position
 `memcpy`, artificial sleep, or global Precise-style fallback is used.
 
-Two exact CUSA03173 01.09 profiles are accepted. The reference profile keeps
-the documented offsets. The user's tested eboot
-`SHA-256 6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80`
-uses:
+Two exact CUSA03173 01.09 profiles are accepted. The active runtime executable
+`SHA-256 D65F0B4F01D59166AED16F8604196D8B7DD805ABBF0758B356E8F1354C9429F9`
+uses profile `cusa03173-109-d65f0b4f` and these five independently validated
+layout anchors:
 
 ```text
-WarpParam                     0x013CE320
-StageTransition               0x013CE220
-periodic game-thread tick     0x01872870
-stage Stop call               0x019475F1  E8 2A 94 58 00
-OnMatchingCheck Stop call     0x01380D57  E8 C4 FC B4 00
+WarpParam                     0x013CDF30  55 48 89 E5 41 57
+StageTransition               0x013CDE30  55 48 89 E5 41 57
+periodic game-thread tick     0x01872360  55 48 89 E5 41 57
+stage Stop call               0x019471B1  E8 EA 95 58 00
+OnMatchingCheck Stop call     0x013809B7  E8 E4 FD B4 00
 ```
 
 All hook installation requires CUSA03173, app version 01.09, the full expected
@@ -1920,15 +1923,13 @@ boss continuity remain later phases. If Bloodborne destroys the room through
 another path, the server keeps the SeamlessParty and logs recovery state, but
 automatic room reconstruction is not part of this iteration.
 
-## Profile-aware initial summon and PvP iteration
+## Legacy 676-profile initial summon and PvP evidence
 
-The initial cross-map path is now selected independently from established
-travel. `cusa03173-109-reference` and
-`cusa03173-109-user-eboot-6764938b` each carry their own patch sites, native
-call targets, global pointers, and original bytes. A profile is never enabled
-by assuming a uniform delta from the reference executable: every site below
-was checked in the user's CUSA03173 01.09 eboot, whose complete SHA-256 is
-`6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80`.
+The offsets below are retained as historical evidence for the distinct
+`cusa03173-109-user-eboot-6764938b` compatibility profile. They are not used by
+the current D65 runtime profile. The initial cross-map path remains selected
+independently from established travel, and every selected profile carries its
+own patch sites, native call targets, global pointers, and original bytes.
 
 Initial bell/candidate/build sites in the user eboot:
 
@@ -1997,31 +1998,31 @@ event instructions, the first four raw argument words, and a bounded four-frame
 caller chain. Seamless itself continues to use its independent
 `SHADPS4_BLOODBORNE_SEAMLESS_COOP` switch.
 
-The trace profile is restricted to CUSA03173, app version 01.09, and the existing
-`cusa03173-109-user-eboot-6764938b` layout derived from the eboot whose SHA-256 is
-`6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80`.
+The trace profile is restricted to CUSA03173, app version 01.09, and the exact
+`cusa03173-109-d65f0b4f` layout whose SHA-256 is
+`D65F0B4F01D59166AED16F8604196D8B7DD805ABBF0758B356E8F1354C9429F9`.
 Every observer separately checks the complete original instruction sequence
 shown below before installing and fails closed if any byte differs:
 
 ```text
-Event instruction dispatcher       0x017B95C0  55 48 89 E5 53 50
-Healing-fountain registration      0x0133B3D0  55 48 89 E5 41 57
-RE_InteractionAvailability gates   0x012F870E  41 80 7D 48 00
-RE_ActionCandidate transition      0x012F8799  4D 8D 75 2C 44 39 3E
-RE_Prompt state                    0x012F8BB3  B8 6F A0 FE FF
-RE_Availability downstream gates   0x012F8F48  41 80 7D 48 00
-RE_Availability blocked target     0x012F921A  41 C7 45 60 00 00 00 00
-RE_Availability publish            0x012F9253  41 8B 7D 20 41 0F BE 55 28
-Warp respawn-point parameter       0x013CE320  55 48 89 E5 41 57
+Event instruction dispatcher       0x017B90B0  55 48 89 E5 53 50
+Healing-fountain registration      0x0133B030  55 48 89 E5 41 57
+RE_InteractionAvailability gates   0x012F836E  41 80 7D 48 00
+RE_ActionCandidate transition      0x012F83F9  4D 8D 75 2C 44 39 3E
+RE_Prompt state                    0x012F8813  B8 6F A0 FE FF
+RE_Availability downstream gates   0x012F8BA8  41 80 7D 48 00
+RE_Availability blocked target     0x012F8E7A  41 C7 45 60 00 00 00 00
+RE_Availability publish            0x012F8EB3  41 8B 7D 20 41 0F BE 55 28
+Warp respawn-point parameter       0x013CDF30  55 48 89 E5 41 57
 ```
 
 The `RE_` function labels are inferred names, not recovered symbols. Static
 analysis establishes that the availability object carries four byte gates at
-`+0x48..+0x4B`; `0x012F8799` compares a value at `+0x2C` while moving through
-candidate selection; `0x012F8BB3` selects prompt state `0xFFFEA06F`;
-`0x012F8F48` consumes the same four gates later in the pipeline;
-`0x012F921A` is a blocked target which clears object state at `+0x60`; and
-`0x012F9253` prepares the native availability publication call. Runtime evidence
+`+0x48..+0x4B`; `0x012F83F9` compares a value at `+0x2C` while moving through
+candidate selection; `0x012F8813` selects prompt state `0xFFFEA06F`;
+`0x012F8BA8` consumes the same four gates later in the pipeline;
+`0x012F8E7A` is a blocked target which clears object state at `+0x60`; and
+`0x012F8EB3` prepares the native availability publication call. Runtime evidence
 is still required before assigning higher-level semantics to gates `48`, `4A`,
 or `4B`. Gate `49` is labelled `multiplayer_gate_49` in a blocked trace only to
 make the known host-effect path easy to compare; its complete native policy is
@@ -2085,27 +2086,46 @@ separate NPC instance, and whether each interaction fails during candidate
 generation, prompt publication, selection, event dispatch, menu opening, or the
 final WarpParam path. No interaction bypass has been added in this iteration.
 
-### Exact-profile, final-placement, and health correction build
+### D65 exact profile, room/signaling convergence, and health build
 
-The first instrumentation build selected `cusa03173-109-reference` on the
-user's exact executable even though its mounted eboot SHA-256 is
-`6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80`. The
-selector had coupled layout identification to a nine-helper initial-summon
-fingerprint. A helper that had already been independently patched could make
-that aggregate fingerprint false and therefore mislabel the executable. This
-disabled both the interaction observers and the full-health policy before
-either feature reached its own byte validation.
+The failing runtime loaded
+`D65F0B4F01D59166AED16F8604196D8B7DD805ABBF0758B356E8F1354C9429F9`, but the
+old selector knew only the distinct `6764938B...` exact profile. D65 therefore
+fell through to the generic `cusa03173-109-reference` label. This disabled both
+the interaction observers and the full-health policy before either feature
+reached its own byte validation. Substituting only the SHA would have been
+unsafe because all five 676 core sites fail on D65.
 
-Layout selection now prefers the exact user profile only when both the mounted
-eboot SHA-256 matches and five core sites validate: `WarpParam`,
+Layout selection now selects D65 only when both the mounted eboot SHA-256 and
+five core sites validate: `WarpParam`,
 `StageTransition`, the periodic game-thread tick, the stage-transition Stop
-call, and the OnMatchingCheck Stop call. The fallback reference profile is
-considered only if that exact identity does not match. This does not weaken
-patch safety: every observer, hook, native call, or data write still validates
-its own complete expected bytes immediately before use and fails closed on a
-mismatch. Startup logs the mounted eboot's actual and expected SHA-256, the
-selected profile, all five selection signatures, and expected plus observed
-bytes at every interaction observer site.
+call, and the OnMatchingCheck Stop call. There is no generic reference fallback:
+an unknown SHA or one failed core site disables the profile. This does not
+weaken patch safety: every observer, hook, native call, or data write still
+validates its own complete expected bytes immediately before use and fails
+closed on a mismatch. Startup logs the mounted eboot's actual and expected
+SHA-256, the selected profile, all five selection signatures, and expected plus
+observed bytes at every interaction observer site.
+
+The matchmaking regression was in client event propagation, not shadNet.
+`PendingCrossMapSummon` learned about signaling only from the custom Matching2
+handshake, while the observed session established through generic
+`sceNpSignaling`. Room completion was also inferred from a later callback
+payload rather than bound explicitly to the request generation, room member,
+and peer. The client now records generation on Create/Join, publishes
+`RoomJoined` directly from the successful room reply, forwards generic and
+Matching2 signaling establishment, and lets either ordering converge through
+the same idempotent state machine. Generic signaling may be retained by NPID
+before the room callback, but cannot commit until the exact room/peer joins.
+Stale generations, wrong rooms, and wrong peers are rejected with a textual
+reason.
+
+`sceNpSignalingDeactivateConnection` remains the normal cleanup path. It is
+now traced with caller, connection, room, peer, and generation. Cleanup is
+suppressed only after placement, claim, exact room join, and signaling are all
+confirmed for the same live pending peer, and only until that bounded summon
+finishes or expires. There is no global signaling or `CSMultiPlayMan::Stop`
+bypass.
 
 The final-placement bug was separate. Once a cross-map reload reached the
 host's packed map, the old state machine returned `same_map_no_reload` and
@@ -2120,7 +2140,7 @@ The native application path is the existing `PlayerWarpTool` dispatcher, not a
 raw player-structure write:
 
 ```text
-PlayerWarp.NativeDispatch (exact eboot)  0x0154EC50
+PlayerWarp.NativeDispatch (D65 eboot)    0x0154EA30
 original bytes                          55 48 89 E5 41 57 41 56
                                         41 55 41 54 53 48 81 EC
 arguments                               position*, orientation*,
@@ -2136,10 +2156,13 @@ The log sequence is `TargetPlacementApplied`, optionally one deduplicated
 `TargetPlacementVerificationPending`, `TargetPlacementVerified`, and
 `Complete placement_verified=true`.
 
-The exact profile also enables the already byte-validated SpEffect lookup at
-`0x01F28D20`. Seamless cooperator rows `9005/9006` and invader rows
-`9025/9026` use the verified `maxHpRate` field at row offset `+0x10`; only the
-vanilla `0.7` value is changed to `1.0`. Traditional mode remains untouched.
+The D65 profile resolves the SpEffect lookup only when its full 14-byte
+prologue has exactly one match in the bounded executable search region. The
+legacy 676 profile retains its separately validated fixed lookup at
+`0x01F28D20`. The active Seamless cooperator row `9006` and invader row `9026`
+use the verified `maxHpRate` field at row offset `+0x10`; the health policy
+changes only the vanilla `0.7` value to `1.0`. Traditional mode remains
+untouched.
 The build does not guess a current-HP address or write HP every frame. It lets
 the game's native recalculation own current-HP ratio preservation and logs
 `current_hp_write=false ratio_preservation=game_owned`; runtime comparison is

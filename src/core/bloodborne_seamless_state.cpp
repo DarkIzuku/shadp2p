@@ -132,6 +132,7 @@ void PendingCrossMapSummonStateMachine::Reset() {
     m_unbound = {};
     m_deadlineMs = 0;
     m_unboundDeadlineMs = 0;
+    m_lastEventReason = "reset";
 }
 
 bool PendingCrossMapSummonStateMachine::MatchesGeneration(u64 generation) const {
@@ -177,6 +178,9 @@ void PendingCrossMapSummonStateMachine::BindUnboundEvents(s64 nowMs) {
     m_pending.roomJoined = m_unbound.roomJoined;
     m_pending.signalingEstablished = m_unbound.signalingEstablished;
     m_pending.roomId = m_unbound.roomId;
+    m_pending.localMemberId = m_unbound.localMemberId;
+    m_pending.expectedPeerMemberId = m_unbound.expectedPeerMemberId;
+    m_pending.expectedPeerNpid = m_unbound.expectedPeerNpid;
     m_unbound = {};
     m_unboundDeadlineMs = 0;
 }
@@ -268,53 +272,150 @@ bool PendingCrossMapSummonStateMachine::OnRoomJoinStarted(s64 nowMs, u64 roomId,
 }
 
 bool PendingCrossMapSummonStateMachine::OnRoomJoined(s64 nowMs, u64 roomId, u64 generation) {
-    if (!m_enabled || roomId == 0)
+    return OnRoomJoinedForPeer(nowMs, roomId, 0, 0, {}, generation);
+}
+
+bool PendingCrossMapSummonStateMachine::OnRoomJoinedForPeer(s64 nowMs, u64 roomId,
+                                                            u16 localMemberId,
+                                                            u16 expectedPeerMemberId,
+                                                            std::string_view expectedPeerNpid,
+                                                            u64 generation) {
+    if (!m_enabled) {
+        m_lastEventReason = "disabled";
         return false;
+    }
+    if (roomId == 0) {
+        m_lastEventReason = "invalid_room";
+        return false;
+    }
     if (m_pending.phase == PendingCrossMapSummonPhase::Idle) {
-        if (generation != 0 || (m_unbound.roomId != 0 && m_unbound.roomId != roomId))
+        if (generation != 0) {
+            m_lastEventReason = "stale_generation";
             return false;
+        }
+        if (m_unbound.roomId != 0 && m_unbound.roomId != roomId) {
+            m_lastEventReason = "room_mismatch";
+            return false;
+        }
         m_unbound.roomJoinStarted = true;
         m_unbound.roomJoined = true;
         m_unbound.roomId = roomId;
+        m_unbound.localMemberId = localMemberId;
+        m_unbound.expectedPeerMemberId = expectedPeerMemberId;
+        m_unbound.expectedPeerNpid = expectedPeerNpid;
         m_unboundDeadlineMs = nowMs + m_options.timeoutMs;
+        m_lastEventReason = "accepted_unbound";
         return true;
     }
-    if (!MatchesGeneration(generation) || IsExpired(nowMs) ||
-        (m_pending.roomId != 0 && m_pending.roomId != roomId)) {
+    if (!MatchesGeneration(generation)) {
+        m_lastEventReason = "stale_generation";
+        return false;
+    }
+    if (IsExpired(nowMs)) {
+        m_lastEventReason = "expired";
+        return false;
+    }
+    if (m_pending.roomId != 0 && m_pending.roomId != roomId) {
+        m_lastEventReason = "room_mismatch";
+        return false;
+    }
+    if (m_pending.expectedPeerMemberId != 0 && expectedPeerMemberId != 0 &&
+        m_pending.expectedPeerMemberId != expectedPeerMemberId) {
+        m_lastEventReason = "peer_member_mismatch";
+        return false;
+    }
+    if (!m_pending.expectedPeerNpid.empty() && !expectedPeerNpid.empty() &&
+        m_pending.expectedPeerNpid != expectedPeerNpid) {
+        m_lastEventReason = "peer_npid_mismatch";
         return false;
     }
     m_pending.roomJoinStarted = true;
     m_pending.roomJoined = true;
     m_pending.roomId = roomId;
+    if (localMemberId != 0)
+        m_pending.localMemberId = localMemberId;
+    if (expectedPeerMemberId != 0)
+        m_pending.expectedPeerMemberId = expectedPeerMemberId;
+    if (!expectedPeerNpid.empty())
+        m_pending.expectedPeerNpid = expectedPeerNpid;
     AdvanceReadyPhase();
     RefreshDeadline(nowMs);
+    m_lastEventReason = "accepted";
     return true;
 }
 
 bool PendingCrossMapSummonStateMachine::OnSignalingEstablished(s64 nowMs, u64 roomId,
                                                                u64 generation) {
-    if (!m_enabled || roomId == 0)
+    return OnSignalingEstablishedForPeer(nowMs, roomId, 0, {}, generation);
+}
+
+bool PendingCrossMapSummonStateMachine::OnSignalingEstablishedForPeer(s64 nowMs, u64 roomId,
+                                                                      u16 peerMemberId,
+                                                                      std::string_view peerNpid,
+                                                                      u64 generation) {
+    if (!m_enabled) {
+        m_lastEventReason = "disabled";
         return false;
+    }
+    // Generic sceNpSignaling can become established just before Matching2 publishes
+    // its room completion callback. Preserve that fact by peer identity and bind the
+    // room later; an anonymous event without either identity is not safe to retain.
+    if (roomId == 0 && peerNpid.empty()) {
+        m_lastEventReason = "invalid_room";
+        return false;
+    }
     if (m_pending.phase == PendingCrossMapSummonPhase::Idle) {
-        if (generation != 0 || (m_unbound.roomId != 0 && m_unbound.roomId != roomId))
+        if (generation != 0) {
+            m_lastEventReason = "stale_generation";
             return false;
+        }
+        if (roomId != 0 && m_unbound.roomId != 0 && m_unbound.roomId != roomId) {
+            m_lastEventReason = "room_mismatch";
+            return false;
+        }
         m_unbound.roomJoinStarted = true;
-        m_unbound.roomJoined = true;
         m_unbound.signalingEstablished = true;
-        m_unbound.roomId = roomId;
+        if (roomId != 0)
+            m_unbound.roomId = roomId;
+        m_unbound.expectedPeerMemberId = peerMemberId;
+        m_unbound.expectedPeerNpid = peerNpid;
         m_unboundDeadlineMs = nowMs + m_options.timeoutMs;
+        m_lastEventReason = roomId == 0 ? "accepted_unbound_without_room" : "accepted_unbound";
         return true;
     }
-    if (!MatchesGeneration(generation) || IsExpired(nowMs) ||
-        (m_pending.roomId != 0 && roomId != m_pending.roomId)) {
+    if (!MatchesGeneration(generation)) {
+        m_lastEventReason = "stale_generation";
+        return false;
+    }
+    if (IsExpired(nowMs)) {
+        m_lastEventReason = "expired";
+        return false;
+    }
+    if (roomId != 0 && m_pending.roomId != 0 && roomId != m_pending.roomId) {
+        m_lastEventReason = "room_mismatch";
+        return false;
+    }
+    if (m_pending.expectedPeerMemberId != 0 && peerMemberId != 0 &&
+        m_pending.expectedPeerMemberId != peerMemberId) {
+        m_lastEventReason = "peer_member_mismatch";
+        return false;
+    }
+    if (!m_pending.expectedPeerNpid.empty() && !peerNpid.empty() &&
+        m_pending.expectedPeerNpid != peerNpid) {
+        m_lastEventReason = "peer_npid_mismatch";
         return false;
     }
     m_pending.roomJoinStarted = true;
-    m_pending.roomJoined = true;
-    m_pending.roomId = roomId;
+    if (roomId != 0)
+        m_pending.roomId = roomId;
     m_pending.signalingEstablished = true;
+    if (peerMemberId != 0)
+        m_pending.expectedPeerMemberId = peerMemberId;
+    if (!peerNpid.empty())
+        m_pending.expectedPeerNpid = peerNpid;
     AdvanceReadyPhase();
     RefreshDeadline(nowMs);
+    m_lastEventReason = roomId == 0 ? "accepted_pending_without_room" : "accepted";
     return true;
 }
 
@@ -453,12 +554,28 @@ bool PendingCrossMapSummonStateMachine::ShouldRetainPlacementOnMissingCreate(s64
            m_pending.phase != PendingCrossMapSummonPhase::Failed;
 }
 
+bool PendingCrossMapSummonStateMachine::ShouldGuardSignalingDeactivate(std::string_view peerNpid,
+                                                                       s64 nowMs) const {
+    return m_enabled && !peerNpid.empty() && !m_pending.expectedPeerNpid.empty() &&
+           peerNpid == m_pending.expectedPeerNpid && !IsExpired(nowMs) &&
+           m_pending.phase != PendingCrossMapSummonPhase::Idle &&
+           m_pending.phase != PendingCrossMapSummonPhase::Complete &&
+           m_pending.phase != PendingCrossMapSummonPhase::Failed && m_pending.roomId != 0 &&
+           m_pending.placementReady && m_pending.claimAccepted && m_pending.roomJoined &&
+           m_pending.signalingEstablished;
+}
+
+std::string_view PendingCrossMapSummonStateMachine::LastEventReason() const {
+    return m_lastEventReason;
+}
+
 PendingCrossMapSummonSnapshot PendingCrossMapSummonStateMachine::Snapshot() const {
     return m_pending;
 }
 
 bool IsSeamlessGuestParamProfileSupported(std::string_view profileName) {
-    return profileName == "cusa03173-109-user-eboot-6764938b";
+    return profileName == "cusa03173-109-d65f0b4f" ||
+           profileName == "cusa03173-109-user-eboot-6764938b";
 }
 
 SeamlessTravelStateMachine::SeamlessTravelStateMachine() : SeamlessTravelStateMachine(Options{}) {}

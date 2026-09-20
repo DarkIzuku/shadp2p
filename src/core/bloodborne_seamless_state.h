@@ -5,6 +5,7 @@
 #include <array>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "common/types.h"
 
@@ -221,6 +222,9 @@ struct PendingCrossMapSummonSnapshot {
     SeamlessPeerRole role = SeamlessPeerRole::Unknown;
     u64 generation = 0;
     u64 roomId = 0;
+    u16 localMemberId = 0;
+    u16 expectedPeerMemberId = 0;
+    std::string expectedPeerNpid;
     u32 sourceMap = 0;
     u32 targetMap = 0;
     u32 reloadCount = 0;
@@ -253,6 +257,10 @@ public:
     bool OnRoomJoinStarted(s64 nowMs, u64 roomId = 0, u64 generation = 0);
     bool OnRoomJoined(s64 nowMs, u64 roomId, u64 generation = 0);
     bool OnSignalingEstablished(s64 nowMs, u64 roomId, u64 generation = 0);
+    bool OnRoomJoinedForPeer(s64 nowMs, u64 roomId, u16 localMemberId, u16 expectedPeerMemberId,
+                             std::string_view expectedPeerNpid, u64 generation = 0);
+    bool OnSignalingEstablishedForPeer(s64 nowMs, u64 roomId, u16 peerMemberId,
+                                       std::string_view peerNpid, u64 generation = 0);
     PendingCrossMapSummonDecision Evaluate(u32 currentMap, u32 targetMap, s64 nowMs);
     bool BeginCommit(u64 generation);
     bool MarkCommitFailed(u64 generation);
@@ -264,6 +272,8 @@ public:
     bool MarkWorldReady(u32 currentMap, u64 generation);
     bool MarkRemoteInserted(u64 generation);
     bool ShouldRetainPlacementOnMissingCreate(s64 nowMs) const;
+    bool ShouldGuardSignalingDeactivate(std::string_view peerNpid, s64 nowMs) const;
+    std::string_view LastEventReason() const;
     PendingCrossMapSummonSnapshot Snapshot() const;
     void Reset();
 
@@ -281,11 +291,16 @@ private:
     u64 m_nextGeneration = 0;
     s64 m_deadlineMs = 0;
     s64 m_unboundDeadlineMs = 0;
+    std::string_view m_lastEventReason{"not_observed"};
 };
 
 bool IsSeamlessGuestParamProfileSupported(std::string_view profileName);
 
 constexpr bool IsExpectedBloodborneEbootSha256(std::string_view sha256) {
+    return sha256 == "D65F0B4F01D59166AED16F8604196D8B7DD805ABBF0758B356E8F1354C9429F9";
+}
+
+constexpr bool IsLegacyBloodborneEbootSha256(std::string_view sha256) {
     return sha256 == "6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80";
 }
 

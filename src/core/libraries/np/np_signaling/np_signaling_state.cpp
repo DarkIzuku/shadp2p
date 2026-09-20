@@ -10,6 +10,7 @@
 
 #include "common/logging/log.h"
 #include "common/singleton.h"
+#include "core/bloodborne_re.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/process.h"
@@ -737,6 +738,7 @@ void EstablishConnection(s32 conn_id, bool peer_activated_hint) {
     bool send_established = false;
     u32 peer_addr = 0;
     u16 peer_port = 0;
+    std::string peer_online_id;
     {
         SignalingMutexGuard lock;
         const auto it = g_connections.find(conn_id);
@@ -756,6 +758,7 @@ void EstablishConnection(s32 conn_id, bool peer_activated_hint) {
             ArmStepCalloutLocked(ci, kKeepaliveIntervalMs * 1000);
             ci.last_peer_rx_us = NowUs();
             first_establish = true;
+            peer_online_id = OnlineIdToString(ci.online_id);
 
             if (ci.addr != 0 && ci.port != 0) {
                 established_pkt = MakeControlLocked(ci, ControlKind::Established);
@@ -789,6 +792,7 @@ void EstablishConnection(s32 conn_id, bool peer_activated_hint) {
     if (first_establish) {
         LOG_DEBUG(Lib_NpSignaling, "Connection {} -> ESTABLISHED ({})", conn_id,
                   fire_established ? "owner" : "answerer/non-owner");
+        Core::Bloodborne::NotifySeamlessNpSignalingEstablished(conn_id, peer_online_id);
     }
     if (fire_peer_activated) {
         DispatchPeerActivatedEvent(conn_id);

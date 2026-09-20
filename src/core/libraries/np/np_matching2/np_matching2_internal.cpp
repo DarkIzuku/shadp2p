@@ -337,6 +337,7 @@ void* BuildLeaveRoomPayload(ContextObject& ctx, const shadnet::LeaveRoomReply& r
         ctx.peers.clear();
         ctx.room_id = 0;
         ctx.my_member_id = 0;
+        ctx.seamless_generation = 0;
         ctx.is_room_owner = false;
     }
 

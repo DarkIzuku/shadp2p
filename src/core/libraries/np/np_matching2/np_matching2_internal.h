@@ -237,6 +237,7 @@ struct ContextObject {
     OrbisNpMatching2LobbyId lobby_id = 0;
     OrbisNpMatching2RoomId room_id = 0;
     OrbisNpMatching2RoomMemberId my_member_id = 0;
+    u64 seamless_generation = 0;
     bool is_room_owner = false;
     u32 max_slot = 5;
     OrbisNpMatching2Flags flag_attr = 0;
@@ -281,6 +282,7 @@ struct ContextObject {
         lobby_id = 0;
         room_id = 0;
         my_member_id = 0;
+        seamless_generation = 0;
         is_room_owner = false;
         max_slot = 5;
         flag_attr = 0;

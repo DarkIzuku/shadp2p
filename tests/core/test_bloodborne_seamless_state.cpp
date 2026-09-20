@@ -365,12 +365,15 @@ TEST(BloodborneSeamlessState, StaleSummonGenerationCannotCommitOrReload) {
 }
 
 TEST(BloodborneSeamlessState, ExactUserEbootSupportsGuestParamPolicy) {
+    EXPECT_TRUE(IsSeamlessGuestParamProfileSupported("cusa03173-109-d65f0b4f"));
     EXPECT_TRUE(IsSeamlessGuestParamProfileSupported("cusa03173-109-user-eboot-6764938b"));
     EXPECT_FALSE(IsSeamlessGuestParamProfileSupported("cusa03173-109-reference"));
 }
 
 TEST(BloodborneSeamlessState, ExactEbootHashAndCoreSignaturesSelectUserProfile) {
     EXPECT_TRUE(IsExpectedBloodborneEbootSha256(
+        "D65F0B4F01D59166AED16F8604196D8B7DD805ABBF0758B356E8F1354C9429F9"));
+    EXPECT_TRUE(IsLegacyBloodborneEbootSha256(
         "6764938B23539D29C936BCA9880FC4A774E7B0099CE31C7E8C4B0F8BD0BEFB80"));
     EXPECT_FALSE(IsExpectedBloodborneEbootSha256(
         "0000000000000000000000000000000000000000000000000000000000000000"));
@@ -378,6 +381,89 @@ TEST(BloodborneSeamlessState, ExactEbootHashAndCoreSignaturesSelectUserProfile) 
     EXPECT_FALSE(ShouldSelectExactBloodborneProfile(false, true));
     EXPECT_FALSE(ShouldSelectExactBloodborneProfile(true, false));
     EXPECT_FALSE(ShouldSelectExactBloodborneProfile(false, false));
+}
+
+TEST(BloodborneSeamlessState, RoomAndSignalingEventsConvergeInEitherOrder) {
+    for (const bool signalingFirst : {false, true}) {
+        PendingCrossMapSummonStateMachine machine;
+        machine.SetEnabled(true);
+        const u64 generation = machine.OnPlacementDeferred(0x15000000, 100);
+        ASSERT_TRUE(machine.OnClaimAccepted(101, generation));
+        ASSERT_TRUE(machine.OnRoomJoinStarted(102, 17, generation));
+        if (signalingFirst) {
+            ASSERT_TRUE(machine.OnSignalingEstablishedForPeer(103, 17, 2, "Izuku", generation));
+            EXPECT_FALSE(machine.Snapshot().roomJoined);
+            ASSERT_TRUE(machine.OnRoomJoinedForPeer(104, 17, 3, 2, "Izuku", generation));
+        } else {
+            ASSERT_TRUE(machine.OnRoomJoinedForPeer(103, 17, 3, 2, "Izuku", generation));
+            ASSERT_TRUE(machine.OnSignalingEstablishedForPeer(104, 17, 2, "Izuku", generation));
+        }
+        const auto snapshot = machine.Snapshot();
+        EXPECT_TRUE(snapshot.roomJoined);
+        EXPECT_TRUE(snapshot.signalingEstablished);
+        EXPECT_EQ(snapshot.expectedPeerMemberId, 2);
+        EXPECT_EQ(snapshot.expectedPeerNpid, "Izuku");
+        EXPECT_EQ(machine.Evaluate(0x15000000, 0x15000000, 105),
+                  PendingCrossMapSummonDecision::ApplyPlacement);
+        EXPECT_EQ(snapshot.reloadCount, 0);
+    }
+}
+
+TEST(BloodborneSeamlessState, GenericSignalingCanArriveBeforeRoomOrPlacement) {
+    for (const bool placementFirst : {false, true}) {
+        PendingCrossMapSummonStateMachine machine;
+        machine.SetEnabled(true);
+        u64 generation = 0;
+        if (placementFirst) {
+            generation = machine.OnPlacementDeferred(0x15000000, 100);
+            ASSERT_TRUE(machine.OnClaimAccepted(101, generation));
+        }
+
+        ASSERT_TRUE(machine.OnSignalingEstablishedForPeer(102, 0, 0, "Izuku"));
+        EXPECT_EQ(machine.LastEventReason(), placementFirst ? "accepted_pending_without_room"
+                                                            : "accepted_unbound_without_room");
+
+        if (!placementFirst) {
+            generation = machine.OnPlacementDeferred(0x15000000, 103);
+            ASSERT_TRUE(machine.OnClaimAccepted(104, generation));
+        }
+        EXPECT_TRUE(machine.Snapshot().signalingEstablished);
+        EXPECT_FALSE(machine.Snapshot().roomJoined);
+        ASSERT_TRUE(machine.OnRoomJoinedForPeer(105, 17, 3, 2, "Izuku", generation));
+        EXPECT_EQ(machine.Evaluate(0x15000000, 0x15000000, 106),
+                  PendingCrossMapSummonDecision::ApplyPlacement);
+    }
+}
+
+TEST(BloodborneSeamlessState, StaleRoomGenerationAndWrongSignalingPeerAreIgnored) {
+    PendingCrossMapSummonStateMachine machine;
+    machine.SetEnabled(true);
+    const u64 stale = machine.OnPlacementDeferred(0x18010000, 100);
+    const u64 generation = machine.OnPlacementDeferred(0x15000000, 110);
+    ASSERT_GT(generation, stale);
+    ASSERT_TRUE(machine.OnClaimAccepted(111, generation));
+    EXPECT_FALSE(machine.OnRoomJoinedForPeer(112, 17, 3, 2, "Izuku", stale));
+    EXPECT_EQ(machine.LastEventReason(), "stale_generation");
+    ASSERT_TRUE(machine.OnRoomJoinedForPeer(113, 17, 3, 2, "Izuku", generation));
+    EXPECT_FALSE(machine.OnSignalingEstablishedForPeer(114, 17, 4, "OtherPeer", generation));
+    EXPECT_EQ(machine.LastEventReason(), "peer_member_mismatch");
+    EXPECT_FALSE(machine.Snapshot().signalingEstablished);
+    ASSERT_TRUE(machine.OnSignalingEstablishedForPeer(115, 17, 2, "Izuku", generation));
+    EXPECT_TRUE(machine.Snapshot().signalingEstablished);
+}
+
+TEST(BloodborneSeamlessState, ExactPendingPeerGuardsOnlyPrematureDeactivate) {
+    PendingCrossMapSummonStateMachine machine;
+    machine.SetEnabled(true);
+    const u64 generation = machine.OnPlacementDeferred(0x15000000, 100);
+    ASSERT_TRUE(machine.OnClaimAccepted(101, generation));
+    ASSERT_TRUE(machine.OnRoomJoinStarted(102, 17, generation));
+    ASSERT_TRUE(machine.OnSignalingEstablishedForPeer(103, 17, 2, "Izuku", generation));
+    EXPECT_FALSE(machine.ShouldGuardSignalingDeactivate("Izuku", 104));
+    ASSERT_TRUE(machine.OnRoomJoinedForPeer(105, 17, 3, 2, "Izuku", generation));
+    EXPECT_TRUE(machine.ShouldGuardSignalingDeactivate("Izuku", 106));
+    EXPECT_FALSE(machine.ShouldGuardSignalingDeactivate("OtherPeer", 106));
+    EXPECT_FALSE(machine.ShouldGuardSignalingDeactivate("Izuku", 120'106));
 }
 
 TEST(BloodborneSeamlessState, InvalidSignatureNeverInstallsVerifiedHook) {

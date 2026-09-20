@@ -26,11 +26,26 @@ void ClearSeamlessHostPlacementHeader() {
 
 void NotifySeamlessSummonClaimAccepted() {}
 
-void NotifySeamlessSummonRoomJoinStarted(std::uint64_t) {}
+std::uint64_t NotifySeamlessSummonRoomJoinStarted(std::uint64_t) {
+    return 0;
+}
 
 void NotifySeamlessSummonRoomJoined(std::uint64_t) {}
 
 void NotifySeamlessSummonSignalingEstablished(std::uint64_t) {}
+
+void NotifySeamlessSummonRoomJoinedForPeer(std::uint64_t, std::uint16_t, std::uint16_t,
+                                           std::string_view, std::uint64_t) {}
+
+void NotifySeamlessSummonSignalingEstablishedForPeer(std::uint64_t, std::uint16_t, std::string_view,
+                                                     std::uint64_t) {}
+
+void NotifySeamlessNpSignalingEstablished(std::int32_t, std::string_view) {}
+
+bool TraceAndGuardSeamlessSignalingDeactivate(std::uintptr_t, std::int32_t, std::int32_t,
+                                              std::string_view, std::int32_t) {
+    return false;
+}
 
 } // namespace Core::Bloodborne
 

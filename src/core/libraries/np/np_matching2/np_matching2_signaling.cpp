@@ -142,7 +142,8 @@ void MarkMatching2PeerActive(ContextObject& ctx, OrbisNpMatching2RoomId room_id,
 
     if (first_active && !peer.sent_established) {
         peer.sent_established = true;
-        Core::Bloodborne::NotifySeamlessSummonSignalingEstablished(room_id);
+        Core::Bloodborne::NotifySeamlessSummonSignalingEstablishedForPeer(
+            room_id, member_id, OnlineIdToString(peer.online_id), ctx.seamless_generation);
         QueueMatching2SignalingEvent(ctx, room_id, member_id,
                                      ORBIS_NP_MATCHING2_SIGNALING_EVENT_ESTABLISHED, ORBIS_OK);
         LOG_INFO(Lib_NpMatching2,
