@@ -13,6 +13,7 @@ namespace Core::Bloodborne {
 std::optional<std::string> GetSeamlessHostPlacementHeader();
 bool SetSeamlessHostPlacementHeader(std::string_view value);
 void ClearSeamlessHostPlacementHeader();
+void NotifySeamlessSummonSearchObserved();
 void NotifySeamlessSummonClaimAccepted();
 std::uint64_t NotifySeamlessSummonRoomJoinStarted(std::uint64_t room_id);
 void NotifySeamlessSummonRoomJoined(std::uint64_t room_id);
