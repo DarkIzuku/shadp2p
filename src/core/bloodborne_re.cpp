@@ -301,7 +301,7 @@ constexpr std::array HunterDreamInteractionTraceSites{
     HunterDreamInteractionTraceSite{"RE_ActionCandidate.Transition",
                                     0x012F83F9,
                                     HunterDreamInteractionHook::CandidateTransition,
-                                    {0x4D, 0x8D, 0x75, 0x2C, 0x44, 0x39, 0x3E},
+                                    {0x4D, 0x8D, 0x75, 0x2C, 0x45, 0x39, 0x3E},
                                     7},
     HunterDreamInteractionTraceSite{"RE_Prompt.State",
                                     0x012F8813,
@@ -1571,6 +1571,16 @@ bool hunter_dream_interaction_session_active{};
 std::array<bool, HunterDreamInteractionTraceSites.size()>
     hunter_dream_interaction_trace_hook_installed{};
 
+struct HunterDreamInteractionOverrideState {
+    u64 blocked_object{};
+    u32 blocked_state_60{};
+    bool restore_state_60{};
+    u64 last_logged_object{};
+    HunterDreamInteractionHook last_logged_hook{HunterDreamInteractionHook::EventInstruction};
+};
+
+thread_local HunterDreamInteractionOverrideState hunter_dream_interaction_override_state{};
+
 struct MaintenanceLocatorMatch {
     u64 offset{};
     bool context_valid{};
@@ -2382,32 +2392,49 @@ struct alignas(8) SpEffectParamLookupResult {
 static_assert(offsetof(SpEffectParamLookupResult, row) == 0x08);
 static_assert(offsetof(SpEffectParamLookupResult, format) == 0x10);
 
-std::optional<u64> FindUniqueEbootSignature(std::span<const u8> signature, u64 begin, u64 end) {
+std::vector<u64> FindEbootSignatureMatches(std::span<const u8> signature, u64 begin, u64 end) {
+    std::vector<u64> matches;
     const u64 image_size = MemoryPatcher::g_eboot_image_size;
     if (image_base == 0 || signature.empty() || begin >= end || begin >= image_size)
-        return std::nullopt;
+        return matches;
     end = std::min(end, image_size);
     if (signature.size() > end - begin ||
         !HasMemoryAccess(image_base + begin, static_cast<size_t>(end - begin),
                          MemoryProt::CpuRead)) {
-        return std::nullopt;
+        return matches;
     }
 
     const auto bytes = std::span<const u8>{reinterpret_cast<const u8*>(image_base + begin),
                                            static_cast<size_t>(end - begin)};
-    std::optional<u64> match;
     auto cursor = bytes.begin();
     while (cursor != bytes.end()) {
         const auto found = std::search(cursor, bytes.end(), signature.begin(), signature.end());
         if (found == bytes.end())
             break;
-        const u64 offset = begin + static_cast<u64>(std::distance(bytes.begin(), found));
-        if (match.has_value())
-            return std::nullopt;
-        match = offset;
+        matches.push_back(begin + static_cast<u64>(std::distance(bytes.begin(), found)));
         cursor = found + 1;
     }
-    return match;
+    return matches;
+}
+
+std::string FormatEbootSignatureMatches(std::span<const u64> matches) {
+    std::ostringstream out;
+    out << '[';
+    const size_t count = std::min<size_t>(matches.size(), 12);
+    for (size_t index = 0; index < count; ++index) {
+        if (index != 0)
+            out << ',';
+        out << "0x" << std::hex << matches[index] << std::dec;
+    }
+    if (matches.size() > count)
+        out << ",...";
+    out << ']';
+    return out.str();
+}
+
+std::optional<u64> FindUniqueEbootSignature(std::span<const u8> signature, u64 begin, u64 end) {
+    const auto matches = FindEbootSignatureMatches(signature, begin, end);
+    return matches.size() == 1 ? std::optional<u64>{matches.front()} : std::nullopt;
 }
 
 void ApplySeamlessGuestParamPolicy() {
@@ -2440,8 +2467,29 @@ void ApplySeamlessGuestParamPolicy() {
         runtime_sp_effect_param_lookup_offset = lookup_site.offset;
         if (runtime_sp_effect_param_lookup_offset == 0 &&
             initial_seamless_profile->name == "cusa03173-109-d65f0b4f") {
-            runtime_sp_effect_param_lookup_offset =
-                FindUniqueEbootSignature(expected, 0x01E00000, 0x02100000).value_or(0);
+            // The legacy 676 layout places this function at 0x01F28D20. D65 has small,
+            // non-uniform code shifts elsewhere, so first search a bounded neighborhood
+            // without ever reusing the legacy address blindly.
+            const auto nearby_matches =
+                FindEbootSignatureMatches(expected, 0x01F20000, 0x01F38000);
+            LOG_INFO(Debug,
+                     "[BLOODBORNE SEAMLESS HEALTH LOCATOR] profile={} scope=near_legacy "
+                     "begin=0x01f20000 end=0x01f38000 matches={} candidates={}",
+                     initial_seamless_profile->name, nearby_matches.size(),
+                     FormatEbootSignatureMatches(nearby_matches));
+            if (nearby_matches.size() == 1) {
+                runtime_sp_effect_param_lookup_offset = nearby_matches.front();
+            } else if (nearby_matches.empty()) {
+                const auto full_matches =
+                    FindEbootSignatureMatches(expected, 0x01E00000, 0x02100000);
+                LOG_INFO(Debug,
+                         "[BLOODBORNE SEAMLESS HEALTH LOCATOR] profile={} scope=full "
+                         "begin=0x01e00000 end=0x02100000 matches={} candidates={}",
+                         initial_seamless_profile->name, full_matches.size(),
+                         FormatEbootSignatureMatches(full_matches));
+                if (full_matches.size() == 1)
+                    runtime_sp_effect_param_lookup_offset = full_matches.front();
+            }
         }
         if (runtime_sp_effect_param_lookup_offset == 0 ||
             !MatchesEstablishedTravelBytes(runtime_sp_effect_param_lookup_offset, expected)) {
@@ -4243,6 +4291,110 @@ u64 ReadInteractionCallerOffset(const GuestRegisterSnapshot& registers,
                : 0;
 }
 
+bool ShouldApplyHunterDreamLocalWorldOverride(
+    const HunterDreamInteractionRuntimeContext& context) {
+    if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP") || !context.matching.inRoom)
+        return false;
+
+    // Priority 1: preserve host interaction/travel while a guest is connected.
+    if (context.snapshot.role == HunterDreamInteractionRole::Host)
+        return true;
+
+    // Experimental local-world role: in the Dream only, let a cooperator pass
+    // local action/presentation gates without changing Matching2, CSMultiPlayMan,
+    // SummonType, faction, or network ownership.
+    return context.inHuntersDream &&
+           context.snapshot.role == HunterDreamInteractionRole::Cooperator;
+}
+
+void ApplyHunterDreamLocalWorldOverride(const HunterDreamInteractionTraceSite& site,
+                                        const GuestRegisterSnapshot* registers) {
+    if (registers == nullptr)
+        return;
+
+    const auto context = BuildHunterDreamInteractionContext();
+    if (!ShouldApplyHunterDreamLocalWorldOverride(context))
+        return;
+
+    const u64 object = registers->r13;
+    if (object < 0x10000 || !HasMemoryAccess(object, 0x64, MemoryProt::CpuRead))
+        return;
+
+    auto& state = hunter_dream_interaction_override_state;
+    auto log_applied = [&](std::string_view action) {
+        if (state.last_logged_object == object && state.last_logged_hook == site.hook)
+            return;
+        state.last_logged_object = object;
+        state.last_logged_hook = site.hook;
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS INTERACT OVERRIDE] action={} role={} "
+                 "map={:#x} object={:#x} hook={} gates={},{},{},{} state_60={:#x}",
+                 action, InteractionRoleName(context.snapshot.role), context.snapshot.map, object,
+                 site.name, ReadValue<u8>(object, 0x48), ReadValue<u8>(object, 0x49),
+                 ReadValue<u8>(object, 0x4A), ReadValue<u8>(object, 0x4B),
+                 ReadValue<u32>(object, 0x60));
+    };
+
+    switch (site.hook) {
+    case HunterDreamInteractionHook::AvailabilityGate:
+    case HunterDreamInteractionHook::DownstreamGate: {
+        bool changed = false;
+        for (size_t index = 0; index < 4; ++index) {
+            if (ReadValue<u8>(object, 0x48 + index) != 0) {
+                changed |= WriteValue(object, 0x48 + index, u8{});
+            }
+        }
+        if (changed)
+            log_applied("clear_local_action_gates");
+        break;
+    }
+    case HunterDreamInteractionHook::CandidateTransition: {
+        // Exact D65 instruction is:
+        //   lea r14,[r13+2c] ; cmp dword ptr [r14],r15d
+        // For the scoped local-world override, keep the object's own candidate/prompt
+        // id selected instead of allowing multiplayer presentation state to reject it.
+        const s32 object_candidate = ReadValue<s32>(object, 0x2C);
+        if (object_candidate >= 0 &&
+            static_cast<s32>(registers->r15) != object_candidate) {
+            auto* mutable_registers = const_cast<GuestRegisterSnapshot*>(registers);
+            mutable_registers->r15 = static_cast<u32>(object_candidate);
+            log_applied("select_local_candidate");
+        }
+        break;
+    }
+    case HunterDreamInteractionHook::Blocked:
+        state.blocked_object = object;
+        state.blocked_state_60 = ReadValue<u32>(object, 0x60);
+        state.restore_state_60 = true;
+        log_applied("preserve_pre_block_state");
+        break;
+    case HunterDreamInteractionHook::AvailabilityPublished: {
+        if (state.restore_state_60 && state.blocked_object == object) {
+            if (WriteValue(object, 0x60, state.blocked_state_60))
+                log_applied("restore_local_action_state");
+            state.restore_state_60 = false;
+        }
+
+        // This site immediately follows the availability/selection pipeline. RAX is
+        // the observed availability result and is restored from this snapshot before
+        // Bloodborne executes the copied instructions, so this is a scoped test of
+        // the remaining downstream presentation gate rather than a global NOP.
+        const bool gates_clear = ReadValue<u8>(object, 0x48) == 0 &&
+                                 ReadValue<u8>(object, 0x49) == 0 &&
+                                 ReadValue<u8>(object, 0x4A) == 0 &&
+                                 ReadValue<u8>(object, 0x4B) == 0;
+        if (gates_clear && registers->rax == 0) {
+            auto* mutable_registers = const_cast<GuestRegisterSnapshot*>(registers);
+            mutable_registers->rax = 1;
+            log_applied("force_local_availability_result");
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 void EmitHunterDreamInteractionTrace(const HunterDreamInteractionTraceSite& site,
                                      const GuestRegisterSnapshot& registers) {
     if (!hunter_dream_interaction_trace_enabled)
@@ -4507,6 +4659,7 @@ void PS4_SYSV_ABI HunterDreamInteractionTraceEntry(u64 tag,
                                                    const GuestRegisterSnapshot* registers) {
     if (tag >= HunterDreamInteractionTraceSites.size() || registers == nullptr)
         return;
+    ApplyHunterDreamLocalWorldOverride(HunterDreamInteractionTraceSites[tag], registers);
     EmitHunterDreamInteractionTrace(HunterDreamInteractionTraceSites[tag], *registers);
 }
 
@@ -8368,10 +8521,13 @@ bool InstallEstablishedTravelHooks(const EstablishedTravelProfile& profile) {
 
 void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
                                         std::string_view eboot_sha256) {
-    if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_INTERACT_TRACE")) {
+    const bool trace_requested = EnvFlagEnabled("SHADPS4_BLOODBORNE_INTERACT_TRACE");
+    const bool seamless_behavior =
+        EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP");
+    if (!trace_requested && !seamless_behavior) {
         LOG_INFO(Debug,
-                 "[BLOODBORNE SEAMLESS INTERACT STATE] enabled=false profile={} "
-                 "actual_sha256={} expected_sha256={} reason=env_disabled "
+                 "[BLOODBORNE SEAMLESS INTERACT STATE] enabled=false behavior_override=false "
+                 "profile={} actual_sha256={} expected_sha256={} reason=env_disabled "
                  "hooks_installed=0 hooks_rejected=0 hooks_total={}",
                  profile.name, eboot_sha256, HunterDreamInteractionEbootSha256,
                  HunterDreamInteractionTraceSites.size());
@@ -8387,14 +8543,14 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
         return;
     }
 
-    hunter_dream_interaction_trace_enabled = true;
+    hunter_dream_interaction_trace_enabled = trace_requested;
     hunter_dream_interaction_trace_verbose =
-        EnvFlagEnabled("SHADPS4_BLOODBORNE_INTERACT_TRACE_VERBOSE");
+        trace_requested && EnvFlagEnabled("SHADPS4_BLOODBORNE_INTERACT_TRACE_VERBOSE");
     hunter_dream_interaction_trace_sequence.store(0, std::memory_order_relaxed);
     hunter_dream_interaction_session_active = false;
     {
         std::scoped_lock lock{hunter_dream_interaction_trace_mutex};
-        hunter_dream_interaction_trace_state.SetEnabled(true);
+        hunter_dream_interaction_trace_state.SetEnabled(trace_requested);
     }
 
     size_t installed_count = 0;
@@ -8461,12 +8617,13 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
                  site.name, site.offset, BytesToHex(expected), observed);
     }
     LOG_INFO(Debug,
-             "[BLOODBORNE SEAMLESS INTERACT STATE] enabled=true verbose={} profile={} "
+             "[BLOODBORNE SEAMLESS INTERACT STATE] enabled={} verbose={} behavior_override={} "
+             "host_priority=true guest_dream_override=true profile={} "
              "actual_sha256={} expected_sha256={} hooks_installed={} hooks_rejected={} "
-             "hooks_total={} behavior_changes=false",
-             hunter_dream_interaction_trace_verbose, profile.name, eboot_sha256,
-             HunterDreamInteractionEbootSha256, installed_count, rejected_count,
-             HunterDreamInteractionTraceSites.size());
+             "hooks_total={}",
+             trace_requested, hunter_dream_interaction_trace_verbose, seamless_behavior,
+             profile.name, eboot_sha256, HunterDreamInteractionEbootSha256, installed_count,
+             rejected_count, HunterDreamInteractionTraceSites.size());
     LOG_INFO(Debug,
              "[BLOODBORNE PROFILE RESOLVE] feature=interact_trace profile={} address={:#x} "
              "validated={} hooks_installed={} hooks_rejected={}",
