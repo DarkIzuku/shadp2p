@@ -4382,11 +4382,24 @@ void ApplyHunterDreamClientGuardOverride(const GuestRegisterSnapshot& registers)
 }
 
 void RestoreHunterDreamClientGuardPatchesIfInactive() {
-    const auto matching = Libraries::Np::NpMatching2::GetSeamlessMatchingSnapshot();
-    if (EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP") &&
-        GetCurrentPackedMap() == HuntersDreamPackedMap && matching.inRoom) {
-        return;
+    {
+        std::scoped_lock lock{hunter_dream_client_guard_mutex};
+        if (hunter_dream_client_guard_patches.empty())
+            return;
     }
+
+    const auto context = BuildHunterDreamInteractionContext();
+    SeamlessPeerRole transport_role = SeamlessPeerRole::Unknown;
+    {
+        std::scoped_lock lock{seamless_placement_mutex};
+        transport_role = pending_cross_map_summon.Snapshot().role;
+    }
+    const bool keep_active = ShouldBypassHunterDreamClientGuard(
+        EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP"), context.inHuntersDream,
+        context.matching.inRoom, context.snapshot.role, transport_role,
+        context.invaderBellEffect9025 || context.invaderActiveEffect9026, 1003, 6, 1);
+    if (keep_active)
+        return;
 
     size_t restored = 0;
     size_t discarded = 0;
@@ -4411,8 +4424,9 @@ void RestoreHunterDreamClientGuardPatchesIfInactive() {
     if (restored != 0 || discarded != 0) {
         LOG_INFO(Debug,
                  "[BLOODBORNE SEAMLESS DREAM] state=ClientGuardRestored "
-                 "restored={} discarded={} map={:#x} matching_room={}",
-                 restored, discarded, GetCurrentPackedMap(), matching.inRoom);
+                 "restored={} discarded={} role={} map={:#x} matching_room={}",
+                 restored, discarded, InteractionRoleName(context.snapshot.role),
+                 context.snapshot.map, context.matching.inRoom);
     }
 }
 
