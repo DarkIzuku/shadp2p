@@ -89,6 +89,25 @@ constexpr HunterDreamInteractionRole ClassifyHunterDreamInteractionRole(bool inR
     return HunterDreamInteractionRole::Unknown;
 }
 
+constexpr bool ShouldBypassHunterDreamClientGuard(bool seamlessEnabled, bool inHuntersDream,
+                                                   bool inRoom,
+                                                   HunterDreamInteractionRole localRole,
+                                                   SeamlessPeerRole transportRole,
+                                                   bool invaderEffect, s32 eventBank,
+                                                   s32 eventCommand,
+                                                   s32 desiredMultiplayerState) {
+    if (!seamlessEnabled || !inHuntersDream || !inRoom || invaderEffect)
+        return false;
+    if (eventBank != 1003 || eventCommand != 6 || desiredMultiplayerState != 1)
+        return false;
+    if (localRole == HunterDreamInteractionRole::Host ||
+        localRole == HunterDreamInteractionRole::Cooperator) {
+        return true;
+    }
+    return localRole == HunterDreamInteractionRole::Unknown &&
+           transportRole == SeamlessPeerRole::Cooperator;
+}
+
 enum class HunterDreamInteractionKind : u32 {
     Unknown = 0,
     NormalHeadstone,
