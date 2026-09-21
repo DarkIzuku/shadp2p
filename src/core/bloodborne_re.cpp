@@ -4466,114 +4466,120 @@ u64 ReadInteractionCallerOffset(const GuestRegisterSnapshot& registers,
                : 0;
 }
 
-bool ShouldApplyHunterDreamLocalWorldOverride(
-    const HunterDreamInteractionRuntimeContext& context) {
-    if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP") || !context.inHuntersDream)
-        return false;
+constexpr u8 HunterDreamClientGuardDisabledState = 0x7F;
+constexpr size_t MaxHunterDreamClientGuardPatches = 128;
 
-    // The Beckoning-Bell requester is still outside Matching2 while polling
-    // /summon_messenger/get. Bloodborne already applies its multiplayer interaction
-    // restrictions at that point, so preserve Dream travel/services during the
-    // explicitly observed host-search window without changing ordinary solo play.
-    if (!context.matching.inRoom) {
-        return EstablishedTravelNowMs() <=
-               hunter_dream_host_search_active_until_ms.load(std::memory_order_acquire);
+bool IsHunterDreamCooperativeLocalContext(const HunterDreamInteractionRuntimeContext& context) {
+    if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP") || !context.inHuntersDream ||
+        !context.matching.inRoom ||
+        context.snapshot.role == HunterDreamInteractionRole::Invader ||
+        context.invaderBellEffect9025 || context.invaderActiveEffect9026) {
+        return false;
     }
 
-    // Once the room exists, keep the override scoped to the two cooperative roles.
-    if (context.snapshot.role == HunterDreamInteractionRole::Host)
+    if (context.snapshot.role == HunterDreamInteractionRole::Host ||
+        context.snapshot.role == HunterDreamInteractionRole::Cooperator) {
         return true;
+    }
 
-    // Experimental local-world role for the cooperator in the Dream only. Matching2,
-    // CSMultiPlayMan, SummonType, faction and network ownership remain unchanged.
-    return context.snapshot.role == HunterDreamInteractionRole::Cooperator;
+    // During the short role transition the game can report Unknown before the
+    // cooperative SpEffect arrives. The pending summon machine already has the
+    // transport role bound to the exact room/peer, so use that fact instead of
+    // pretending CSMultiPlayMan itself is in another state.
+    std::scoped_lock lock{seamless_placement_mutex};
+    return pending_cross_map_summon.Snapshot().role == SeamlessPeerRole::Cooperator;
 }
 
-void ApplyHunterDreamLocalWorldOverride(const HunterDreamInteractionTraceSite& site,
-                                        const GuestRegisterSnapshot* registers) {
-    if (registers == nullptr)
+void ApplyHunterDreamClientGuardOverride(const GuestRegisterSnapshot& registers) {
+    const auto event = ReadEventInstructionTrace(registers);
+    if (!event.valid || event.bank != 1003 || event.command != 6 ||
+        event.desiredMultiplayerState != 1 || event.arguments < 0x10000) {
         return;
+    }
 
     const auto context = BuildHunterDreamInteractionContext();
-    if (!ShouldApplyHunterDreamLocalWorldOverride(context))
+    if (!IsHunterDreamCooperativeLocalContext(context))
         return;
 
-    const u64 object = registers->r13;
-    if (object < 0x10000 || !HasMemoryAccess(object, 0x64, MemoryProt::CpuRead))
+    const u64 argument = event.arguments + 1;
+    if (!HasMemoryAccess(argument, sizeof(u8), MemoryProt::CpuRead) ||
+        !HasMemoryAccess(argument, sizeof(u8), MemoryProt::CpuWrite)) {
+        LOG_ERROR(Debug,
+                  "[BLOODBORNE SEAMLESS DREAM] state=ClientGuardBypassRejected "
+                  "reason=argument_not_writable role={} map={:#x} argument={:#x}",
+                  InteractionRoleName(context.snapshot.role), context.snapshot.map, argument);
         return;
+    }
 
-    auto& state = hunter_dream_interaction_override_state;
-    auto log_applied = [&](std::string_view action) {
-        if (state.last_logged_object == object && state.last_logged_hook == site.hook)
+    bool applied = false;
+    {
+        std::scoped_lock lock{hunter_dream_client_guard_mutex};
+        if (std::ranges::any_of(hunter_dream_client_guard_patches,
+                                [argument](const auto& patch) {
+                                    return patch.argument == argument;
+                                })) {
             return;
-        state.last_logged_object = object;
-        state.last_logged_hook = site.hook;
-        LOG_INFO(Debug,
-                 "[BLOODBORNE SEAMLESS INTERACT OVERRIDE] action={} role={} "
-                 "map={:#x} object={:#x} hook={} gates={},{},{},{} state_60={:#x}",
-                 action, InteractionRoleName(context.snapshot.role), context.snapshot.map, object,
-                 site.name, ReadValue<u8>(object, 0x48), ReadValue<u8>(object, 0x49),
-                 ReadValue<u8>(object, 0x4A), ReadValue<u8>(object, 0x4B),
-                 ReadValue<u32>(object, 0x60));
-    };
+        }
+        if (hunter_dream_client_guard_patches.size() >= MaxHunterDreamClientGuardPatches) {
+            LOG_ERROR(Debug,
+                      "[BLOODBORNE SEAMLESS DREAM] state=ClientGuardBypassRejected "
+                      "reason=patch_limit argument={:#x}",
+                      argument);
+            return;
+        }
 
-    switch (site.hook) {
-    case HunterDreamInteractionHook::AvailabilityGate:
-    case HunterDreamInteractionHook::DownstreamGate: {
-        bool changed = false;
-        for (size_t index = 0; index < 4; ++index) {
-            if (ReadValue<u8>(object, 0x48 + index) != 0) {
-                changed |= WriteValue(object, 0x48 + index, u8{});
+        const u8 original = ReadValue<u8>(argument, 0);
+        if (original != 1)
+            return;
+        if (!WriteValue(event.arguments, 1, HunterDreamClientGuardDisabledState))
+            return;
+
+        hunter_dream_client_guard_patches.push_back({argument, original});
+        applied = true;
+    }
+
+    if (applied) {
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS DREAM] state=ClientGuardBypassed "
+                 "role={} map={:#x} bank=1003 command=6 desired_state=Client "
+                 "argument={:#x} replacement={:#x}",
+                 InteractionRoleName(context.snapshot.role), context.snapshot.map, argument,
+                 HunterDreamClientGuardDisabledState);
+    }
+}
+
+void RestoreHunterDreamClientGuardPatchesIfInactive() {
+    const auto matching = Libraries::Np::NpMatching2::GetSeamlessMatchingSnapshot();
+    if (EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP") &&
+        GetCurrentPackedMap() == HuntersDreamPackedMap && matching.inRoom) {
+        return;
+    }
+
+    size_t restored = 0;
+    size_t discarded = 0;
+    {
+        std::scoped_lock lock{hunter_dream_client_guard_mutex};
+        for (const auto& patch : hunter_dream_client_guard_patches) {
+            if (!HasMemoryAccess(patch.argument, sizeof(u8), MemoryProt::CpuRead) ||
+                !HasMemoryAccess(patch.argument, sizeof(u8), MemoryProt::CpuWrite)) {
+                ++discarded;
+                continue;
+            }
+            if (ReadValue<u8>(patch.argument, 0) == HunterDreamClientGuardDisabledState &&
+                WriteValue(patch.argument, 0, patch.original)) {
+                ++restored;
+            } else {
+                ++discarded;
             }
         }
-        if (changed)
-            log_applied("clear_local_action_gates");
-        break;
+        hunter_dream_client_guard_patches.clear();
     }
-    case HunterDreamInteractionHook::CandidateTransition: {
-        // Exact D65 instruction is:
-        //   lea r14,[r13+2c] ; cmp dword ptr [r14],r15d
-        // For the scoped local-world override, keep the object's own candidate/prompt
-        // id selected instead of allowing multiplayer presentation state to reject it.
-        const s32 object_candidate = ReadValue<s32>(object, 0x2C);
-        if (object_candidate >= 0 &&
-            static_cast<s32>(registers->r15) != object_candidate) {
-            auto* mutable_registers = const_cast<GuestRegisterSnapshot*>(registers);
-            mutable_registers->r15 = static_cast<u32>(object_candidate);
-            log_applied("select_local_candidate");
-        }
-        break;
-    }
-    case HunterDreamInteractionHook::Blocked:
-        state.blocked_object = object;
-        state.blocked_state_60 = ReadValue<u32>(object, 0x60);
-        state.restore_state_60 = true;
-        log_applied("preserve_pre_block_state");
-        break;
-    case HunterDreamInteractionHook::AvailabilityPublished: {
-        if (state.restore_state_60 && state.blocked_object == object) {
-            if (WriteValue(object, 0x60, state.blocked_state_60))
-                log_applied("restore_local_action_state");
-            state.restore_state_60 = false;
-        }
 
-        // This site immediately follows the availability/selection pipeline. RAX is
-        // the observed availability result and is restored from this snapshot before
-        // Bloodborne executes the copied instructions, so this is a scoped test of
-        // the remaining downstream presentation gate rather than a global NOP.
-        const bool gates_clear = ReadValue<u8>(object, 0x48) == 0 &&
-                                 ReadValue<u8>(object, 0x49) == 0 &&
-                                 ReadValue<u8>(object, 0x4A) == 0 &&
-                                 ReadValue<u8>(object, 0x4B) == 0;
-        if (gates_clear && registers->rax == 0) {
-            auto* mutable_registers = const_cast<GuestRegisterSnapshot*>(registers);
-            mutable_registers->rax = 1;
-            log_applied("force_local_availability_result");
-        }
-        break;
-    }
-    default:
-        break;
+    if (restored != 0 || discarded != 0) {
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS DREAM] state=ClientGuardRestored "
+                 "restored={} discarded={} map={:#x} matching_room={}",
+                 restored, discarded, GetCurrentPackedMap(), matching.inRoom);
     }
 }
 
@@ -4845,8 +4851,9 @@ void PS4_SYSV_ABI HunterDreamInteractionTraceEntry(u64 tag,
     RecordHunterDreamInteractionRawHit(tag, runtime_site.offset, "direct_observer");
     if (hunter_dream_interaction_trace_runtime_offsets[tag] != 0)
         runtime_site.offset = hunter_dream_interaction_trace_runtime_offsets[tag];
-    ApplyHunterDreamLocalWorldOverride(runtime_site, registers);
     EmitHunterDreamInteractionTrace(runtime_site, *registers);
+    if (runtime_site.hook == HunterDreamInteractionHook::EventInstruction)
+        ApplyHunterDreamClientGuardOverride(*registers);
 }
 
 void WriteHex(std::ostream& out, u64 value) {
@@ -6021,6 +6028,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         // guest-play parameter rows before the role transition can apply them;
         // network callbacks never touch game memory.
         ApplySeamlessGuestParamPolicy();
+        RestoreHunterDreamClientGuardPatchesIfInactive();
         RefreshSeamlessLocalPlacement();
         // Network callbacks only retain facts. This game-thread tick centrally
         // evaluates them in any arrival order and commits the validated destination
@@ -6032,10 +6040,6 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (healing_fountain_host_availability_hook_installed &&
         site.offset == HealingFountainAvailabilityOffset) {
         ApplyHealingFountainHostAvailability(*registers);
-        ApplyHunterDreamLocalWorldOverride(
-            HunterDreamInteractionTraceSites[static_cast<size_t>(
-                HunterDreamInteractionHook::AvailabilityGate)],
-            registers);
     }
     std::optional<MaintenanceSourceRecord> maintenance_source;
     u64 early_hit{};
