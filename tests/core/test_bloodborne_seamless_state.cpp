@@ -171,6 +171,34 @@ TEST(BloodborneSeamlessState, InteractionRoleClassificationKeepsRolesDistinct) {
               HunterDreamInteractionRole::Unknown);
 }
 
+TEST(BloodborneSeamlessState, DreamClientGuardBypassIsStrictlyScoped) {
+    EXPECT_TRUE(ShouldBypassHunterDreamClientGuard(
+        true, true, true, HunterDreamInteractionRole::Host, SeamlessPeerRole::Host, false, 1003, 6,
+        1));
+    EXPECT_TRUE(ShouldBypassHunterDreamClientGuard(
+        true, true, true, HunterDreamInteractionRole::Cooperator, SeamlessPeerRole::Cooperator,
+        false, 1003, 6, 1));
+    EXPECT_TRUE(ShouldBypassHunterDreamClientGuard(
+        true, true, true, HunterDreamInteractionRole::Unknown, SeamlessPeerRole::Cooperator, false,
+        1003, 6, 1));
+
+    EXPECT_FALSE(ShouldBypassHunterDreamClientGuard(
+        true, false, true, HunterDreamInteractionRole::Host, SeamlessPeerRole::Host, false, 1003, 6,
+        1));
+    EXPECT_FALSE(ShouldBypassHunterDreamClientGuard(
+        true, true, false, HunterDreamInteractionRole::Host, SeamlessPeerRole::Host, false, 1003, 6,
+        1));
+    EXPECT_FALSE(ShouldBypassHunterDreamClientGuard(
+        true, true, true, HunterDreamInteractionRole::Invader, SeamlessPeerRole::Invader, true, 1003,
+        6, 1));
+    EXPECT_FALSE(ShouldBypassHunterDreamClientGuard(
+        true, true, true, HunterDreamInteractionRole::Host, SeamlessPeerRole::Host, false, 1003, 5,
+        1));
+    EXPECT_FALSE(ShouldBypassHunterDreamClientGuard(
+        true, true, true, HunterDreamInteractionRole::Host, SeamlessPeerRole::Host, false, 1003, 6,
+        0));
+}
+
 TEST(BloodborneSeamlessState, CrossMapSummonCommitsOnceAfterSignaling) {
     PendingCrossMapSummonStateMachine machine;
     machine.SetEnabled(true);
