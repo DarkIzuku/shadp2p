@@ -208,6 +208,7 @@ enum class PendingCrossMapSummonDecision : u32 {
     WaitForClaim,
     WaitForRoom,
     WaitForSignaling,
+    WaitForNativeHandoff,
     ApplyPlacement,
     VerifyPlacement,
     PlacementComplete,
