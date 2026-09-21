@@ -3454,6 +3454,8 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot* registers) {
             : handoff_decision == PendingCrossMapSummonDecision::WaitForRoom  ? "waiting_for_room"
             : handoff_decision == PendingCrossMapSummonDecision::WaitForSignaling
                 ? "waiting_for_signaling"
+            : handoff_decision == PendingCrossMapSummonDecision::WaitForNativeHandoff
+                ? "waiting_for_native_handoff"
             : handoff_decision == PendingCrossMapSummonDecision::StaleTarget
                 ? "stale_target"
                 : "pending_summon_unavailable";
