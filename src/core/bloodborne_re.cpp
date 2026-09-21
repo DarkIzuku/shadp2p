@@ -3185,18 +3185,40 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot* registers) {
     u64 summon_generation = 0;
     bool log_native_handoff = false;
     const bool native_handoff_callback = registers != nullptr;
+    s32 native_client_state = -1;
+    bool native_client_active_effect = false;
+    bool native_client_ready_handoff = false;
+    if (!native_handoff_callback && responder.role == SeamlessPeerRole::Cooperator &&
+        record.current_map != record.received_map && pending_snapshot.claimAccepted &&
+        pending_snapshot.roomJoined && pending_snapshot.signalingEstablished) {
+        const auto matching = Libraries::Np::NpMatching2::GetSeamlessMatchingSnapshot();
+        const u64 multi_play = GetMatchingState();
+        if (multi_play >= 0x10000 && HasMemoryAccess(multi_play, 0x128, MemoryProt::CpuRead))
+            native_client_state = ReadValue<s32>(multi_play, 0x124);
+        native_client_active_effect = HasPlayerEffect(GetLocalPlayer(), 9006);
+        // A cross-map guest can reach Bloodborne's fully active cooperative state
+        // without ever entering the later insertion callback that the retail same-map
+        // path uses. Treat that exact native convergence as an alternative handoff:
+        // room + signaling + claim are already bound to this generation, CSMultiPlay
+        // reached state 6, and the game itself applied the cooperator-active effect.
+        // This deliberately waits longer than the old forced-reload path that could
+        // run before SprjLuaEventMan was initialized.
+        native_client_ready_handoff =
+            matching.inRoom && native_client_state == 6 && native_client_active_effect;
+    }
     {
         std::scoped_lock lock{seamless_placement_mutex};
         const auto snapshot = pending_cross_map_summon.Snapshot();
         summon_generation = snapshot.generation;
-        if (native_handoff_callback) {
-            if (!pending_cross_map_summon.OnNativeHandoffObserved(
-                    record.current_map, record.received_map, responder.role,
-                    EstablishedTravelNowMs(), summon_generation)) {
+        if (native_handoff_callback || native_client_ready_handoff) {
+            const bool accepted = pending_cross_map_summon.OnNativeHandoffObserved(
+                record.current_map, record.received_map, responder.role,
+                EstablishedTravelNowMs(), summon_generation);
+            if (!accepted && native_handoff_callback) {
                 record.result = "native_handoff_rejected";
                 return;
             }
-            if (native_handoff_logged_generation != summon_generation) {
+            if (accepted && native_handoff_logged_generation != summon_generation) {
                 native_handoff_logged_generation = summon_generation;
                 log_native_handoff = true;
             }
@@ -3211,9 +3233,11 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot* registers) {
         LOG_INFO(Debug,
                  "[BLOODBORNE SEAMLESS SUMMON] generation={} "
                  "state=NativeHandoffObserved current_map={:#x} target_map={:#x} "
-                 "role={}",
+                 "role={} source={} csmultiplay_state={} active_effect_9006={}",
                  summon_generation, record.current_map, record.received_map,
-                 invader ? "Invader" : "Cooperator");
+                 invader ? "Invader" : "Cooperator",
+                 native_handoff_callback ? "native_insertion_hook" : "native_client_ready",
+                 native_client_state, native_client_active_effect);
     }
     if (native_handoff_callback) {
         record.result = "native_handoff_deferred_to_periodic_tick";
@@ -4210,6 +4234,7 @@ struct EventInstructionTraceRecord {
     s32 eventFlag{-1};
     s32 targetEntityType{-1};
     s32 helpMessageId{-1};
+    u64 instructionArgumentOffset{std::numeric_limits<u64>::max()};
 };
 
 EventInstructionTraceRecord ReadEventInstructionTraceFromContext(u64 context) {
@@ -4231,6 +4256,7 @@ EventInstructionTraceRecord ReadEventInstructionTraceFromContext(u64 context) {
         if (data >= 0x10000 && HasMemoryAccess(data, 0x80, MemoryProt::CpuRead)) {
             const u64 argument_base = ReadValue<u64>(data, 0x78);
             const u64 instruction_offset = ReadValue<u64>(definition, 0x10);
+            record.instructionArgumentOffset = instruction_offset;
             if (argument_base != std::numeric_limits<u64>::max() &&
                 data <= std::numeric_limits<u64>::max() - argument_base &&
                 data + argument_base <= std::numeric_limits<u64>::max() - instruction_offset) {
@@ -4633,7 +4659,9 @@ void EmitHunterDreamInteractionTrace(const HunterDreamInteractionTraceSite& site
         << std::dec << " event_flag=" << event_flag
         << " desired_multiplayer_state=" << desired_multiplayer_state
         << " target_entity_type=" << target_entity_type << " help_message_id=" << help_message_id
-        << " respawn_point_id=" << respawn_point << " eboot_offset=0x" << std::hex << site.offset
+        << " instruction_argument_offset=0x" << std::hex << event.instructionArgumentOffset
+        << std::dec << " respawn_point_id=" << respawn_point << " eboot_offset=0x" << std::hex
+        << site.offset
         << " caller_offset=0x" << ReadInteractionCallerOffset(registers, site.hook) << std::dec
         << " original_bytes="
         << BytesToHex(std::span<const u8>{site.expected.data(), site.expectedSize})
@@ -4700,8 +4728,11 @@ void PS4_SYSV_ABI HunterDreamInteractionTraceEntry(u64 tag,
     if (hunter_dream_interaction_trace_runtime_offsets[tag] != 0)
         runtime_site.offset = hunter_dream_interaction_trace_runtime_offsets[tag];
     EmitHunterDreamInteractionTrace(runtime_site, *registers);
-    if (runtime_site.hook == HunterDreamInteractionHook::EventInstruction)
-        ApplyHunterDreamClientGuardOverride(*registers);
+    // Do not mutate every 1003[6] Client guard in Hunter's Dream. Runtime testing
+    // showed that this broad fallback touched unrelated map events, exhausted the
+    // bounded patch table, and changed presentation without restoring interaction.
+    // Keep the dispatcher read-only until a specific event instance/instruction can
+    // be identified and patched with structural checks.
 }
 
 void WriteHex(std::ostream& out, u64 value) {
