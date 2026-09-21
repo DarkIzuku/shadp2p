@@ -1563,7 +1563,6 @@ HunterDreamInteractionTraceState hunter_dream_interaction_trace_state({.repeatAf
                                                                        .staleAfterMs = 120'000,
                                                                        .maxEntries = 512});
 std::atomic<u64> hunter_dream_interaction_trace_sequence{};
-std::atomic<s64> hunter_dream_host_search_active_until_ms{};
 bool hunter_dream_interaction_trace_enabled{};
 bool hunter_dream_interaction_trace_verbose{};
 bool hunter_dream_interaction_availability_uses_seamless_hook{};
@@ -1586,15 +1585,13 @@ std::atomic<u64> hunter_dream_event_dispatch_selected_offset{};
 std::atomic<u32> hunter_dream_event_dispatch_selected_register{
     std::numeric_limits<u32>::max()};
 
-struct HunterDreamInteractionOverrideState {
-    u64 blocked_object{};
-    u32 blocked_state_60{};
-    bool restore_state_60{};
-    u64 last_logged_object{};
-    HunterDreamInteractionHook last_logged_hook{HunterDreamInteractionHook::EventInstruction};
+struct HunterDreamClientGuardPatch {
+    u64 argument{};
+    u8 original{};
 };
 
-thread_local HunterDreamInteractionOverrideState hunter_dream_interaction_override_state{};
+std::mutex hunter_dream_client_guard_mutex;
+std::vector<HunterDreamClientGuardPatch> hunter_dream_client_guard_patches;
 
 struct MaintenanceLocatorMatch {
     u64 offset{};
