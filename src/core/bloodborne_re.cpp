@@ -8553,15 +8553,16 @@ bool InstallEstablishedTravelHooks(const EstablishedTravelProfile& profile) {
 void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
                                         std::string_view eboot_sha256) {
     const bool trace_requested = EnvFlagEnabled("SHADPS4_BLOODBORNE_INTERACT_TRACE");
-    const bool seamless_behavior =
-        EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP");
+    const bool seamless_behavior = EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP");
+    const size_t requested_hook_count =
+        trace_requested ? HunterDreamInteractionTraceSites.size() : size_t{1};
+
     if (!trace_requested && !seamless_behavior) {
         LOG_INFO(Debug,
-                 "[BLOODBORNE SEAMLESS INTERACT STATE] enabled=false behavior_override=false "
+                 "[BLOODBORNE SEAMLESS INTERACT STATE] enabled=false client_guard_override=false "
                  "profile={} actual_sha256={} expected_sha256={} reason=env_disabled "
-                 "hooks_installed=0 hooks_rejected=0 hooks_total={}",
-                 profile.name, eboot_sha256, HunterDreamInteractionEbootSha256,
-                 HunterDreamInteractionTraceSites.size());
+                 "hooks_installed=0 hooks_rejected=0 hooks_total=0",
+                 profile.name, eboot_sha256, HunterDreamInteractionEbootSha256);
         return;
     }
     if (profile.name != "cusa03173-109-d65f0b4f") {
@@ -8570,7 +8571,7 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
                   "reason=exact_user_eboot_profile_required actual_sha256={} "
                   "expected_sha256={} hooks_installed=0 hooks_rejected={} hooks_total={}",
                   profile.name, eboot_sha256, HunterDreamInteractionEbootSha256,
-                  HunterDreamInteractionTraceSites.size(), HunterDreamInteractionTraceSites.size());
+                  requested_hook_count, requested_hook_count);
         return;
     }
 
@@ -8579,12 +8580,6 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
         trace_requested && EnvFlagEnabled("SHADPS4_BLOODBORNE_INTERACT_TRACE_VERBOSE");
     hunter_dream_interaction_trace_sequence.store(0, std::memory_order_relaxed);
     hunter_dream_interaction_session_active = false;
-    hunter_dream_event_dispatch_probe_count = 0;
-    for (auto& hit : hunter_dream_event_dispatch_candidate_hits)
-        hit.store(0, std::memory_order_relaxed);
-    hunter_dream_event_dispatch_selected_offset.store(0, std::memory_order_relaxed);
-    hunter_dream_event_dispatch_selected_register.store(std::numeric_limits<u32>::max(),
-                                                        std::memory_order_relaxed);
     for (auto& hit : hunter_dream_interaction_raw_hits)
         hit.store(0, std::memory_order_relaxed);
     {
@@ -8596,29 +8591,34 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
     size_t rejected_count = 0;
     for (size_t index = 0; index < HunterDreamInteractionTraceSites.size(); ++index) {
         const auto& site = HunterDreamInteractionTraceSites[index];
+
+        // Seamless behavior needs only the verified event dispatcher. The rest of
+        // the interaction sites are diagnostics and are installed only when trace
+        // was explicitly requested.
+        if (!trace_requested && site.hook != HunterDreamInteractionHook::EventInstruction)
+            continue;
+
         hunter_dream_interaction_trace_runtime_offsets[index] = site.offset;
-        if (site.hook == HunterDreamInteractionHook::AvailabilityGate &&
+        if (trace_requested && site.hook == HunterDreamInteractionHook::AvailabilityGate &&
             healing_fountain_host_availability_hook_installed) {
             hunter_dream_interaction_availability_uses_seamless_hook = true;
             ++installed_count;
             LOG_INFO(Debug,
                      "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} eboot_offset={:#x} "
-                     "expected_bytes={} observed_bytes={} "
-                     "result=reused_seamless_observer",
+                     "expected_bytes={} observed_bytes={} result=reused_seamless_observer",
                      site.name, site.offset,
                      BytesToHex(std::span<const u8>{site.expected.data(), site.expectedSize}),
                      ReadDiagnosticBytes(image_base, MemoryPatcher::g_eboot_image_size, site.offset,
                                          site.expectedSize));
             continue;
         }
-        if (site.hook == HunterDreamInteractionHook::WarpParam &&
+        if (trace_requested && site.hook == HunterDreamInteractionHook::WarpParam &&
             established_warp_param_hook_installed) {
             hunter_dream_interaction_warp_uses_established_hook = true;
             ++installed_count;
             LOG_INFO(Debug,
                      "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} eboot_offset={:#x} "
-                     "expected_bytes={} observed_bytes={} "
-                     "result=reused_established_travel_observer",
+                     "expected_bytes={} observed_bytes={} result=reused_established_travel_observer",
                      site.name, site.offset,
                      BytesToHex(std::span<const u8>{site.expected.data(), site.expectedSize}),
                      ReadDiagnosticBytes(image_base, MemoryPatcher::g_eboot_image_size, site.offset,
@@ -8627,60 +8627,10 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
         }
 
         const auto expected = std::span<const u8>{site.expected.data(), site.expectedSize};
-        u64 resolved_offset = site.offset;
-        std::string observed = ReadDiagnosticBytes(
+        const u64 resolved_offset = site.offset;
+        const std::string observed = ReadDiagnosticBytes(
             image_base, MemoryPatcher::g_eboot_image_size, resolved_offset, expected.size());
-        bool signature_matches = MatchesEstablishedTravelBytes(resolved_offset, expected);
-
-        if (!signature_matches &&
-            site.hook == HunterDreamInteractionHook::EventInstruction) {
-            constexpr u64 EventDispatcherSearchBegin = 0x017B0000;
-            constexpr u64 EventDispatcherSearchEnd = 0x017C2000;
-            const auto candidates =
-                FindEbootSignatureMatches(expected, EventDispatcherSearchBegin,
-                                          EventDispatcherSearchEnd);
-            LOG_INFO(Debug,
-                     "[BLOODBORNE SEAMLESS INTERACT LOCATOR] hook={} static_offset={:#x} "
-                     "search_begin={:#x} search_end={:#x} matches={} candidates={}",
-                     site.name, site.offset, EventDispatcherSearchBegin,
-                     EventDispatcherSearchEnd, candidates.size(),
-                     FormatEbootSignatureMatches(candidates));
-            if (candidates.size() == 1) {
-                resolved_offset = candidates.front();
-                observed = ReadDiagnosticBytes(image_base, MemoryPatcher::g_eboot_image_size,
-                                               resolved_offset, expected.size());
-                signature_matches = MatchesEstablishedTravelBytes(resolved_offset, expected);
-            } else if (trace_requested && !candidates.empty() &&
-                       candidates.size() <= MaxHunterDreamEventDispatcherProbeCandidates) {
-                size_t armed_count = 0;
-                hunter_dream_event_dispatch_probe_count = candidates.size();
-                for (size_t candidate_index = 0; candidate_index < candidates.size();
-                     ++candidate_index) {
-                    const u64 candidate = candidates[candidate_index];
-                    hunter_dream_event_dispatch_probe_offsets[candidate_index] = candidate;
-                    if (InstallGuestCodeHook(
-                            reinterpret_cast<void*>(image_base + candidate), expected,
-                            candidate_index, HunterDreamEventDispatcherProbeEntry)) {
-                        ++armed_count;
-                    } else {
-                        LOG_ERROR(Debug,
-                                  "[BLOODBORNE SEAMLESS INTERACT LOCATOR] hook={} "
-                                  "candidate={:#x} result=runtime_probe_install_failed",
-                                  site.name, candidate);
-                    }
-                }
-                if (armed_count != 0) {
-                    hunter_dream_interaction_trace_hook_installed[index] = true;
-                    ++installed_count;
-                    LOG_INFO(Debug,
-                             "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} "
-                             "static_offset={:#x} runtime_probe_candidates={} "
-                             "runtime_probe_armed={} result=runtime_dispatch_probe_armed",
-                             site.name, site.offset, candidates.size(), armed_count);
-                    continue;
-                }
-            }
-        }
+        const bool signature_matches = MatchesEstablishedTravelBytes(resolved_offset, expected);
 
         if (!ShouldInstallBloodborneVerifiedHook(
                 profile.name == "cusa03173-109-d65f0b4f", signature_matches)) {
@@ -8702,25 +8652,23 @@ void InstallHunterDreamInteractionTrace(const EstablishedTravelProfile& profile,
                       site.name, site.offset, resolved_offset, BytesToHex(expected), observed);
             continue;
         }
-        hunter_dream_interaction_trace_runtime_offsets[index] = resolved_offset;
+
         hunter_dream_interaction_trace_hook_installed[index] = true;
         ++installed_count;
         LOG_INFO(Debug,
                  "[BLOODBORNE SEAMLESS INTERACT STATE] hook={} static_offset={:#x} "
                  "resolved_offset={:#x} expected_bytes={} observed_bytes={} "
-                 "result=read_only_observer_installed",
+                 "result=verified_hook_installed",
                  site.name, site.offset, resolved_offset, BytesToHex(expected), observed);
     }
+
     LOG_INFO(Debug,
-             "[BLOODBORNE SEAMLESS INTERACT STATE] enabled={} verbose={} behavior_override={} "
-             "host_priority=true guest_dream_override=true profile={} "
-             "actual_sha256={} expected_sha256={} hooks_installed={} hooks_rejected={} "
-             "hooks_total={} dispatcher_probe_candidates={} dispatcher_selected_offset={:#x}",
+             "[BLOODBORNE SEAMLESS INTERACT STATE] enabled={} verbose={} "
+             "client_guard_override={} profile={} actual_sha256={} expected_sha256={} "
+             "hooks_installed={} hooks_rejected={} hooks_total={}",
              trace_requested, hunter_dream_interaction_trace_verbose, seamless_behavior,
              profile.name, eboot_sha256, HunterDreamInteractionEbootSha256, installed_count,
-             rejected_count, HunterDreamInteractionTraceSites.size(),
-             hunter_dream_event_dispatch_probe_count,
-             hunter_dream_event_dispatch_selected_offset.load(std::memory_order_relaxed));
+             rejected_count, requested_hook_count);
     LOG_INFO(Debug,
              "[BLOODBORNE PROFILE RESOLVE] feature=interact_trace profile={} address={:#x} "
              "validated={} hooks_installed={} hooks_rejected={}",
