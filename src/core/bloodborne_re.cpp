@@ -7827,16 +7827,6 @@ void ClearSeamlessHostPlacementHeader() {
     pending_cross_map_summon.Reset();
 }
 
-void NotifySeamlessSummonSearchObserved() {
-    constexpr s64 HostSearchInteractionWindowMs = 30'000;
-    const s64 until = EstablishedTravelNowMs() + HostSearchInteractionWindowMs;
-    hunter_dream_host_search_active_until_ms.store(until, std::memory_order_release);
-    LOG_INFO(Debug,
-             "[BLOODBORNE SEAMLESS MATCH] state=HostSearchObserved "
-             "dream_interaction_override_until_ms={}",
-             until);
-}
-
 void NotifySeamlessSummonClaimAccepted() {
     std::scoped_lock lock{seamless_placement_mutex};
     if (pending_cross_map_summon.OnClaimAccepted(EstablishedTravelNowMs())) {
