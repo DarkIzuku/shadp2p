@@ -4316,7 +4316,8 @@ constexpr size_t MaxHunterDreamClientGuardPatches = 128;
 void ApplyHunterDreamClientGuardOverride(const GuestRegisterSnapshot& registers) {
     const auto event = ReadEventInstructionTrace(registers);
     if (!event.valid || event.bank != 1003 || event.command != 6 ||
-        event.desiredMultiplayerState != 1 || event.arguments < 0x10000) {
+        event.desiredMultiplayerState != 1 || event.arguments < 0x10000 ||
+        ReadValue<u32>(event.arguments, 0) != 0x00000100U) {
         return;
     }
 
