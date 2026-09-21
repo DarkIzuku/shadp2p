@@ -4299,27 +4299,6 @@ u64 ReadInteractionCallerOffset(const GuestRegisterSnapshot& registers,
 constexpr u8 HunterDreamClientGuardDisabledState = 0x7F;
 constexpr size_t MaxHunterDreamClientGuardPatches = 128;
 
-bool IsHunterDreamCooperativeLocalContext(const HunterDreamInteractionRuntimeContext& context) {
-    if (!EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP") || !context.inHuntersDream ||
-        !context.matching.inRoom ||
-        context.snapshot.role == HunterDreamInteractionRole::Invader ||
-        context.invaderBellEffect9025 || context.invaderActiveEffect9026) {
-        return false;
-    }
-
-    if (context.snapshot.role == HunterDreamInteractionRole::Host ||
-        context.snapshot.role == HunterDreamInteractionRole::Cooperator) {
-        return true;
-    }
-
-    // During the short role transition the game can report Unknown before the
-    // cooperative SpEffect arrives. The pending summon machine already has the
-    // transport role bound to the exact room/peer, so use that fact instead of
-    // pretending CSMultiPlayMan itself is in another state.
-    std::scoped_lock lock{seamless_placement_mutex};
-    return pending_cross_map_summon.Snapshot().role == SeamlessPeerRole::Cooperator;
-}
-
 void ApplyHunterDreamClientGuardOverride(const GuestRegisterSnapshot& registers) {
     const auto event = ReadEventInstructionTrace(registers);
     if (!event.valid || event.bank != 1003 || event.command != 6 ||
@@ -4328,8 +4307,18 @@ void ApplyHunterDreamClientGuardOverride(const GuestRegisterSnapshot& registers)
     }
 
     const auto context = BuildHunterDreamInteractionContext();
-    if (!IsHunterDreamCooperativeLocalContext(context))
+    SeamlessPeerRole transport_role = SeamlessPeerRole::Unknown;
+    {
+        std::scoped_lock lock{seamless_placement_mutex};
+        transport_role = pending_cross_map_summon.Snapshot().role;
+    }
+    if (!ShouldBypassHunterDreamClientGuard(
+            EnvFlagEnabled("SHADPS4_BLOODBORNE_SEAMLESS_COOP"), context.inHuntersDream,
+            context.matching.inRoom, context.snapshot.role, transport_role,
+            context.invaderBellEffect9025 || context.invaderActiveEffect9026, event.bank,
+            event.command, event.desiredMultiplayerState)) {
         return;
+    }
 
     const u64 argument = event.arguments + 1;
     if (!HasMemoryAccess(argument, sizeof(u8), MemoryProt::CpuRead) ||
