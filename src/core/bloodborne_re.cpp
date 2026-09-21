@@ -3225,7 +3225,8 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot* registers) {
                                (static_cast<u32>(record.current_map == record.received_map) << 4) |
                                (static_cast<u32>(snapshot.commitIssued) << 5) |
                                (static_cast<u32>(snapshot.placementApplied) << 6) |
-                               (static_cast<u32>(snapshot.placementVerified) << 7);
+                               (static_cast<u32>(snapshot.placementVerified) << 7) |
+                               (static_cast<u32>(snapshot.nativeHandoffObserved) << 8);
         if (pending_evaluation_logged_generation != summon_generation ||
             pending_evaluation_logged_bits != state_bits ||
             pending_evaluation_logged_decision != handoff_decision) {
@@ -3241,6 +3242,8 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot* registers) {
                     ? "waiting_for_room"
                 : handoff_decision == PendingCrossMapSummonDecision::WaitForSignaling
                     ? "waiting_for_signaling"
+                : handoff_decision == PendingCrossMapSummonDecision::WaitForNativeHandoff
+                    ? "waiting_for_native_handoff"
                 : handoff_decision == PendingCrossMapSummonDecision::ApplyPlacement
                     ? "ready_to_apply_target_placement"
                 : handoff_decision == PendingCrossMapSummonDecision::VerifyPlacement
