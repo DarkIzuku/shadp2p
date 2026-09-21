@@ -3184,11 +3184,12 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot* registers) {
     PendingCrossMapSummonDecision handoff_decision{};
     u64 summon_generation = 0;
     bool log_native_handoff = false;
+    const bool native_handoff_callback = registers != nullptr;
     {
         std::scoped_lock lock{seamless_placement_mutex};
         const auto snapshot = pending_cross_map_summon.Snapshot();
         summon_generation = snapshot.generation;
-        if (registers != nullptr) {
+        if (native_handoff_callback) {
             if (!pending_cross_map_summon.OnNativeHandoffObserved(
                     record.current_map, record.received_map, responder.role,
                     EstablishedTravelNowMs(), summon_generation)) {
@@ -3201,8 +3202,10 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot* registers) {
             }
         }
         pending_cross_map_summon.BindRole(responder.role, summon_generation);
-        handoff_decision = pending_cross_map_summon.Evaluate(
-            record.current_map, record.received_map, EstablishedTravelNowMs());
+        if (!native_handoff_callback) {
+            handoff_decision = pending_cross_map_summon.Evaluate(
+                record.current_map, record.received_map, EstablishedTravelNowMs());
+        }
     }
     if (log_native_handoff) {
         LOG_INFO(Debug,
@@ -3211,6 +3214,15 @@ void ApplyCrossMapSummonGuestPlacement(const GuestRegisterSnapshot* registers) {
                  "role={}",
                  summon_generation, record.current_map, record.received_map,
                  invader ? "Invader" : "Cooperator");
+    }
+    if (native_handoff_callback) {
+        record.result = "native_handoff_deferred_to_periodic_tick";
+        LOG_INFO(Debug,
+                 "[BLOODBORNE SEAMLESS SUMMON] generation={} "
+                 "state=NativeHandoffDeferredToGameThread current_map={:#x} "
+                 "target_map={:#x}",
+                 summon_generation, record.current_map, record.received_map);
+        return;
     }
     {
         PendingCrossMapSummonSnapshot snapshot;
