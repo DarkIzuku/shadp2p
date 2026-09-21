@@ -449,6 +449,8 @@ PendingCrossMapSummonDecision PendingCrossMapSummonStateMachine::Evaluate(u32 cu
         return PendingCrossMapSummonDecision::WaitForRoom;
     if (!m_pending.signalingEstablished)
         return PendingCrossMapSummonDecision::WaitForSignaling;
+    if (currentMap != targetMap && !m_pending.nativeHandoffObserved)
+        return PendingCrossMapSummonDecision::WaitForNativeHandoff;
     if (currentMap == targetMap) {
         if (!m_pending.placementApplied) {
             m_pending.phase = PendingCrossMapSummonPhase::CrossMapCommit;
