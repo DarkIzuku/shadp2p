@@ -177,10 +177,8 @@ private:
     };
 
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBufferImpl(VAddr gpu_addr, u32 size,
-                                                           bool is_written,
-                                                           bool is_texel_buffer,
-                                                           BufferId buffer_id,
-                                                           ReadUsage usage);
+                                                           bool is_written, bool is_texel_buffer,
+                                                           BufferId buffer_id, ReadUsage usage);
 
     template <typename Func>
     void ForEachBufferInRange(VAddr device_addr, u64 size, Func&& func) {
