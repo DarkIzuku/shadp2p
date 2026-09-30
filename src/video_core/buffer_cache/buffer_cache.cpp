@@ -648,9 +648,8 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferImpl(VAddr device_addr, u32 siz
     }
     Buffer& buffer = slot_buffers[buffer_id];
     const bool defer_read_protect = is_written && UseReadbackOptimizations();
-    const bool synchronized_from_image =
-        SynchronizeBuffer(buffer, device_addr, size, is_written && !defer_read_protect,
-                          is_texel_buffer);
+    const bool synchronized_from_image = SynchronizeBuffer(
+        buffer, device_addr, size, is_written && !defer_read_protect, is_texel_buffer);
     if (IsBloodborneVertexSyncEnabled() && (is_written || synchronized_from_image)) {
         bb_gpu_written_ranges.Add(device_addr, size);
     }
