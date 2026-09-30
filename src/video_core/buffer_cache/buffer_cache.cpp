@@ -135,6 +135,23 @@ void LogBloodborneManagedCopy(VAddr dst, VAddr src, u32 size, bool dst_registere
              dst, src, size, dst_registered, src_registered);
 }
 
+bool ShouldLogBloodborneRangeBarrier(bool vertex) {
+    static std::atomic<u64> vertex_barriers{0};
+    static std::atomic<u64> index_barriers{0};
+    auto& counter = vertex ? vertex_barriers : index_barriers;
+    const u64 sample = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    return sample <= 8 || (sample & (sample - 1)) == 0;
+}
+
+void LogBloodborneRangeBarrier(VAddr addr, u32 size, bool vertex) {
+    if (!ShouldLogBloodborneRangeBarrier(vertex)) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "[BB VERTEX SYNC] event=forced_range_barrier addr={:#x} size={} usage={}", addr,
+             size, vertex ? "VERTEX" : "INDEX");
+}
+
 } // namespace
 
 static bool UseReadbackOptimizations() {
@@ -386,9 +403,28 @@ void BufferCache::BindVertexBuffers(
             ObtainBufferImpl(range.base_address, size, false, false, {}, ReadUsage::Vertex);
         range.vk_buffer = buffer->buffer;
         range.offset = offset;
+        const bool bloodborne_sync = IsBloodborneVertexSyncEnabled();
         const bool bloodborne_managed =
-            IsBloodborneVertexSyncEnabled() && IsRegionRegistered(range.base_address, size);
-        if (bloodborne_managed || IsRegionGpuModified(range.base_address, size)) {
+            bloodborne_sync && IsRegionRegistered(range.base_address, size);
+        const bool gpu_dirty = IsRegionGpuModified(range.base_address, size);
+        if (bloodborne_sync && gpu_dirty) {
+            // The legacy Buffer barrier state is global to the whole backing buffer. Bloodborne
+            // can interleave GPU writes and vertex reads to different subranges of that buffer,
+            // which can make GetBarrier() believe no transition is needed. Force an exact-range
+            // GPU-write -> vertex-read dependency while leaving readbacks disabled.
+            (void)buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
+                                     vk::PipelineStageFlagBits2::eVertexAttributeInput);
+            barriers.emplace_back(vk::BufferMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eVertexAttributeInput,
+                .dstAccessMask = vk::AccessFlagBits2::eVertexAttributeRead,
+                .buffer = buffer->Handle(),
+                .offset = buffer->Offset(range.base_address),
+                .size = size,
+            });
+            LogBloodborneRangeBarrier(range.base_address, size, true);
+        } else if (bloodborne_managed || gpu_dirty) {
             if (auto barrier =
                     buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
                                        vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
@@ -446,9 +482,24 @@ void BufferCache::BindIndexBuffer(
     const u32 index_buffer_size = regs.num_indices * index_size;
     const auto [vk_buffer, offset] =
         ObtainBufferImpl(index_address, index_buffer_size, false, false, {}, ReadUsage::Index);
+    const bool bloodborne_sync = IsBloodborneVertexSyncEnabled();
     const bool bloodborne_managed =
-        IsBloodborneVertexSyncEnabled() && IsRegionRegistered(index_address, index_buffer_size);
-    if (bloodborne_managed || IsRegionGpuModified(index_address, index_buffer_size)) {
+        bloodborne_sync && IsRegionRegistered(index_address, index_buffer_size);
+    const bool gpu_dirty = IsRegionGpuModified(index_address, index_buffer_size);
+    if (bloodborne_sync && gpu_dirty) {
+        (void)vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
+                                    vk::PipelineStageFlagBits2::eIndexInput);
+        barriers.emplace_back(vk::BufferMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eIndexInput,
+            .dstAccessMask = vk::AccessFlagBits2::eIndexRead,
+            .buffer = vk_buffer->Handle(),
+            .offset = vk_buffer->Offset(index_address),
+            .size = index_buffer_size,
+        });
+        LogBloodborneRangeBarrier(index_address, index_buffer_size, false);
+    } else if (bloodborne_managed || gpu_dirty) {
         if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
                                                  vk::PipelineStageFlagBits2::eIndexInput)) {
             barriers.emplace_back(*barrier);
