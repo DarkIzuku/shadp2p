@@ -117,6 +117,9 @@ public:
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
+    /// Pre-resolves one Bloodborne buffer range before shader resources are bound.
+    void PrimeBloodborneBufferRange(VAddr addr, u32 size);
+
     /// Pre-resolves Bloodborne vertex buffers before shader resources are bound.
     void PrimeBloodborneVertexBuffers(const Vulkan::GraphicsPipeline& pipeline);
 
