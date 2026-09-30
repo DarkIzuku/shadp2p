@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: Bloodborne Vertex Sync Test - Windows x64
+
+on:
+  push:
+    branches: [bb-vertex-sync-test]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bb-vertex-sync-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build-windows:
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Cache CMake configuration
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/build
+          key: windows-sdl-ninja-cache-cmake-configuration-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+          restore-keys: |
+            windows-sdl-ninja-cache-cmake-configuration-
+
+      - name: Cache compiler output
+        uses: hendrikmuhs/ccache-action@v1.2.21
+        with:
+          append-timestamp: false
+          key: windows-sdl-cache-cmake-build-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+
+      - name: Configure
+        shell: pwsh
+        run: >-
+          cmake --fresh -G Ninja
+          -B "${{ github.workspace }}/build"
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON
+          -DCMAKE_C_COMPILER=clang-cl
+          -DCMAKE_CXX_COMPILER=clang-cl
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build shadPS4
+        shell: pwsh
+        run: >-
+          cmake --build "${{ github.workspace }}/build"
+          --config "${{ env.BUILD_TYPE }}"
+          --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Upload Windows test build
+        uses: actions/upload-artifact@v7
+        with:
+          name: shadPS4-bb-vertex-sync-test-windows-x64
+          path: ${{ github.workspace }}/build/shadPS4.exe
+          if-no-files-found: error
+          retention-days: 14
