@@ -36,6 +36,7 @@ namespace {
 struct BloodborneVertexSyncState {
     bool enabled = false;
     bool registered = false;
+    bool gpu_history = false;
     bool gpu_dirty_exact = false;
     bool gpu_dirty_page = false;
     bool fast_path_blocked = false;
@@ -63,13 +64,14 @@ BloodborneVertexSyncState QueryBloodborneVertexSync(BufferCache& cache, VAddr ad
 
     state.enabled = true;
     state.registered = cache.IsRegionRegistered(addr, size);
+    state.gpu_history = cache.IsBloodborneGpuWritten(addr, size);
     state.gpu_dirty_exact = cache.IsRegionGpuModified(addr, size);
 
     const VAddr page_begin = Common::AlignDown(addr, BufferCache::CACHING_PAGESIZE);
     const VAddr page_end = Common::AlignUp(addr + size, BufferCache::CACHING_PAGESIZE);
     state.gpu_dirty_page = cache.IsRegionGpuModified(page_begin, page_end - page_begin);
     state.fast_path_blocked =
-        size <= BufferCache::CACHING_PAGESIZE && (state.registered || state.gpu_dirty_page);
+        size <= BufferCache::CACHING_PAGESIZE && (state.gpu_dirty_exact || state.gpu_history);
     return state;
 }
 
@@ -95,10 +97,10 @@ void LogBloodborneVertexSync(VAddr addr, u32 size, const BloodborneVertexSyncSta
         return;
     }
     LOG_INFO(Render_Vulkan,
-             "[BB VERTEX SYNC] addr={:#x} size={} registered={} gpu_dirty_exact={} "
-             "gpu_dirty_page={} fast_path_blocked={} usage={}",
-             addr, size, state.registered, state.gpu_dirty_exact, state.gpu_dirty_page,
-             state.fast_path_blocked, vertex ? "VERTEX" : "INDEX");
+             "[BB VERTEX SYNC] addr={:#x} size={} registered={} gpu_history={} "
+             "gpu_dirty_exact={} gpu_dirty_page={} fast_path_blocked={} usage={}",
+             addr, size, state.registered, state.gpu_history, state.gpu_dirty_exact,
+             state.gpu_dirty_page, state.fast_path_blocked, vertex ? "VERTEX" : "INDEX");
 }
 
 } // namespace
@@ -287,6 +289,83 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     }
 }
 
+bool BufferCache::IsBloodborneGpuWritten(VAddr addr, size_t size) const {
+    return bb_gpu_written_ranges.Intersects(addr, size);
+}
+
+void BufferCache::PrimeBloodborneBufferRange(VAddr addr, u32 size) {
+    if (!IsBloodborneVertexSyncEnabled() || addr == 0 || size == 0) {
+        return;
+    }
+    const u64 clamped_size = memory->ClampRangeSize(addr, size);
+    if (clamped_size == 0) {
+        return;
+    }
+    (void)FindBuffer(addr, static_cast<u32>(clamped_size));
+}
+
+void BufferCache::PrimeBloodborneVertexBuffers(const Vulkan::GraphicsPipeline& pipeline) {
+    if (!IsBloodborneVertexSyncEnabled()) {
+        return;
+    }
+
+    const auto& regs = liverpool->regs;
+    Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    Vulkan::VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
+    pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
+                             regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+    if (bindings.empty()) {
+        return;
+    }
+
+    struct PrimeRange {
+        VAddr base_address;
+        VAddr end_address;
+    };
+    Vulkan::VertexInputs<PrimeRange> ranges{};
+    for (const auto& buffer : guest_buffers) {
+        if (buffer.base_address != 0 && buffer.GetSize() > 0) {
+            ranges.emplace_back(buffer.base_address, buffer.base_address + buffer.GetSize());
+        }
+    }
+    if (ranges.empty()) {
+        return;
+    }
+
+    std::ranges::sort(ranges, [](const PrimeRange& lhs, const PrimeRange& rhs) {
+        return lhs.base_address < rhs.base_address;
+    });
+    Vulkan::VertexInputs<PrimeRange> merged{};
+    merged.emplace_back(ranges.front());
+    for (const auto& range : ranges | std::views::drop(1)) {
+        auto& previous = merged.back();
+        if (previous.end_address < range.base_address) {
+            merged.emplace_back(range);
+        } else {
+            previous.end_address = std::max(previous.end_address, range.end_address);
+        }
+    }
+
+    for (const auto& range : merged) {
+        PrimeBloodborneBufferRange(range.base_address,
+                                   static_cast<u32>(range.end_address - range.base_address));
+    }
+}
+
+void BufferCache::PrimeBloodborneIndexBuffer(u32 index_offset) {
+    if (!IsBloodborneVertexSyncEnabled()) {
+        return;
+    }
+    const auto& regs = liverpool->regs;
+    const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+    const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
+    const VAddr index_address =
+        regs.index_base_address.Address<VAddr>() + index_offset * index_size;
+    PrimeBloodborneBufferRange(index_address, regs.num_indices * index_size);
+}
+
 void BufferCache::BindVertexBuffers(
     const Vulkan::GraphicsPipeline& pipeline,
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
@@ -352,9 +431,10 @@ void BufferCache::BindVertexBuffers(
             ObtainBufferImpl(range.base_address, size, false, false, {}, ReadUsage::Vertex);
         range.vk_buffer = buffer->buffer;
         range.offset = offset;
-        const bool bloodborne_managed =
-            IsBloodborneVertexSyncEnabled() && IsRegionRegistered(range.base_address, size);
-        if (bloodborne_managed || IsRegionGpuModified(range.base_address, size)) {
+        const bool gpu_dirty = IsRegionGpuModified(range.base_address, size);
+        const bool bloodborne_gpu_owned =
+            IsBloodborneVertexSyncEnabled() && IsBloodborneGpuWritten(range.base_address, size);
+        if (bloodborne_gpu_owned || gpu_dirty) {
             if (auto barrier =
                     buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
                                        vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
@@ -412,9 +492,10 @@ void BufferCache::BindIndexBuffer(
     const u32 index_buffer_size = regs.num_indices * index_size;
     const auto [vk_buffer, offset] =
         ObtainBufferImpl(index_address, index_buffer_size, false, false, {}, ReadUsage::Index);
-    const bool bloodborne_managed =
-        IsBloodborneVertexSyncEnabled() && IsRegionRegistered(index_address, index_buffer_size);
-    if (bloodborne_managed || IsRegionGpuModified(index_address, index_buffer_size)) {
+    const bool gpu_dirty = IsRegionGpuModified(index_address, index_buffer_size);
+    const bool bloodborne_gpu_owned =
+        IsBloodborneVertexSyncEnabled() && IsBloodborneGpuWritten(index_address, index_buffer_size);
+    if (bloodborne_gpu_owned || gpu_dirty) {
         if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
                                                  vk::PipelineStageFlagBits2::eIndexInput)) {
             barriers.emplace_back(*barrier);
@@ -566,8 +647,12 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferImpl(VAddr device_addr, u32 siz
     }
     Buffer& buffer = slot_buffers[buffer_id];
     const bool defer_read_protect = is_written && UseReadbackOptimizations();
-    SynchronizeBuffer(buffer, device_addr, size, is_written && !defer_read_protect,
-                      is_texel_buffer);
+    const bool synchronized_from_image =
+        SynchronizeBuffer(buffer, device_addr, size, is_written && !defer_read_protect,
+                          is_texel_buffer);
+    if (IsBloodborneVertexSyncEnabled() && (is_written || synchronized_from_image)) {
+        bb_gpu_written_ranges.Add(device_addr, size);
+    }
     if (is_written) {
         if (defer_read_protect) {
             if (UseOptimizedReadbacksV2()) {
