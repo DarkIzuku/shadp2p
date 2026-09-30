@@ -2,9 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <string_view>
 #include "common/alignment.h"
 #include "common/debug.h"
+#include "common/logging/log.h"
+#include "common/memory_patcher.h"
 #include "common/scope_exit.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -25,6 +30,79 @@ static constexpr size_t StagingBufferSize = 512_MB;
 static constexpr size_t DownloadBufferSize = 128_MB;
 static constexpr size_t UboStreamBufferSize = 64_MB;
 static constexpr size_t DeviceBufferSize = 128_MB;
+
+namespace {
+
+struct BloodborneVertexSyncState {
+    bool enabled = false;
+    bool registered = false;
+    bool gpu_dirty_exact = false;
+    bool gpu_dirty_page = false;
+    bool fast_path_blocked = false;
+};
+
+constexpr std::array<std::string_view, 8> BloodborneSerials = {
+    "CUSA03173", "CUSA00900", "CUSA00208", "CUSA00207",
+    "CUSA01363", "CUSA03023", "CUSA00299", "CUSA03014",
+};
+
+bool IsBloodborneTitle() {
+    const std::string_view serial{MemoryPatcher::g_game_serial};
+    return std::ranges::find(BloodborneSerials, serial) != BloodborneSerials.end();
+}
+
+bool IsBloodborneVertexSyncEnabled() {
+    return IsBloodborneTitle() &&
+           EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Disabled;
+}
+
+BloodborneVertexSyncState QueryBloodborneVertexSync(BufferCache& cache, VAddr addr, u32 size) {
+    BloodborneVertexSyncState state{};
+    if (!IsBloodborneVertexSyncEnabled() || size == 0) {
+        return state;
+    }
+
+    state.enabled = true;
+    state.registered = cache.IsRegionRegistered(addr, size);
+    state.gpu_dirty_exact = cache.IsRegionGpuModified(addr, size);
+
+    const VAddr page_begin = Common::AlignDown(addr, BufferCache::CACHING_PAGESIZE);
+    const VAddr page_end = Common::AlignUp(addr + size, BufferCache::CACHING_PAGESIZE);
+    state.gpu_dirty_page = cache.IsRegionGpuModified(page_begin, page_end - page_begin);
+    state.fast_path_blocked =
+        size <= BufferCache::CACHING_PAGESIZE && (state.registered || state.gpu_dirty_page);
+    return state;
+}
+
+bool ShouldLogBloodborneVertexSync(bool vertex, bool blocked) {
+    static std::atomic<u64> vertex_blocked{0};
+    static std::atomic<u64> vertex_allowed{0};
+    static std::atomic<u64> index_blocked{0};
+    static std::atomic<u64> index_allowed{0};
+
+    auto& counter = vertex ? (blocked ? vertex_blocked : vertex_allowed)
+                           : (blocked ? index_blocked : index_allowed);
+    const u64 sample = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!blocked) {
+        return sample <= 4;
+    }
+    return sample <= 8 || (sample & (sample - 1)) == 0;
+}
+
+void LogBloodborneVertexSync(VAddr addr, u32 size, const BloodborneVertexSyncState& state,
+                            bool vertex) {
+    if (size > BufferCache::CACHING_PAGESIZE ||
+        !ShouldLogBloodborneVertexSync(vertex, state.fast_path_blocked)) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "[BB VERTEX SYNC] addr={:#x} size={} registered={} gpu_dirty_exact={} "
+             "gpu_dirty_page={} fast_path_blocked={} usage={}",
+             addr, size, state.registered, state.gpu_dirty_exact, state.gpu_dirty_page,
+             state.fast_path_blocked, vertex ? "VERTEX" : "INDEX");
+}
+
+} // namespace
 
 static bool UseReadbackOptimizations() {
     const auto mode = static_cast<GpuReadbacksMode>(EmulatorSettings.GetReadbacksMode());
@@ -271,10 +349,13 @@ void BufferCache::BindVertexBuffers(
     // Map buffers for merged ranges
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
-        const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
+        const auto [buffer, offset] =
+            ObtainBufferImpl(range.base_address, size, false, false, {}, ReadUsage::Vertex);
         range.vk_buffer = buffer->buffer;
         range.offset = offset;
-        if (IsRegionGpuModified(range.base_address, size)) {
+        const bool bloodborne_managed =
+            IsBloodborneVertexSyncEnabled() && IsRegionRegistered(range.base_address, size);
+        if (bloodborne_managed || IsRegionGpuModified(range.base_address, size)) {
             if (auto barrier =
                     buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
                                        vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
@@ -330,8 +411,11 @@ void BufferCache::BindIndexBuffer(
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
-    const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
-    if (IsRegionGpuModified(index_address, index_buffer_size)) {
+    const auto [vk_buffer, offset] =
+        ObtainBufferImpl(index_address, index_buffer_size, false, false, {}, ReadUsage::Index);
+    const bool bloodborne_managed =
+        IsBloodborneVertexSyncEnabled() && IsRegionRegistered(index_address, index_buffer_size);
+    if (bloodborne_managed || IsRegionGpuModified(index_address, index_buffer_size)) {
         if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
                                                  vk::PipelineStageFlagBits2::eIndexInput)) {
             barriers.emplace_back(*barrier);
@@ -449,10 +533,35 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     });
 }
 
-std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
-                                                  bool is_texel_buffer, BufferId buffer_id) {
+std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
+                                                  bool is_written, bool is_texel_buffer,
+                                                  BufferId buffer_id) {
+    return ObtainBufferImpl(device_addr, size, is_written, is_texel_buffer, buffer_id,
+                            ReadUsage::Generic);
+}
+
+std::pair<Buffer*, u32> BufferCache::ObtainBufferImpl(VAddr device_addr, u32 size, bool is_written,
+                                                      bool is_texel_buffer, BufferId buffer_id,
+                                                      ReadUsage usage) {
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
+    // Bloodborne's vertex/index path is deliberately more conservative while readbacks are
+    // disabled: once a range belongs to the managed cache, or any 16 KiB cache page touched by
+    // the request is GPU-dirty, keep the read GPU-resident instead of copying stale guest RAM.
+    const bool bloodborne_vertex_or_index =
+        usage == ReadUsage::Vertex || usage == ReadUsage::Index;
+    BloodborneVertexSyncState bb_sync{};
+    if (!is_written && bloodborne_vertex_or_index) {
+        bb_sync = QueryBloodborneVertexSync(*this, device_addr, size);
+        if (bb_sync.enabled) {
+            LogBloodborneVertexSync(device_addr, size, bb_sync, usage == ReadUsage::Vertex);
+        }
+    }
+
+    const bool can_use_stream =
+        !is_written && size <= CACHING_PAGESIZE &&
+        (bb_sync.enabled ? !bb_sync.fast_path_blocked
+                         : !IsRegionGpuModified(device_addr, size));
+    if (can_use_stream) {
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
         return {&stream_buffer, offset};
     }
