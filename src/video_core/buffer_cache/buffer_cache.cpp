@@ -36,6 +36,8 @@ namespace {
 struct BloodborneVertexSyncState {
     bool enabled = false;
     bool registered = false;
+    bool cpu_dirty_exact = false;
+    bool cpu_dirty_page = false;
     bool gpu_dirty_exact = false;
     bool gpu_dirty_page = false;
     bool fast_path_blocked = false;
@@ -63,10 +65,12 @@ BloodborneVertexSyncState QueryBloodborneVertexSync(BufferCache& cache, VAddr ad
 
     state.enabled = true;
     state.registered = cache.IsRegionRegistered(addr, size);
+    state.cpu_dirty_exact = cache.IsRegionCpuModified(addr, size);
     state.gpu_dirty_exact = cache.IsRegionGpuModified(addr, size);
 
     const VAddr page_begin = Common::AlignDown(addr, BufferCache::CACHING_PAGESIZE);
     const VAddr page_end = Common::AlignUp(addr + size, BufferCache::CACHING_PAGESIZE);
+    state.cpu_dirty_page = cache.IsRegionCpuModified(page_begin, page_end - page_begin);
     state.gpu_dirty_page = cache.IsRegionGpuModified(page_begin, page_end - page_begin);
     state.fast_path_blocked =
         size <= BufferCache::CACHING_PAGESIZE && (state.registered || state.gpu_dirty_page);
@@ -95,10 +99,40 @@ void LogBloodborneVertexSync(VAddr addr, u32 size, const BloodborneVertexSyncSta
         return;
     }
     LOG_INFO(Render_Vulkan,
-             "[BB VERTEX SYNC] addr={:#x} size={} registered={} gpu_dirty_exact={} "
-             "gpu_dirty_page={} fast_path_blocked={} usage={}",
-             addr, size, state.registered, state.gpu_dirty_exact, state.gpu_dirty_page,
-             state.fast_path_blocked, vertex ? "VERTEX" : "INDEX");
+             "[BB VERTEX SYNC] addr={:#x} size={} registered={} cpu_dirty_exact={} "
+             "cpu_dirty_page={} gpu_dirty_exact={} gpu_dirty_page={} fast_path_blocked={} usage={}",
+             addr, size, state.registered, state.cpu_dirty_exact, state.cpu_dirty_page,
+             state.gpu_dirty_exact, state.gpu_dirty_page, state.fast_path_blocked,
+             vertex ? "VERTEX" : "INDEX");
+}
+
+bool ShouldLogBloodborneManagedGpuOp(bool copy) {
+    static std::atomic<u64> forced_fill{0};
+    static std::atomic<u64> forced_copy{0};
+    auto& counter = copy ? forced_copy : forced_fill;
+    const u64 sample = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    return sample <= 8 || (sample & (sample - 1)) == 0;
+}
+
+void LogBloodborneManagedFill(VAddr addr, u32 size) {
+    if (!ShouldLogBloodborneManagedGpuOp(false)) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "[BB VERTEX SYNC] event=managed_fill_gpu addr={:#x} size={} registered=true "
+             "gpu_dirty=false",
+             addr, size);
+}
+
+void LogBloodborneManagedCopy(VAddr dst, VAddr src, u32 size, bool dst_registered,
+                              bool src_registered) {
+    if (!ShouldLogBloodborneManagedGpuOp(true)) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "[BB VERTEX SYNC] event=managed_copy_gpu dst={:#x} src={:#x} size={} "
+             "dst_registered={} src_registered={} dst_gpu_dirty=false src_gpu_dirty=false",
+             dst, src, size, dst_registered, src_registered);
 }
 
 } // namespace
@@ -428,10 +462,16 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
     ASSERT_MSG(address % 4 == 0, "GDS offset must be dword aligned");
     if (!is_gds) {
         texture_cache.ClearMeta(address);
-        if (!IsRegionGpuModified(address, num_bytes)) {
+        const bool gpu_modified = IsRegionGpuModified(address, num_bytes);
+        const bool bloodborne_managed =
+            IsBloodborneVertexSyncEnabled() && IsRegionRegistered(address, num_bytes);
+        if (!gpu_modified && !bloodborne_managed) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + num_bytes / sizeof(u32), value);
             return;
+        }
+        if (!gpu_modified && bloodborne_managed) {
+            LogBloodborneManagedFill(address, num_bytes);
         }
     }
     Buffer* buffer = [&] {
@@ -445,12 +485,24 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
 }
 
 void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
-    if (!dst_gds && !IsRegionGpuModified(dst, num_bytes)) {
-        if (!src_gds && !IsRegionGpuModified(src, num_bytes) &&
-            !texture_cache.FindImageFromRange(src, num_bytes)) {
+    const bool dst_gpu_modified = !dst_gds && IsRegionGpuModified(dst, num_bytes);
+    const bool src_gpu_modified = !src_gds && IsRegionGpuModified(src, num_bytes);
+    const bool dst_registered =
+        !dst_gds && IsBloodborneVertexSyncEnabled() && IsRegionRegistered(dst, num_bytes);
+    const bool src_registered =
+        !src_gds && IsBloodborneVertexSyncEnabled() && IsRegionRegistered(src, num_bytes);
+    const bool bloodborne_managed = dst_registered || src_registered;
+    const bool has_source_image =
+        !src_gds && texture_cache.FindImageFromRange(src, num_bytes) != ImageId{};
+
+    if (!dst_gds && !dst_gpu_modified) {
+        if (!src_gds && !src_gpu_modified && !has_source_image && !bloodborne_managed) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
             memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             return;
+        }
+        if (!src_gds && !src_gpu_modified && !has_source_image && bloodborne_managed) {
+            LogBloodborneManagedCopy(dst, src, num_bytes, dst_registered, src_registered);
         }
         // Without a readback there's nothing we can do with this
         // Fallback to creating dst buffer on GPU to at least have this data there
