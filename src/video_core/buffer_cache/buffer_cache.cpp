@@ -339,7 +339,8 @@ void BufferCache::PrimeBloodborneVertexBuffers(const Vulkan::GraphicsPipeline& p
     });
     Vulkan::VertexInputs<PrimeRange> merged{};
     merged.emplace_back(ranges.front());
-    for (const auto& range : ranges | std::views::drop(1)) {
+    for (u32 i = 1; i < ranges.size(); ++i) {
+        const auto& range = ranges[i];
         auto& previous = merged.back();
         if (previous.end_address < range.base_address) {
             merged.emplace_back(range);
