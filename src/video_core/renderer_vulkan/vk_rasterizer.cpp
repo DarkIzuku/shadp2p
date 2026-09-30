@@ -202,6 +202,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     PrepareRenderState(pipeline);
+    buffer_cache.PrimeBloodborneVertexBuffers(*pipeline);
+    if (is_indexed) {
+        buffer_cache.PrimeBloodborneIndexBuffer(index_offset);
+    }
     if (!BindResources(pipeline)) {
         return;
     }
@@ -251,6 +255,14 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     PrepareRenderState(pipeline);
+    buffer_cache.PrimeBloodborneVertexBuffers(*pipeline);
+    if (is_indexed) {
+        buffer_cache.PrimeBloodborneIndexBuffer(0);
+    }
+    buffer_cache.PrimeBloodborneBufferRange(arg_address + offset, stride * max_count);
+    if (count_address != 0) {
+        buffer_cache.PrimeBloodborneBufferRange(count_address, 4);
+    }
     if (!BindResources(pipeline)) {
         return;
     }
@@ -358,6 +370,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         return;
     }
 
+    buffer_cache.PrimeBloodborneBufferRange(address + offset, size);
     if (!BindResources(pipeline)) {
         return;
     }
@@ -410,6 +423,24 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;
+    }
+
+    // The legacy cache can replace backing buffers during JoinOverlap. Resolve every shader
+    // buffer first so later descriptor and vertex/index binding in this draw cannot invalidate a
+    // buffer object that was already referenced earlier in the same draw/dispatch.
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& desc : stage->buffers) {
+            if (desc.IsSpecial()) {
+                continue;
+            }
+            const auto vsharp = desc.GetSharp(*stage);
+            if (vsharp.base_address != 0 && vsharp.GetSize() > 0) {
+                buffer_cache.PrimeBloodborneBufferRange(vsharp.base_address, vsharp.GetSize());
+            }
+        }
     }
 
     set_write_index = 0;
