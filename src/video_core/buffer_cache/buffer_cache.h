@@ -117,6 +117,15 @@ public:
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
+    /// Pre-resolves Bloodborne vertex buffers before shader resources are bound.
+    void PrimeBloodborneVertexBuffers(const Vulkan::GraphicsPipeline& pipeline);
+
+    /// Pre-resolves the Bloodborne index buffer before shader resources are bound.
+    void PrimeBloodborneIndexBuffer(u32 index_offset);
+
+    /// Returns whether the range has been used as a GPU-written Bloodborne buffer.
+    [[nodiscard]] bool IsBloodborneGpuWritten(VAddr addr, size_t size) const;
+
     /// Binds host vertex buffers for the current draw.
     void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
                            boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
@@ -247,6 +256,10 @@ private:
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
     RangeSet gpu_modified_ranges_pending;
+    // Bloodborne-only ownership hint: unlike the readback tracker this is never consumed by
+    // downloads. It remembers ranges that have actually been GPU-written so read-only vertex
+    // and index fetches can stay GPU-resident without treating every registered buffer as dirty.
+    RangeSet bb_gpu_written_ranges;
     struct PreemptiveDownload {
         VAddr device_addr;
         u64 size;
