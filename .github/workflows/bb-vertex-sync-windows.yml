@@ -5,14 +5,14 @@ name: Bloodborne Vertex Sync Test - Windows x64
 
 on:
   push:
-    branches: [bb-vertex-sync-test]
+    branches: [bb-vertex-sync-test-v2]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: bb-vertex-sync-windows-${{ github.ref }}
+  group: bb-vertex-sync-v2-windows-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -62,7 +62,7 @@ jobs:
       - name: Upload Windows test build
         uses: actions/upload-artifact@v7
         with:
-          name: shadPS4-bb-vertex-sync-test-windows-x64
+          name: shadPS4-bb-vertex-sync-test-v2-windows-x64
           path: ${{ github.workspace }}/build/shadPS4.exe
           if-no-files-found: error
           retention-days: 14
