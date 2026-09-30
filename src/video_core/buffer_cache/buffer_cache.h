@@ -148,6 +148,9 @@ public:
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// Return true when Bloodborne has actually written this exact range from the GPU.
+    [[nodiscard]] bool IsBloodborneGpuWritten(VAddr addr, size_t size) const;
+
     /// Return buffer id for the specified region
     BufferId FindBuffer(VAddr device_addr, u32 size);
 
@@ -247,6 +250,9 @@ private:
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
     RangeSet gpu_modified_ranges_pending;
+    // Bloodborne-only exact ownership hint. Unlike MemoryTracker's page-level dirty state this
+    // records only ranges that were actually written from the GPU and is cleared on CPU writes.
+    RangeSet bb_gpu_written_ranges;
     struct PreemptiveDownload {
         VAddr device_addr;
         u64 size;
