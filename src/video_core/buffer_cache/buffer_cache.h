@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
 #include <boost/container/flat_map.hpp>
 #include <boost/container/small_vector.hpp>
 
@@ -247,6 +251,14 @@ private:
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
     RangeSet gpu_modified_ranges_pending;
+
+    // Bloodborne + Readbacks Disabled: snapshot guest CPU pages immediately before the first
+    // CPU write that collides with GPU-dirty data. SynchronizeBuffer later diffs the current
+    // guest page against this snapshot and uploads only the bytes actually changed by the CPU,
+    // preserving newer GPU-only data in the rest of the page.
+    std::mutex bb_cpu_shadow_mutex;
+    std::unordered_map<VAddr, std::vector<u8>> bb_cpu_shadow_pages;
+
     struct PreemptiveDownload {
         VAddr device_addr;
         u64 size;
