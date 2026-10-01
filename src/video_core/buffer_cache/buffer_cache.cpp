@@ -101,6 +101,38 @@ void LogBloodborneVertexSync(VAddr addr, u32 size, const BloodborneVertexSyncSta
              state.fast_path_blocked, vertex ? "VERTEX" : "INDEX");
 }
 
+bool ShouldLogBloodborneRace(bool cpu_fault) {
+    static std::atomic<u64> cpu_fault_count{0};
+    static std::atomic<u64> upload_conflict_count{0};
+    auto& counter = cpu_fault ? cpu_fault_count : upload_conflict_count;
+    const u64 sample = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    return sample <= 32 || (sample & (sample - 1)) == 0;
+}
+
+void LogBloodborneCpuGpuRace(VAddr addr, u64 size, bool gpu_dirty_exact, bool gpu_dirty_page) {
+    if (!ShouldLogBloodborneRace(true)) {
+        return;
+    }
+    const VAddr page_begin = Common::AlignDown(addr, TRACKER_BYTES_PER_PAGE);
+    const VAddr page_end = Common::AlignUp(addr + size, TRACKER_BYTES_PER_PAGE);
+    LOG_INFO(Render_Vulkan,
+             "[BB VERTEX RACE] event=cpu_write_on_gpu_dirty addr={:#x} size={} page_begin={:#x} "
+             "page_size={} gpu_dirty_exact={} gpu_dirty_page={}",
+             addr, size, page_begin, page_end - page_begin, gpu_dirty_exact, gpu_dirty_page);
+}
+
+void LogBloodborneUploadConflict(VAddr addr, u32 size, bool is_written, bool is_texel_buffer) {
+    if (!ShouldLogBloodborneRace(false)) {
+        return;
+    }
+    const VAddr page_begin = Common::AlignDown(addr, TRACKER_BYTES_PER_PAGE);
+    const VAddr page_end = Common::AlignUp(addr + size, TRACKER_BYTES_PER_PAGE);
+    LOG_INFO(Render_Vulkan,
+             "[BB VERTEX RACE] event=cpu_gpu_dirty_upload addr={:#x} size={} page_begin={:#x} "
+             "page_size={} is_written={} is_texel={}",
+             addr, size, page_begin, page_end - page_begin, is_written, is_texel_buffer);
+}
+
 } // namespace
 
 static bool UseReadbackOptimizations() {
@@ -170,6 +202,15 @@ BufferCache::~BufferCache() = default;
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
     if (!IsRegionRegistered(device_addr, size)) {
         return;
+    }
+    if (IsBloodborneVertexSyncEnabled()) {
+        const VAddr page_begin = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
+        const VAddr page_end = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
+        const bool gpu_dirty_exact = IsRegionGpuModified(device_addr, size);
+        const bool gpu_dirty_page = IsRegionGpuModified(page_begin, page_end - page_begin);
+        if (gpu_dirty_exact || gpu_dirty_page) {
+            LogBloodborneCpuGpuRace(device_addr, size, gpu_dirty_exact, gpu_dirty_page);
+        }
     }
     memory_tracker->InvalidateRegion(
         device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
@@ -975,6 +1016,10 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer) {
+    if (IsBloodborneVertexSyncEnabled() && IsRegionCpuModified(device_addr, size) &&
+        IsRegionGpuModified(device_addr, size)) {
+        LogBloodborneUploadConflict(device_addr, size, is_written, is_texel_buffer);
+    }
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
