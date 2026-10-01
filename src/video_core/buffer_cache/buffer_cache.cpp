@@ -35,9 +35,6 @@ namespace {
 
 struct BloodborneVertexSyncState {
     bool enabled = false;
-    bool registered = false;
-    bool gpu_dirty_exact = false;
-    bool gpu_dirty_page = false;
     bool fast_path_blocked = false;
 };
 
@@ -62,90 +59,46 @@ BloodborneVertexSyncState QueryBloodborneVertexSync(BufferCache& cache, VAddr ad
     }
 
     state.enabled = true;
-    state.registered = cache.IsRegionRegistered(addr, size);
-    state.gpu_dirty_exact = cache.IsRegionGpuModified(addr, size);
-
+    const bool registered = cache.IsRegionRegistered(addr, size);
     const VAddr page_begin = Common::AlignDown(addr, BufferCache::CACHING_PAGESIZE);
     const VAddr page_end = Common::AlignUp(addr + size, BufferCache::CACHING_PAGESIZE);
-    state.gpu_dirty_page = cache.IsRegionGpuModified(page_begin, page_end - page_begin);
+    const bool gpu_dirty_page = cache.IsRegionGpuModified(page_begin, page_end - page_begin);
     state.fast_path_blocked =
-        size <= BufferCache::CACHING_PAGESIZE && (state.registered || state.gpu_dirty_page);
+        size <= BufferCache::CACHING_PAGESIZE && (registered || gpu_dirty_page);
     return state;
 }
 
-bool ShouldLogBloodborneVertexSync(bool vertex, bool blocked) {
-    static std::atomic<u64> vertex_blocked{0};
-    static std::atomic<u64> vertex_allowed{0};
-    static std::atomic<u64> index_blocked{0};
-    static std::atomic<u64> index_allowed{0};
+void RecordBloodborneDeltaStats(u64 changed_bytes, u32 runs) {
+    // SynchronizeBuffer runs on the GPU command processor. Keep these counters thread-local to
+    // avoid atomics/locks on the hot path and sample the clock only once per 256 patched pages.
+    static thread_local u64 pages{};
+    static thread_local u64 bytes{};
+    static thread_local u64 run_count{};
+    static thread_local u64 full_pages{};
+    static thread_local auto next_log = std::chrono::steady_clock::now() + std::chrono::seconds(10);
 
-    auto& counter = vertex ? (blocked ? vertex_blocked : vertex_allowed)
-                           : (blocked ? index_blocked : index_allowed);
-    const u64 sample = counter.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (!blocked) {
-        return sample <= 4;
-    }
-    return sample <= 8 || (sample & (sample - 1)) == 0;
-}
+    ++pages;
+    bytes += changed_bytes;
+    run_count += runs;
+    full_pages += changed_bytes >= TRACKER_BYTES_PER_PAGE ? 1 : 0;
 
-void LogBloodborneVertexSync(VAddr addr, u32 size, const BloodborneVertexSyncState& state,
-                             bool vertex) {
-    if (size > BufferCache::CACHING_PAGESIZE ||
-        !ShouldLogBloodborneVertexSync(vertex, state.fast_path_blocked)) {
+    if ((pages & 0xFF) != 0) {
         return;
     }
-    LOG_INFO(Render_Vulkan,
-             "[BB VERTEX SYNC] addr={:#x} size={} registered={} gpu_dirty_exact={} "
-             "gpu_dirty_page={} fast_path_blocked={} usage={}",
-             addr, size, state.registered, state.gpu_dirty_exact, state.gpu_dirty_page,
-             state.fast_path_blocked, vertex ? "VERTEX" : "INDEX");
-}
-
-bool ShouldLogBloodborneRace(bool cpu_fault) {
-    static std::atomic<u64> cpu_fault_count{0};
-    static std::atomic<u64> upload_conflict_count{0};
-    auto& counter = cpu_fault ? cpu_fault_count : upload_conflict_count;
-    const u64 sample = counter.fetch_add(1, std::memory_order_relaxed) + 1;
-    return sample <= 32 || (sample & (sample - 1)) == 0;
-}
-
-void LogBloodborneCpuGpuRace(VAddr addr, u64 size, bool gpu_dirty_exact, bool gpu_dirty_page) {
-    if (!ShouldLogBloodborneRace(true)) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_log) {
         return;
     }
-    const VAddr page_begin = Common::AlignDown(addr, TRACKER_BYTES_PER_PAGE);
-    const VAddr page_end = Common::AlignUp(addr + size, TRACKER_BYTES_PER_PAGE);
-    LOG_INFO(Render_Vulkan,
-             "[BB VERTEX RACE] event=cpu_write_on_gpu_dirty addr={:#x} size={} page_begin={:#x} "
-             "page_size={} gpu_dirty_exact={} gpu_dirty_page={}",
-             addr, size, page_begin, page_end - page_begin, gpu_dirty_exact, gpu_dirty_page);
-}
 
-void LogBloodborneUploadConflict(VAddr addr, u32 size, bool is_written, bool is_texel_buffer) {
-    if (!ShouldLogBloodborneRace(false)) {
-        return;
-    }
-    const VAddr page_begin = Common::AlignDown(addr, TRACKER_BYTES_PER_PAGE);
-    const VAddr page_end = Common::AlignUp(addr + size, TRACKER_BYTES_PER_PAGE);
     LOG_INFO(Render_Vulkan,
-             "[BB VERTEX RACE] event=cpu_gpu_dirty_upload addr={:#x} size={} page_begin={:#x} "
-             "page_size={} is_written={} is_texel={}",
-             addr, size, page_begin, page_end - page_begin, is_written, is_texel_buffer);
-}
-
-bool ShouldLogBloodborneDelta() {
-    static std::atomic<u64> delta_count{0};
-    const u64 sample = delta_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    return sample <= 32 || (sample & (sample - 1)) == 0;
-}
-
-void LogBloodborneDeltaUpload(VAddr page_addr, u64 changed_bytes, u32 runs) {
-    if (!ShouldLogBloodborneDelta()) {
-        return;
-    }
-    LOG_INFO(Render_Vulkan,
-             "[BB VERTEX PATCH] event=cpu_delta_upload page={:#x} changed_bytes={} runs={}",
-             page_addr, changed_bytes, runs);
+             "[BB VERTEX PATCH] summary pages={} changed_bytes={} runs={} full_pages={} "
+             "interval_s=10",
+             pages, bytes, run_count, full_pages);
+    pages = 0;
+    bytes = 0;
+    run_count = 0;
+    full_pages = 0;
+    next_log = now + std::chrono::seconds(10);
 }
 
 } // namespace
@@ -221,11 +174,8 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
     if (IsBloodborneVertexSyncEnabled()) {
         const VAddr page_begin = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
         const VAddr page_end = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
-        const bool gpu_dirty_exact = IsRegionGpuModified(device_addr, size);
         const bool gpu_dirty_page = IsRegionGpuModified(page_begin, page_end - page_begin);
-        if (gpu_dirty_exact || gpu_dirty_page) {
-            LogBloodborneCpuGpuRace(device_addr, size, gpu_dirty_exact, gpu_dirty_page);
-
+        if (gpu_dirty_page) {
             // The page fault occurs before the guest CPU write is retried. Snapshot the stale CPU
             // view now; later SynchronizeBuffer can diff it against the post-write RAM contents
             // and patch only bytes genuinely changed by the CPU into the GPU-resident buffer.
@@ -630,9 +580,6 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferImpl(VAddr device_addr, u32 siz
     BloodborneVertexSyncState bb_sync{};
     if (!is_written && bloodborne_vertex_or_index) {
         bb_sync = QueryBloodborneVertexSync(*this, device_addr, size);
-        if (bb_sync.enabled) {
-            LogBloodborneVertexSync(device_addr, size, bb_sync, usage == ReadUsage::Vertex);
-        }
     }
 
     const bool can_use_stream =
@@ -1056,10 +1003,6 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer) {
-    if (IsBloodborneVertexSyncEnabled() && IsRegionCpuModified(device_addr, size) &&
-        IsRegionGpuModified(device_addr, size)) {
-        LogBloodborneUploadConflict(device_addr, size, is_written, is_texel_buffer);
-    }
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
@@ -1188,7 +1131,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                     changed_bytes += run_size;
                     ++runs;
                 }
-                LogBloodborneDeltaUpload(page.addr, changed_bytes, runs);
+                RecordBloodborneDeltaStats(changed_bytes, runs);
                 cursor = patch_end;
             }
             if (cursor < range_end) {
