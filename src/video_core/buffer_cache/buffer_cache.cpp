@@ -235,8 +235,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
                     continue;
                 }
                 const VAddr fault_begin = std::max(device_addr, page);
-                const VAddr fault_end =
-                    std::min(device_addr + size, page + TRACKER_BYTES_PER_PAGE);
+                const VAddr fault_end = std::min(device_addr + size, page + TRACKER_BYTES_PER_PAGE);
                 std::scoped_lock lk{bb_cpu_shadow_mutex};
                 if (fault_begin < fault_end) {
                     // Even if the guest writes the same value already present in stale RAM,
@@ -1101,8 +1100,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                             .snapshot = std::move(it->second),
                         };
                         bb_cpu_forced_patch_ranges.ForEachInRange(
-                            page_addr, TRACKER_BYTES_PER_PAGE,
-                            [&](VAddr begin, VAddr end) {
+                            page_addr, TRACKER_BYTES_PER_PAGE, [&](VAddr begin, VAddr end) {
                                 page.forced_ranges.emplace_back(begin, end);
                             });
                         bb_cpu_forced_patch_ranges.Subtract(page_addr, TRACKER_BYTES_PER_PAGE);
@@ -1155,8 +1153,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 // Promote touched bytes to DWORD granularity; this still preserves the other
                 // 4092 bytes of a page instead of uploading stale guest RAM wholesale.
                 const size_t dword_first = first & ~size_t{3};
-                const size_t dword_last = std::min<size_t>(
-                    TRACKER_BYTES_PER_PAGE, Common::AlignUp(last, size_t{4}));
+                const size_t dword_last =
+                    std::min<size_t>(TRACKER_BYTES_PER_PAGE, Common::AlignUp(last, size_t{4}));
                 for (size_t word = dword_first; word < dword_last; word += sizeof(u32)) {
                     const size_t check_first = std::max(word, first);
                     const size_t check_last = std::min(word + sizeof(u32), last);
