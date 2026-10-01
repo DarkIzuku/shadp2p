@@ -4309,8 +4309,10 @@ bool IsRelevantInteractionEvent(const EventInstructionTraceRecord& event) {
 }
 
 void RecordHunterDreamInteractionRawHit(size_t index, u64 offset, std::string_view source) {
-    if (index >= hunter_dream_interaction_raw_hits.size())
+    if (!hunter_dream_interaction_trace_enabled ||
+        index >= hunter_dream_interaction_raw_hits.size()) {
         return;
+    }
     const u64 hit =
         hunter_dream_interaction_raw_hits[index].fetch_add(1, std::memory_order_relaxed) + 1;
     if (hit <= 3) {
