@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-name: Bloodborne Vertex Sync Test - Windows x64
+name: Bloodborne Vertex Delta + Save Fix - Windows x64
 
 on:
   push:
