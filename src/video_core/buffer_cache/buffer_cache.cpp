@@ -133,6 +133,21 @@ void LogBloodborneUploadConflict(VAddr addr, u32 size, bool is_written, bool is_
              addr, size, page_begin, page_end - page_begin, is_written, is_texel_buffer);
 }
 
+bool ShouldLogBloodborneDelta() {
+    static std::atomic<u64> delta_count{0};
+    const u64 sample = delta_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    return sample <= 32 || (sample & (sample - 1)) == 0;
+}
+
+void LogBloodborneDeltaUpload(VAddr page_addr, u64 changed_bytes, u32 runs) {
+    if (!ShouldLogBloodborneDelta()) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "[BB VERTEX PATCH] event=cpu_delta_upload page={:#x} changed_bytes={} runs={}",
+             page_addr, changed_bytes, runs);
+}
+
 } // namespace
 
 static bool UseReadbackOptimizations() {
@@ -210,6 +225,23 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
         const bool gpu_dirty_page = IsRegionGpuModified(page_begin, page_end - page_begin);
         if (gpu_dirty_exact || gpu_dirty_page) {
             LogBloodborneCpuGpuRace(device_addr, size, gpu_dirty_exact, gpu_dirty_page);
+
+            // The page fault occurs before the guest CPU write is retried. Snapshot the stale CPU
+            // view now; later SynchronizeBuffer can diff it against the post-write RAM contents
+            // and patch only bytes genuinely changed by the CPU into the GPU-resident buffer.
+            // This preserves GPU-only bytes without a GPU->CPU readback.
+            for (VAddr page = page_begin; page < page_end; page += TRACKER_BYTES_PER_PAGE) {
+                if (!IsRegionGpuModified(page, TRACKER_BYTES_PER_PAGE)) {
+                    continue;
+                }
+                std::scoped_lock lk{bb_cpu_shadow_mutex};
+                if (bb_cpu_shadow_pages.contains(page)) {
+                    continue;
+                }
+                auto& snapshot = bb_cpu_shadow_pages[page];
+                snapshot.resize(TRACKER_BYTES_PER_PAGE);
+                memory->CopySparseMemory(page, snapshot.data(), TRACKER_BYTES_PER_PAGE);
+            }
         }
     }
     memory_tracker->InvalidateRegion(
@@ -1024,14 +1056,90 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
     vk::Buffer src_buffer = VK_NULL_HANDLE;
+
+    const auto append_regular_upload = [&](VAddr range_addr, u64 range_size) {
+        gpu_modified_ranges_pending.ForEachNotInRange(
+            range_addr, range_size, [&](VAddr upload_addr, u32 upload_size) {
+                copies.emplace_back(total_size_bytes, upload_addr - buffer_start, upload_size);
+                total_size_bytes += upload_size;
+            });
+    };
+
     memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 device_addr_out, u64 range_size) {
-            gpu_modified_ranges_pending.ForEachNotInRange(
-                device_addr_out, range_size, [&](VAddr range_addr, u32 range_size) {
-                    copies.emplace_back(total_size_bytes, range_addr - buffer_start, range_size);
-                    total_size_bytes += range_size;
-                });
+            if (!IsBloodborneVertexSyncEnabled()) {
+                append_regular_upload(device_addr_out, range_size);
+                return;
+            }
+
+            const VAddr range_end = device_addr_out + range_size;
+            std::vector<std::pair<VAddr, std::vector<u8>>> shadow_pages;
+            {
+                std::scoped_lock lk{bb_cpu_shadow_mutex};
+                auto it = bb_cpu_shadow_pages.lower_bound(
+                    Common::AlignDown(device_addr_out, TRACKER_BYTES_PER_PAGE));
+                while (it != bb_cpu_shadow_pages.end() && it->first < range_end) {
+                    const VAddr page_addr = it->first;
+                    if (page_addr + TRACKER_BYTES_PER_PAGE > device_addr_out) {
+                        shadow_pages.emplace_back(page_addr, std::move(it->second));
+                        it = bb_cpu_shadow_pages.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+
+            if (shadow_pages.empty()) {
+                append_regular_upload(device_addr_out, range_size);
+                return;
+            }
+
+            VAddr cursor = device_addr_out;
+            for (auto& [page_addr, snapshot] : shadow_pages) {
+                const VAddr page_end = page_addr + TRACKER_BYTES_PER_PAGE;
+                const VAddr patch_begin = std::max(cursor, page_addr);
+                const VAddr patch_end = std::min(range_end, page_end);
+                if (patch_begin >= patch_end) {
+                    continue;
+                }
+
+                if (cursor < patch_begin) {
+                    append_regular_upload(cursor, patch_begin - cursor);
+                }
+
+                std::vector<u8> current(TRACKER_BYTES_PER_PAGE);
+                memory->CopySparseMemory(page_addr, current.data(), TRACKER_BYTES_PER_PAGE);
+
+                const size_t first = static_cast<size_t>(patch_begin - page_addr);
+                const size_t last = static_cast<size_t>(patch_end - page_addr);
+                u64 changed_bytes = 0;
+                u32 runs = 0;
+                size_t pos = first;
+                while (pos < last) {
+                    while (pos < last && current[pos] == snapshot[pos]) {
+                        ++pos;
+                    }
+                    if (pos == last) {
+                        break;
+                    }
+                    const size_t run_begin = pos;
+                    while (pos < last && current[pos] != snapshot[pos]) {
+                        ++pos;
+                    }
+                    const u32 run_size = static_cast<u32>(pos - run_begin);
+                    const VAddr upload_addr = page_addr + run_begin;
+                    copies.emplace_back(total_size_bytes, upload_addr - buffer_start, run_size);
+                    total_size_bytes += run_size;
+                    changed_bytes += run_size;
+                    ++runs;
+                }
+                LogBloodborneDeltaUpload(page_addr, changed_bytes, runs);
+                cursor = patch_end;
+            }
+            if (cursor < range_end) {
+                append_regular_upload(cursor, range_end - cursor);
+            }
         },
         [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
 
