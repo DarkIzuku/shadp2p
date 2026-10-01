@@ -1151,6 +1151,24 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                     }
                 }
 
+                // vkCmdCopyBuffer requires 4-byte aligned source/destination offsets and sizes.
+                // Promote touched bytes to DWORD granularity; this still preserves the other
+                // 4092 bytes of a page instead of uploading stale guest RAM wholesale.
+                const size_t dword_first = first & ~size_t{3};
+                const size_t dword_last = std::min<size_t>(
+                    TRACKER_BYTES_PER_PAGE, Common::AlignUp(last, size_t{4}));
+                for (size_t word = dword_first; word < dword_last; word += sizeof(u32)) {
+                    const size_t check_first = std::max(word, first);
+                    const size_t check_last = std::min(word + sizeof(u32), last);
+                    bool touched = false;
+                    for (size_t byte = check_first; byte < check_last; ++byte) {
+                        touched |= changed[byte] != 0;
+                    }
+                    if (touched) {
+                        std::fill(changed.begin() + word, changed.begin() + word + sizeof(u32), 1);
+                    }
+                }
+
                 u64 changed_bytes = 0;
                 u32 runs = 0;
                 size_t pos = first;
