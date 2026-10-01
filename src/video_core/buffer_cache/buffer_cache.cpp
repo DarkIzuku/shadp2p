@@ -234,7 +234,16 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
                 if (!IsRegionGpuModified(page, TRACKER_BYTES_PER_PAGE)) {
                     continue;
                 }
+                const VAddr fault_begin = std::max(device_addr, page);
+                const VAddr fault_end =
+                    std::min(device_addr + size, page + TRACKER_BYTES_PER_PAGE);
                 std::scoped_lock lk{bb_cpu_shadow_mutex};
+                if (fault_begin < fault_end) {
+                    // Even if the guest writes the same value already present in stale RAM,
+                    // the write is semantically significant: it must override any newer GPU
+                    // value at this exact address. Keep the faulting write range explicitly.
+                    bb_cpu_forced_patch_ranges.Add(fault_begin, fault_end - fault_begin);
+                }
                 if (bb_cpu_shadow_pages.contains(page)) {
                     continue;
                 }
@@ -1074,7 +1083,12 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             }
 
             const VAddr range_end = device_addr_out + range_size;
-            std::vector<std::pair<VAddr, std::vector<u8>>> shadow_pages;
+            struct ShadowPage {
+                VAddr addr;
+                std::vector<u8> snapshot;
+                std::vector<std::pair<VAddr, VAddr>> forced_ranges;
+            };
+            std::vector<ShadowPage> shadow_pages;
             {
                 std::scoped_lock lk{bb_cpu_shadow_mutex};
                 auto it = bb_cpu_shadow_pages.lower_bound(
@@ -1082,7 +1096,17 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 while (it != bb_cpu_shadow_pages.end() && it->first < range_end) {
                     const VAddr page_addr = it->first;
                     if (page_addr + TRACKER_BYTES_PER_PAGE > device_addr_out) {
-                        shadow_pages.emplace_back(page_addr, std::move(it->second));
+                        ShadowPage page{
+                            .addr = page_addr,
+                            .snapshot = std::move(it->second),
+                        };
+                        bb_cpu_forced_patch_ranges.ForEachInRange(
+                            page_addr, TRACKER_BYTES_PER_PAGE,
+                            [&](VAddr begin, VAddr end) {
+                                page.forced_ranges.emplace_back(begin, end);
+                            });
+                        bb_cpu_forced_patch_ranges.Subtract(page_addr, TRACKER_BYTES_PER_PAGE);
+                        shadow_pages.emplace_back(std::move(page));
                         it = bb_cpu_shadow_pages.erase(it);
                     } else {
                         ++it;
@@ -1096,9 +1120,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             }
 
             VAddr cursor = device_addr_out;
-            for (auto& [page_addr, snapshot] : shadow_pages) {
-                const VAddr page_end = page_addr + TRACKER_BYTES_PER_PAGE;
-                const VAddr patch_begin = std::max(cursor, page_addr);
+            for (auto& page : shadow_pages) {
+                const VAddr page_end = page.addr + TRACKER_BYTES_PER_PAGE;
+                const VAddr patch_begin = std::max(cursor, page.addr);
                 const VAddr patch_end = std::min(range_end, page_end);
                 if (patch_begin >= patch_end) {
                     continue;
@@ -1109,32 +1133,46 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 }
 
                 std::vector<u8> current(TRACKER_BYTES_PER_PAGE);
-                memory->CopySparseMemory(page_addr, current.data(), TRACKER_BYTES_PER_PAGE);
+                memory->CopySparseMemory(page.addr, current.data(), TRACKER_BYTES_PER_PAGE);
 
-                const size_t first = static_cast<size_t>(patch_begin - page_addr);
-                const size_t last = static_cast<size_t>(patch_end - page_addr);
+                const size_t first = static_cast<size_t>(patch_begin - page.addr);
+                const size_t last = static_cast<size_t>(patch_end - page.addr);
+                std::vector<u8> changed(TRACKER_BYTES_PER_PAGE, 0);
+                for (size_t pos = first; pos < last; ++pos) {
+                    changed[pos] = current[pos] != page.snapshot[pos];
+                }
+                for (const auto& [forced_begin, forced_end] : page.forced_ranges) {
+                    const size_t forced_first =
+                        static_cast<size_t>(std::max(forced_begin, patch_begin) - page.addr);
+                    const size_t forced_last =
+                        static_cast<size_t>(std::min(forced_end, patch_end) - page.addr);
+                    if (forced_first < forced_last) {
+                        std::fill(changed.begin() + forced_first, changed.begin() + forced_last, 1);
+                    }
+                }
+
                 u64 changed_bytes = 0;
                 u32 runs = 0;
                 size_t pos = first;
                 while (pos < last) {
-                    while (pos < last && current[pos] == snapshot[pos]) {
+                    while (pos < last && changed[pos] == 0) {
                         ++pos;
                     }
                     if (pos == last) {
                         break;
                     }
                     const size_t run_begin = pos;
-                    while (pos < last && current[pos] != snapshot[pos]) {
+                    while (pos < last && changed[pos] != 0) {
                         ++pos;
                     }
                     const u32 run_size = static_cast<u32>(pos - run_begin);
-                    const VAddr upload_addr = page_addr + run_begin;
+                    const VAddr upload_addr = page.addr + run_begin;
                     copies.emplace_back(total_size_bytes, upload_addr - buffer_start, run_size);
                     total_size_bytes += run_size;
                     changed_bytes += run_size;
                     ++runs;
                 }
-                LogBloodborneDeltaUpload(page_addr, changed_bytes, runs);
+                LogBloodborneDeltaUpload(page.addr, changed_bytes, runs);
                 cursor = patch_end;
             }
             if (cursor < range_end) {
