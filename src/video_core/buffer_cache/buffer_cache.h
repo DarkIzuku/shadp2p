@@ -3,8 +3,8 @@
 
 #pragma once
 
+#include <map>
 #include <mutex>
-#include <unordered_map>
 #include <vector>
 
 #include <boost/container/flat_map.hpp>
@@ -257,7 +257,7 @@ private:
     // guest page against this snapshot and uploads only the bytes actually changed by the CPU,
     // preserving newer GPU-only data in the rest of the page.
     std::mutex bb_cpu_shadow_mutex;
-    std::unordered_map<VAddr, std::vector<u8>> bb_cpu_shadow_pages;
+    std::map<VAddr, std::vector<u8>> bb_cpu_shadow_pages;
 
     struct PreemptiveDownload {
         VAddr device_addr;
