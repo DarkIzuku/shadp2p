@@ -258,6 +258,7 @@ private:
     // preserving newer GPU-only data in the rest of the page.
     std::mutex bb_cpu_shadow_mutex;
     std::map<VAddr, std::vector<u8>> bb_cpu_shadow_pages;
+    RangeSet bb_cpu_forced_patch_ranges;
 
     struct PreemptiveDownload {
         VAddr device_addr;
