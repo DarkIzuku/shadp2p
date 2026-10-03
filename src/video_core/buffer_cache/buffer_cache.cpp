@@ -1167,44 +1167,82 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         scheduler.EndRendering();
         const auto cmdbuf = scheduler.CommandBuffer();
 
-        // Synchronize only the bounding range actually written by this upload. v8 barriers the
-        // entire backing buffer, which unnecessarily stalls unrelated subranges sharing it.
-        u64 barrier_offset = copies.front().dstOffset;
-        u64 barrier_end = barrier_offset + copies.front().size;
+        // v9 synchronized one bounding range from the first copied byte to the last. Sparse
+        // Bloodborne delta uploads can leave large untouched gaps inside that span, causing
+        // unnecessary cache synchronization on the GPU. Build a small set of compact ranges
+        // instead. Nearby copies are deliberately merged to keep command overhead low.
+        struct BarrierRange {
+            u64 begin;
+            u64 end;
+        };
+        constexpr u64 BarrierMergeGap = 64_KB;
+        constexpr size_t MaxBarrierRanges = 32;
+        boost::container::small_vector<BarrierRange, 8> barrier_ranges;
         for (const auto& copy : copies) {
-            barrier_offset = std::min(barrier_offset, copy.dstOffset);
-            barrier_end = std::max(barrier_end, copy.dstOffset + copy.size);
+            const u64 begin = copy.dstOffset;
+            const u64 end = copy.dstOffset + copy.size;
+            if (barrier_ranges.empty()) {
+                barrier_ranges.push_back({begin, end});
+                continue;
+            }
+            auto& previous = barrier_ranges.back();
+            const bool near_previous =
+                begin <= previous.end ||
+                (begin > previous.end && begin - previous.end <= BarrierMergeGap);
+            if (near_previous) {
+                previous.end = std::max(previous.end, end);
+            } else {
+                barrier_ranges.push_back({begin, end});
+            }
         }
-        const vk::BufferMemoryBarrier2 pre_barrier = {
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
-                             vk::AccessFlagBits2::eTransferRead |
-                             vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .buffer = buffer.Handle(),
-            .offset = barrier_offset,
-            .size = barrier_end - barrier_offset,
-        };
-        const vk::BufferMemoryBarrier2 post_barrier = {
-            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-            .buffer = buffer.Handle(),
-            .offset = barrier_offset,
-            .size = barrier_end - barrier_offset,
-        };
+
+        // Never let the optimization create an excessive barrier list. In pathological cases
+        // fall back exactly to the v9 bounding-range behavior.
+        if (barrier_ranges.size() > MaxBarrierRanges) {
+            const u64 begin = barrier_ranges.front().begin;
+            const u64 end = barrier_ranges.back().end;
+            barrier_ranges.clear();
+            barrier_ranges.push_back({begin, end});
+        }
+
+        boost::container::small_vector<vk::BufferMemoryBarrier2, 8> pre_barriers;
+        boost::container::small_vector<vk::BufferMemoryBarrier2, 8> post_barriers;
+        pre_barriers.reserve(barrier_ranges.size());
+        post_barriers.reserve(barrier_ranges.size());
+        for (const auto& range : barrier_ranges) {
+            pre_barriers.push_back(vk::BufferMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
+                    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .buffer = buffer.Handle(),
+                .offset = range.begin,
+                .size = range.end - range.begin,
+            });
+            post_barriers.push_back(vk::BufferMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .buffer = buffer.Handle(),
+                .offset = range.begin,
+                .size = range.end - range.begin,
+            });
+        }
+
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{
             .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .bufferMemoryBarrierCount = 1,
-            .pBufferMemoryBarriers = &pre_barrier,
+            .bufferMemoryBarrierCount = static_cast<u32>(pre_barriers.size()),
+            .pBufferMemoryBarriers = pre_barriers.data(),
         });
         cmdbuf.copyBuffer(src_buffer, buffer.buffer, copies);
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{
             .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .bufferMemoryBarrierCount = 1,
-            .pBufferMemoryBarriers = &post_barrier,
+            .bufferMemoryBarrierCount = static_cast<u32>(post_barriers.size()),
+            .pBufferMemoryBarriers = post_barriers.data(),
         });
         TouchBuffer(buffer);
     }
