@@ -1,18 +1,18 @@
 # SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-name: Bloodborne Vertex Performance v8 - Windows x64
+name: Bloodborne Performance v9 - Windows x64
 
 on:
   push:
-    branches: [bb-vertex-perf-seamless-toggle-v8]
+    branches: [bb-performance-v9]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: bb-vertex-perf-v8-windows-${{ github.ref }}
+  group: bb-performance-v9-windows-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -62,7 +62,7 @@ jobs:
       - name: Upload Windows test build
         uses: actions/upload-artifact@v7
         with:
-          name: shadPS4-bb-vertex-perf-v8-windows-x64
+          name: shadPS4-bb-performance-v9-windows-x64
           path: ${{ github.workspace }}/build/shadPS4.exe
           if-no-files-found: error
           retention-days: 14
