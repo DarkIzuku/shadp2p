@@ -58,12 +58,20 @@ BloodborneVertexSyncState QueryBloodborneVertexSync(BufferCache& cache, VAddr ad
     }
 
     state.enabled = true;
-    const bool registered = cache.IsRegionRegistered(addr, size);
+    if (size > BufferCache::CACHING_PAGESIZE) {
+        return state;
+    }
+
+    // Preserve the v8 decision exactly, but avoid a GPU-dirty range lookup when registration
+    // already blocks the stream-buffer path. Registered vertex/index buffers are the common case.
+    if (cache.IsRegionRegistered(addr, size)) {
+        state.fast_path_blocked = true;
+        return state;
+    }
+
     const VAddr page_begin = Common::AlignDown(addr, BufferCache::CACHING_PAGESIZE);
     const VAddr page_end = Common::AlignUp(addr + size, BufferCache::CACHING_PAGESIZE);
-    const bool gpu_dirty_page = cache.IsRegionGpuModified(page_begin, page_end - page_begin);
-    state.fast_path_blocked =
-        size <= BufferCache::CACHING_PAGESIZE && (registered || gpu_dirty_page);
+    state.fast_path_blocked = cache.IsRegionGpuModified(page_begin, page_end - page_begin);
     return state;
 }
 
