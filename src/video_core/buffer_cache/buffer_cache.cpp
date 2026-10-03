@@ -1010,17 +1010,33 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer) {
-    boost::container::small_vector<vk::BufferCopy, 4> copies;
+    boost::container::small_vector<vk::BufferCopy, 16> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
     vk::Buffer src_buffer = VK_NULL_HANDLE;
 
+    // UploadCopies packs source data contiguously in staging memory. Merge destination-adjacent
+    // copies up front so large runs of fully changed pages become a single Vulkan copy region.
+    // This is byte-for-byte equivalent to v8 and does not bridge untouched gaps.
+    const auto append_copy = [&](VAddr upload_addr, u32 upload_size) {
+        const u64 dst_offset = upload_addr - buffer_start;
+        if (!copies.empty()) {
+            auto& previous = copies.back();
+            if (previous.dstOffset + previous.size == dst_offset &&
+                previous.srcOffset + previous.size == total_size_bytes) {
+                previous.size += upload_size;
+                total_size_bytes += upload_size;
+                return;
+            }
+        }
+        copies.emplace_back(total_size_bytes, dst_offset, upload_size);
+        total_size_bytes += upload_size;
+    };
+
     const auto append_regular_upload = [&](VAddr range_addr, u64 range_size) {
         gpu_modified_ranges_pending.ForEachNotInRange(
-            range_addr, range_size, [&](VAddr upload_addr, u32 upload_size) {
-                copies.emplace_back(total_size_bytes, upload_addr - buffer_start, upload_size);
-                total_size_bytes += upload_size;
-            });
+            range_addr, range_size,
+            [&](VAddr upload_addr, u32 upload_size) { append_copy(upload_addr, upload_size); });
     };
 
     memory_tracker->ForEachUploadRange(
@@ -1035,9 +1051,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             struct ShadowPage {
                 VAddr addr;
                 std::vector<u8> snapshot;
-                std::vector<std::pair<VAddr, VAddr>> forced_ranges;
+                boost::container::small_vector<std::pair<VAddr, VAddr>, 4> forced_ranges;
             };
-            std::vector<ShadowPage> shadow_pages;
+            boost::container::small_vector<ShadowPage, 4> shadow_pages;
             {
                 std::scoped_lock lk{bb_cpu_shadow_mutex};
                 auto it = bb_cpu_shadow_pages.lower_bound(
@@ -1068,6 +1084,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             }
 
             VAddr cursor = device_addr_out;
+            std::array<u8, TRACKER_BYTES_PER_PAGE> current{};
+            std::array<u8, TRACKER_BYTES_PER_PAGE> changed{};
             for (auto& page : shadow_pages) {
                 const VAddr page_end = page.addr + TRACKER_BYTES_PER_PAGE;
                 const VAddr patch_begin = std::max(cursor, page.addr);
@@ -1080,12 +1098,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                     append_regular_upload(cursor, patch_begin - cursor);
                 }
 
-                std::vector<u8> current(TRACKER_BYTES_PER_PAGE);
                 memory->CopySparseMemory(page.addr, current.data(), TRACKER_BYTES_PER_PAGE);
 
                 const size_t first = static_cast<size_t>(patch_begin - page.addr);
                 const size_t last = static_cast<size_t>(patch_end - page.addr);
-                std::vector<u8> changed(TRACKER_BYTES_PER_PAGE, 0);
+                std::fill(changed.begin(), changed.end(), 0);
                 for (size_t pos = first; pos < last; ++pos) {
                     changed[pos] = current[pos] != page.snapshot[pos];
                 }
@@ -1133,8 +1150,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                     }
                     const u32 run_size = static_cast<u32>(pos - run_begin);
                     const VAddr upload_addr = page.addr + run_begin;
-                    copies.emplace_back(total_size_bytes, upload_addr - buffer_start, run_size);
-                    total_size_bytes += run_size;
+                    append_copy(upload_addr, run_size);
                     changed_bytes += run_size;
                     ++runs;
                 }
@@ -1150,6 +1166,15 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     if (src_buffer) {
         scheduler.EndRendering();
         const auto cmdbuf = scheduler.CommandBuffer();
+
+        // Synchronize only the bounding range actually written by this upload. v8 barriers the
+        // entire backing buffer, which unnecessarily stalls unrelated subranges sharing it.
+        u64 barrier_offset = copies.front().dstOffset;
+        u64 barrier_end = barrier_offset + copies.front().size;
+        for (const auto& copy : copies) {
+            barrier_offset = std::min(barrier_offset, copy.dstOffset);
+            barrier_end = std::max(barrier_end, copy.dstOffset + copy.size);
+        }
         const vk::BufferMemoryBarrier2 pre_barrier = {
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
@@ -1158,8 +1183,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
             .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
             .buffer = buffer.Handle(),
-            .offset = 0,
-            .size = buffer.SizeBytes(),
+            .offset = barrier_offset,
+            .size = barrier_end - barrier_offset,
         };
         const vk::BufferMemoryBarrier2 post_barrier = {
             .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
@@ -1167,8 +1192,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
             .buffer = buffer.Handle(),
-            .offset = 0,
-            .size = buffer.SizeBytes(),
+            .offset = barrier_offset,
+            .size = barrier_end - barrier_offset,
         };
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{
             .dependencyFlags = vk::DependencyFlagBits::eByRegion,
