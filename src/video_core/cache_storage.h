@@ -28,6 +28,9 @@ public:
 
     void Open();
     void Close();
+    /// Recreate a non-archived cache in place after an incompatible profile is detected.
+    /// Returns false for archived caches so their existing behavior remains unchanged.
+    bool Reset();
     [[nodiscard]] bool IsOpened() const {
         return opened;
     }
