@@ -137,6 +137,26 @@ void DataBase::Close() {
     LOG_INFO(Render, "Cache dumped");
 }
 
+bool DataBase::Reset() {
+    if (EmulatorSettings.IsPipelineCacheArchived()) {
+        return false;
+    }
+
+    Close();
+
+    std::error_code ec;
+    std::filesystem::remove_all(cache_path, ec);
+    if (ec) {
+        LOG_WARNING(Render, "Failed to remove incompatible pipeline cache {}: {}",
+                    cache_path.string(), ec.message());
+        return false;
+    }
+
+    Open();
+    LOG_INFO(Render, "Recreated incompatible pipeline cache {}", cache_path.string());
+    return true;
+}
+
 template <typename T>
 bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v) {
     {
