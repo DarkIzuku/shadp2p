@@ -1,18 +1,18 @@
 # SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-name: Bloodborne GPU Barrier Opt v10 - Windows x64
+name: Bloodborne EXODUS Perf Test v1 - Windows x64
 
 on:
   push:
-    branches: [bb-gpu-barrier-opt-v10]
+    branches: [bb-exodus-perf-test-v1]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: bb-gpu-barrier-opt-v10-windows-${{ github.ref }}
+  group: bb-exodus-perf-test-v1-windows-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -62,7 +62,7 @@ jobs:
       - name: Upload Windows test build
         uses: actions/upload-artifact@v7
         with:
-          name: shadPS4-bb-gpu-barrier-opt-v10-windows-x64
+          name: shadPS4-bb-exodus-perf-test-v1-windows-x64
           path: ${{ github.workspace }}/build/shadPS4.exe
           if-no-files-found: error
           retention-days: 14
