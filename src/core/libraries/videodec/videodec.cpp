@@ -8,7 +8,11 @@
 #include "core/libraries/videodec/videodec_error.h"
 #include "core/libraries/videodec/videodec_impl.h"
 
+#include <mutex>
+
 namespace Libraries::Videodec {
+
+static std::mutex g_decoder_mutex;
 
 static constexpr u64 kFallbackMemorySize = 16_MB;
 
@@ -64,6 +68,7 @@ int PS4_SYSV_ABI sceVideodecCreateDecoder(const OrbisVideodecConfigInfo* pCfgInf
         return ORBIS_VIDEODEC_ERROR_STRUCT_SIZE;
     }
 
+    std::scoped_lock lock{g_decoder_mutex};
     VdecDecoder* decoder = new VdecDecoder(*pCfgInfoIn, *pRsrcInfoIn);
     pCtrlOut->thisSize = sizeof(OrbisVideodecCtrl);
     pCtrlOut->handle = decoder;
@@ -76,7 +81,7 @@ int PS4_SYSV_ABI sceVideodecDecode(OrbisVideodecCtrl* pCtrlIn,
                                    OrbisVideodecFrameBuffer* pFrameBufferInOut,
                                    OrbisVideodecPictureInfo* pPictureInfoOut) {
     LOG_TRACE(Lib_Videodec, "called");
-    if (!pCtrlIn || !pInputDataIn || !pPictureInfoOut) {
+    if (!pCtrlIn || !pInputDataIn || !pFrameBufferInOut || !pPictureInfoOut) {
         LOG_ERROR(Lib_Videodec, "Invalid arguments");
         return ORBIS_VIDEODEC_ERROR_ARGUMENT_POINTER;
     }
@@ -86,6 +91,7 @@ int PS4_SYSV_ABI sceVideodecDecode(OrbisVideodecCtrl* pCtrlIn,
         return ORBIS_VIDEODEC_ERROR_STRUCT_SIZE;
     }
 
+    std::scoped_lock lock{g_decoder_mutex};
     VdecDecoder* decoder = (VdecDecoder*)pCtrlIn->handle;
     if (!decoder) {
         LOG_ERROR(Lib_Videodec, "Invalid decoder handle");
@@ -95,13 +101,25 @@ int PS4_SYSV_ABI sceVideodecDecode(OrbisVideodecCtrl* pCtrlIn,
 }
 
 int PS4_SYSV_ABI sceVideodecDeleteDecoder(OrbisVideodecCtrl* pCtrlIn) {
-    LOG_INFO(Lib_Videodec, "(STUBBED) called");
+    LOG_INFO(Lib_Videodec, "called");
 
+    if (!pCtrlIn) {
+        LOG_ERROR(Lib_Videodec, "Invalid arguments");
+        return ORBIS_VIDEODEC_ERROR_ARGUMENT_POINTER;
+    }
+    if (pCtrlIn->thisSize != sizeof(OrbisVideodecCtrl)) {
+        LOG_ERROR(Lib_Videodec, "Invalid struct size");
+        return ORBIS_VIDEODEC_ERROR_STRUCT_SIZE;
+    }
+
+    std::scoped_lock lock{g_decoder_mutex};
     VdecDecoder* decoder = (VdecDecoder*)pCtrlIn->handle;
     if (!decoder) {
         LOG_ERROR(Lib_Videodec, "Invalid decoder handle");
         return ORBIS_VIDEODEC_ERROR_HANDLE;
     }
+    pCtrlIn->handle = nullptr;
+    pCtrlIn->version = 0;
     delete decoder;
     return ORBIS_OK;
 }
@@ -111,16 +129,18 @@ int PS4_SYSV_ABI sceVideodecFlush(OrbisVideodecCtrl* pCtrlIn,
                                   OrbisVideodecPictureInfo* pPictureInfoOut) {
     LOG_INFO(Lib_Videodec, "called");
 
-    if (!pFrameBufferInOut || !pPictureInfoOut) {
+    if (!pCtrlIn || !pFrameBufferInOut || !pPictureInfoOut) {
         LOG_ERROR(Lib_Videodec, "Invalid arguments");
         return ORBIS_VIDEODEC_ERROR_ARGUMENT_POINTER;
     }
-    if (pFrameBufferInOut->thisSize != sizeof(OrbisVideodecFrameBuffer) ||
+    if (pCtrlIn->thisSize != sizeof(OrbisVideodecCtrl) ||
+        pFrameBufferInOut->thisSize != sizeof(OrbisVideodecFrameBuffer) ||
         pPictureInfoOut->thisSize != sizeof(OrbisVideodecPictureInfo)) {
         LOG_ERROR(Lib_Videodec, "Invalid struct size");
         return ORBIS_VIDEODEC_ERROR_STRUCT_SIZE;
     }
 
+    std::scoped_lock lock{g_decoder_mutex};
     VdecDecoder* decoder = (VdecDecoder*)pCtrlIn->handle;
     if (!decoder) {
         LOG_ERROR(Lib_Videodec, "Invalid decoder handle");
@@ -187,11 +207,24 @@ int PS4_SYSV_ABI sceVideodecQueryResourceInfo(const OrbisVideodecConfigInfo* pCf
 }
 
 int PS4_SYSV_ABI sceVideodecReset(OrbisVideodecCtrl* pCtrlIn) {
-    LOG_INFO(Lib_Videodec, "(STUBBED) called");
+    LOG_INFO(Lib_Videodec, "called");
 
+    if (!pCtrlIn) {
+        LOG_ERROR(Lib_Videodec, "Invalid arguments");
+        return ORBIS_VIDEODEC_ERROR_ARGUMENT_POINTER;
+    }
+    if (pCtrlIn->thisSize != sizeof(OrbisVideodecCtrl)) {
+        LOG_ERROR(Lib_Videodec, "Invalid struct size");
+        return ORBIS_VIDEODEC_ERROR_STRUCT_SIZE;
+    }
+
+    std::scoped_lock lock{g_decoder_mutex};
     VdecDecoder* decoder = (VdecDecoder*)pCtrlIn->handle;
-    decoder->Reset();
-    return ORBIS_OK;
+    if (!decoder) {
+        LOG_ERROR(Lib_Videodec, "Invalid decoder handle");
+        return ORBIS_VIDEODEC_ERROR_HANDLE;
+    }
+    return decoder->Reset();
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
