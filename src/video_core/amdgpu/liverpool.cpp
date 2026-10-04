@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/elf_info.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -93,6 +94,14 @@ void Liverpool::ProcessCommands() {
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
+
+    if (Common::ElfInfo::Instance().GameSerial() == "CUSA00575") {
+        const u64 reserved_mask = Common::ReserveCurrentThreadPhysicalCore();
+        if (reserved_mask != 0) {
+            LOG_INFO(Render, "First Light GPU command thread reserved CPU mask {:#x}",
+                     reserved_mask);
+        }
+    }
 
     while (!stoken.stop_requested()) {
         {
