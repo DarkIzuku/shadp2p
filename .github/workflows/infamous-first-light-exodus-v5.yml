@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: inFAMOUS First Light EXODUS v5 - Windows x64
+
+on:
+  push:
+    branches: [infamous-first-light-exodus-v5]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infamous-first-light-exodus-v5-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+  EXODUS_REF: GR2fork-EXODUS
+
+jobs:
+  build-windows:
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Clone GR2fork EXODUS
+        shell: pwsh
+        run: |
+          git clone --recursive --branch "$env:EXODUS_REF" --depth 1 https://github.com/junminlee2004/GR2fork.git source
+          Set-Location source
+          git rev-parse HEAD | Out-File -Encoding ascii ../EXODUS_COMMIT.txt
+
+      - name: Cache compiler output
+        uses: hendrikmuhs/ccache-action@v1.2.21
+        with:
+          append-timestamp: false
+          key: infamous-first-light-exodus-v5-windows
+
+      - name: Configure
+        shell: pwsh
+        run: >-
+          cmake --fresh -G Ninja
+          -S "${{ github.workspace }}/source"
+          -B "${{ github.workspace }}/build-exodus"
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON
+          -DCMAKE_C_COMPILER=clang-cl
+          -DCMAKE_CXX_COMPILER=clang-cl
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build shadPS4 EXODUS
+        shell: pwsh
+        run: >-
+          cmake --build "${{ github.workspace }}/build-exodus"
+          --config "${{ env.BUILD_TYPE }}"
+          --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "${{ github.workspace }}/artifact" | Out-Null
+          Copy-Item "${{ github.workspace }}/build-exodus/shadPS4.exe" "${{ github.workspace }}/artifact/shadPS4.exe"
+          Copy-Item "${{ github.workspace }}/EXODUS_COMMIT.txt" "${{ github.workspace }}/artifact/EXODUS_COMMIT.txt"
+
+      - name: Upload Windows test build
+        uses: actions/upload-artifact@v7
+        with:
+          name: shadPS4-infamous-first-light-exodus-v5-windows-x64
+          path: ${{ github.workspace }}/artifact/*
+          if-no-files-found: error
+          retention-days: 14
