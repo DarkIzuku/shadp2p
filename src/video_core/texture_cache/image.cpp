@@ -47,9 +47,10 @@ static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance* instance,
 
 static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
     switch (type) {
+    // PS4 1D color resources are backed as Vulkan 2D images. This matches current upstream
+    // behavior and avoids unsupported BCn 1D image combinations on NVIDIA.
     case AmdGpu::ImageType::Color1D:
     case AmdGpu::ImageType::Color1DArray:
-        return vk::ImageType::e1D;
     case AmdGpu::ImageType::Color2D:
     case AmdGpu::ImageType::Color2DMsaa:
     case AmdGpu::ImageType::Color2DArray:
