@@ -3,9 +3,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <ctime>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "core/libraries/kernel/threads/pthread.h"
 
@@ -19,6 +21,7 @@
 #include <pthread.h>
 #elif defined(_WIN32)
 #include <windows.h>
+#include <tlhelp32.h>
 #include "common/string_util.h"
 #else
 #if defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
@@ -230,6 +233,124 @@ void SetThreadName(void* thread, const char* name) {
 #endif
 
 #endif
+
+namespace {
+std::atomic<u64> g_reserved_physical_core_mask{0};
+
+#ifdef _WIN32
+void ExcludeReservedMaskFromExistingThreads(u64 reserved) {
+    const DWORD self_pid = GetCurrentProcessId();
+    const DWORD self_tid = GetCurrentThreadId();
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    if (Thread32First(snapshot, &entry)) {
+        do {
+            if (entry.th32OwnerProcessID != self_pid || entry.th32ThreadID == self_tid) {
+                continue;
+            }
+            HANDLE thread =
+                OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE,
+                           entry.th32ThreadID);
+            if (!thread) {
+                continue;
+            }
+
+            GROUP_AFFINITY affinity{};
+            if (GetThreadGroupAffinity(thread, &affinity)) {
+                const u64 current = static_cast<u64>(affinity.Mask);
+                const u64 next = current & ~reserved;
+                if ((current & reserved) != 0 && next != 0) {
+                    affinity.Mask = static_cast<KAFFINITY>(next);
+                    SetThreadGroupAffinity(thread, &affinity, nullptr);
+                }
+            }
+            CloseHandle(thread);
+        } while (Thread32Next(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+}
+#endif
+} // namespace
+
+u64 ReserveCurrentThreadPhysicalCore() {
+#ifdef _WIN32
+    DWORD length = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+    if (length == 0) {
+        return 0;
+    }
+
+    std::vector<u8> storage(length);
+    auto* first = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(storage.data());
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, first, &length)) {
+        return 0;
+    }
+
+    u64 selected = 0;
+    u8 selected_efficiency = 0;
+    u32 core_count = 0;
+    auto* entry = first;
+    while (reinterpret_cast<u8*>(entry) < storage.data() + length) {
+        if (entry->Relationship == RelationProcessorCore && entry->Processor.GroupCount > 0) {
+            const u64 mask = static_cast<u64>(entry->Processor.GroupMask[0].Mask);
+            if (mask != 0) {
+                ++core_count;
+                const u8 efficiency = static_cast<u8>(entry->Processor.EfficiencyClass);
+                if (selected == 0 || efficiency > selected_efficiency ||
+                    (efficiency == selected_efficiency && mask > selected)) {
+                    selected = mask;
+                    selected_efficiency = efficiency;
+                }
+            }
+        }
+        entry = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
+            reinterpret_cast<u8*>(entry) + entry->Size);
+    }
+
+    // Do not steal a core on small hosts. First Light is command-thread limited, but the guest
+    // still needs enough CPU time for its own worker threads.
+    if (core_count < 4 || selected == 0) {
+        return 0;
+    }
+
+    if (SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(selected)) == 0) {
+        LOG_WARNING(Common, "Failed to reserve physical CPU core mask {:#x}: {}", selected,
+                    GetLastErrorMsg());
+        return 0;
+    }
+
+    g_reserved_physical_core_mask.store(selected, std::memory_order_release);
+    ExcludeReservedMaskFromExistingThreads(selected);
+    LOG_INFO(Common, "Reserved physical CPU core mask {:#x} for GPU command processing", selected);
+    return selected;
+#else
+    return 0;
+#endif
+}
+
+void ExcludeReservedCoreFromCurrentThread() {
+#ifdef _WIN32
+    const u64 reserved = g_reserved_physical_core_mask.load(std::memory_order_acquire);
+    if (reserved == 0) {
+        return;
+    }
+
+    DWORD_PTR process_mask = 0;
+    DWORD_PTR system_mask = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask)) {
+        return;
+    }
+    const u64 next = static_cast<u64>(process_mask) & ~reserved;
+    if (next != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(next));
+    }
+#endif
+}
 
 AccurateTimer::AccurateTimer(std::chrono::nanoseconds target_interval)
     : target_interval(target_interval) {}
