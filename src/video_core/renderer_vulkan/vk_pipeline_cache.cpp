@@ -179,10 +179,16 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         gs_info.in_vertex_data_size = regs.vgt_esgs_ring_itemsize;
         gs_info.out_vertex_data_size = regs.vgt_gs_vert_itemsize[0];
         gs_info.mode = regs.vgt_gs_mode.mode;
-        const auto params_vc = AmdGpu::GetParams(regs.vs_program);
-        gs_info.vs_copy = params_vc.code;
-        gs_info.vs_copy_hash = params_vc.hash;
-        DumpShader(gs_info.vs_copy, gs_info.vs_copy_hash, Shader::Stage::Vertex, 0, "copy.bin");
+        const auto params_vc = AmdGpu::TryGetParams(regs.vs_program);
+        if (params_vc) {
+            gs_info.vs_copy = params_vc->code;
+            gs_info.vs_copy_hash = params_vc->hash;
+            DumpShader(gs_info.vs_copy, gs_info.vs_copy_hash, Shader::Stage::Vertex, 0, "copy.bin");
+        } else {
+            LOG_WARNING(Render_Vulkan, "Skipping geometry copy shader with missing binary info");
+            gs_info.vs_copy = {};
+            gs_info.vs_copy_hash = 0;
+        }
         break;
     }
     case Stage::Fragment: {
@@ -485,11 +491,21 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
 
-        const auto params = AmdGpu::GetParams(*pgm);
+        const auto params = AmdGpu::TryGetParams(*pgm);
+        if (!params) {
+            LOG_ERROR(Render_Vulkan,
+                      "Skipping shader stage {} because binary info could not be found",
+                      magic_enum::enum_name(stage_in));
+            key.stage_hashes[stage_out_idx] = 0;
+            infos[stage_out_idx] = nullptr;
+            modules[stage_out_idx] = nullptr;
+            return false;
+        }
+
         std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
         std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
-            GetProgram(stage_in, stage_out, params, binding);
+            GetProgram(stage_in, stage_out, *params, binding);
         if (fetch_shader_) {
             fetch_shader = fetch_shader_;
         }
@@ -589,9 +605,16 @@ bool PipelineCache::RefreshGraphicsStages() {
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    const auto cs_params = AmdGpu::TryGetParams(cs_pgm);
+    if (!cs_params) {
+        LOG_ERROR(Render_Vulkan, "Skipping compute shader because binary info could not be found");
+        infos[0] = nullptr;
+        modules[0] = nullptr;
+        compute_key.value = 0;
+        return false;
+    }
     std::tie(infos[0], modules[0], fetch_shader, compute_key.value) =
-        GetProgram(Shader::Stage::Compute, LogicalStage::Compute, cs_params, binding);
+        GetProgram(Shader::Stage::Compute, LogicalStage::Compute, *cs_params, binding);
     return true;
 }
 
