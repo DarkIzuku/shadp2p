@@ -26,6 +26,13 @@ void SetCurrentThreadName(const char* name);
 
 void SetThreadName(void* thread, const char* name);
 
+/// Reserves one physical core for the calling thread on Windows and removes that core from
+/// already-running sibling threads. Returns the reserved logical-CPU mask, or zero if unavailable.
+u64 ReserveCurrentThreadPhysicalCore();
+
+/// Keeps a newly-created thread off the physical core reserved above. No-op if no core is reserved.
+void ExcludeReservedCoreFromCurrentThread();
+
 bool AccurateSleep(std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    bool interruptible);
 
