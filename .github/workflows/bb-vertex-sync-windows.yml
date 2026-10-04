@@ -1,18 +1,18 @@
 # SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-name: inFAMOUS First Light Opt v3 - Windows x64
+name: inFAMOUS First Light Opt v4 - Windows x64
 
 on:
   push:
-    branches: [infamous-first-light-opt-v3]
+    branches: [infamous-first-light-opt-v4]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: infamous-first-light-opt-v3-windows-${{ github.ref }}
+  group: infamous-first-light-opt-v4-windows-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -62,7 +62,7 @@ jobs:
       - name: Upload Windows test build
         uses: actions/upload-artifact@v7
         with:
-          name: shadPS4-infamous-first-light-opt-v3-windows-x64
+          name: shadPS4-infamous-first-light-opt-v4-windows-x64
           path: ${{ github.workspace }}/build/shadPS4.exe
           if-no-files-found: error
           retention-days: 14
