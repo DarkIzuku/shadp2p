@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <unordered_map>
+
 #include "common/assert.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -45,12 +47,34 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     return code;
 }
 
+static u64 HashFetchShaderCode(const u32* code, u32 size_bytes) {
+    u64 hash = 0xCBF29CE484222325ULL;
+    for (u32 i = 0; i < size_bytes / sizeof(u32); ++i) {
+        hash = (hash ^ code[i]) * 0x100000001B3ULL;
+    }
+    return hash;
+}
+
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     if (!info.has_fetch_shader) {
         return std::nullopt;
     }
 
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+
+    struct CacheEntry {
+        u64 code_hash{};
+        FetchShaderData data{};
+    };
+    thread_local std::unordered_map<const u32*, CacheEntry> parse_cache;
+
+    if (const auto it = parse_cache.find(code); it != parse_cache.end()) {
+        const auto& entry = it->second;
+        if (HashFetchShaderCode(code, entry.data.size) == entry.code_hash) {
+            return entry.data;
+        }
+    }
+
     FetchShaderData data{};
     GcnCodeSlice code_slice(code, code + std::numeric_limits<u32>::max());
     GcnDecodeContext decoder;
@@ -107,6 +131,13 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
             }
         }
     }
+
+    // Keep this bounded. A long open-world session can touch many transient fetch shader
+    // addresses, while the useful working set is much smaller.
+    if (parse_cache.size() >= 10'000) {
+        parse_cache.clear();
+    }
+    parse_cache.insert_or_assign(code, CacheEntry{HashFetchShaderCode(code, data.size), data});
 
     return data;
 }
