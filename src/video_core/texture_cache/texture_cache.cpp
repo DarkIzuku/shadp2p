@@ -590,10 +590,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     ImageIds image_ids;
-    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
-        if (image.info.guest_address != address) {
-            return;
-        }
+    // FindImageFromRange only accepts images whose guest address exactly matches the requested
+    // address. Every registered image is present in its first page, so scanning the entire range
+    // wastes CPU time on large texel buffers.
+    ForEachImageWithAddress(address, [&](ImageId image_id, Image& image) {
         if (ensure_valid && !image.SafeToDownload()) {
             return;
         }
