@@ -1,18 +1,18 @@
 # SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-name: inFAMOUS First Light EXODUS v5 - Windows x64
+name: inFAMOUS First Light EXODUS v6 - Windows x64
 
 on:
   push:
-    branches: [infamous-first-light-exodus-v5]
+    branches: [infamous-first-light-exodus-v6]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: infamous-first-light-exodus-v5-windows-${{ github.ref }}
+  group: infamous-first-light-exodus-v6-windows-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -32,11 +32,91 @@ jobs:
           Set-Location source
           git rev-parse HEAD | Out-File -Encoding ascii ../EXODUS_COMMIT.txt
 
+      - name: Patch First Light cache self-heal
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          p = Path("source/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp")
+          s = p.read_text(encoding="utf-8")
+
+          if '#include "common/path_util.h"' not in s:
+              s = s.replace('#include "common/serdes.h"',
+                            '#include "common/path_util.h"\n#include "common/serdes.h"')
+
+          old = '''    if (profile_data.size() != sizeof(Shader::Profile)) {
+              LOG_WARNING(Render,
+                          "Pipeline cache profile has unexpected size ({} != {}). Ignoring the cache",
+                          profile_data.size(), sizeof(Shader::Profile));
+              Storage::DataBase::Instance().Close();
+              return;
+          }
+
+          Shader::Profile cached_profile{};
+          std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
+          if (cached_profile != profile) {
+              LOG_WARNING(Render,
+                          "Pipeline cache isn't compatible with current system. Ignoring the cache");
+              Storage::DataBase::Instance().Close();
+              return;
+          }
+          '''
+
+          new = '''    const auto reset_incompatible_cache = [&]() {
+              Storage::DataBase::Instance().Close();
+              if (EmulatorSettings.IsPipelineCacheArchived()) {
+                  return false;
+              }
+
+              const auto cache_path =
+                  Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "CUSA00575";
+              std::error_code ec;
+              std::filesystem::remove_all(cache_path, ec);
+              if (ec) {
+                  LOG_WARNING(Render, "Failed to reset incompatible First Light cache: {}",
+                              ec.message());
+                  return false;
+              }
+
+              Storage::DataBase::Instance().Open();
+              Storage::DataBase::Instance().FinishPreload();
+              std::vector<u8> fresh_profile(sizeof(profile));
+              std::memcpy(fresh_profile.data(), &profile, sizeof(profile));
+              Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                                 std::move(fresh_profile));
+              LOG_INFO(Render, "Reset incompatible First Light pipeline cache and created a fresh profile");
+              return true;
+          };
+
+          if (profile_data.size() != sizeof(Shader::Profile)) {
+              LOG_WARNING(Render,
+                          "Pipeline cache profile has unexpected size ({} != {}). Rebuilding the cache",
+                          profile_data.size(), sizeof(Shader::Profile));
+              reset_incompatible_cache();
+              return;
+          }
+
+          Shader::Profile cached_profile{};
+          std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
+          if (cached_profile != profile) {
+              LOG_WARNING(Render,
+                          "Pipeline cache isn't compatible with current system. Rebuilding the cache");
+              reset_incompatible_cache();
+              return;
+          }
+          '''
+
+          if old not in s:
+              raise SystemExit("Expected WarmUp compatibility block not found")
+          p.write_text(s.replace(old, new), encoding="utf-8")
+          '@ | python -
+
       - name: Cache compiler output
         uses: hendrikmuhs/ccache-action@v1.2.21
         with:
           append-timestamp: false
-          key: infamous-first-light-exodus-v5-windows
+          key: infamous-first-light-exodus-v6-windows
 
       - name: Configure
         shell: pwsh
@@ -68,7 +148,7 @@ jobs:
       - name: Upload Windows test build
         uses: actions/upload-artifact@v7
         with:
-          name: shadPS4-infamous-first-light-exodus-v5-windows-x64
+          name: shadPS4-infamous-first-light-exodus-v6-windows-x64
           path: ${{ github.workspace }}/artifact/*
           if-no-files-found: error
           retention-days: 14
