@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/elf_info.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -296,6 +297,16 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 
 void PipelineCache::WarmUp() {
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
+        return;
+    }
+
+    // First Light currently crashes while preloading its persistent pipeline cache on restart
+    // (observed on NVIDIA). Keep the in-memory Vulkan pipeline cache active for the session, but
+    // skip disk warm-up/persistence for this title until the serialization path is made robust.
+    if (Common::ElfInfo::Instance().GameSerial() == "CUSA00575") {
+        LOG_WARNING(Render,
+                    "Skipping persistent pipeline cache warm-up for inFAMOUS First Light "
+                    "(CUSA00575)");
         return;
     }
 
