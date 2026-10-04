@@ -256,6 +256,7 @@ static void* RunThread(void* arg) {
     auto* curthread = static_cast<Pthread*>(arg);
     g_curthread = curthread;
     Common::SetCurrentThreadName(curthread->name.c_str());
+    Common::ExcludeReservedCoreFromCurrentThread();
     DebugState.AddCurrentThreadToGuestList();
     Core::InitializeTLS();
 
