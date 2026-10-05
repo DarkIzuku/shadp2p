@@ -28,8 +28,10 @@ jobs:
       - name: Clone latest GR2fork EXODUS
         shell: pwsh
         run: |
-          git clone --recursive --branch "$env:EXODUS_REF" --depth 1 https://github.com/junminlee2004/GR2fork.git source
+          git clone --recursive --branch GR2fork-EXODUS https://github.com/junminlee2004/GR2fork.git source
           Set-Location source
+          git checkout "$env:EXODUS_REF"
+          git submodule update --init --recursive
           git rev-parse HEAD | Out-File -Encoding ascii ../EXODUS_COMMIT.txt
 
       - name: Patch inFAMOUS cache self-heal
