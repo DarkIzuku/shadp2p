@@ -1,0 +1,197 @@
+# SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: inFAMOUS Dual 60FPS v1 - Windows x64
+
+on:
+  push:
+    branches: [infamous-dual-60fps-v1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infamous-dual-60fps-v1-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+  EXODUS_REF: GR2fork-EXODUS
+
+jobs:
+  build-windows:
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Clone latest GR2fork EXODUS
+        shell: pwsh
+        run: |
+          git clone --recursive --branch "$env:EXODUS_REF" --depth 1 https://github.com/junminlee2004/GR2fork.git source
+          Set-Location source
+          git rev-parse HEAD | Out-File -Encoding ascii ../EXODUS_COMMIT.txt
+
+      - name: Patch inFAMOUS cache self-heal
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import re
+
+          p = Path("source/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp")
+          s = p.read_text(encoding="utf-8")
+
+          if '#include "common/elf_info.h"' not in s:
+              s = s.replace('#include "common/serdes.h"',
+                            '#include "common/elf_info.h"\n#include "common/path_util.h"\n#include "common/serdes.h"')
+          elif '#include "common/path_util.h"' not in s:
+              s = s.replace('#include "common/elf_info.h"',
+                            '#include "common/elf_info.h"\n#include "common/path_util.h"')
+
+          marker = '    Storage::DataBase::Instance().Open();\n'
+          if marker not in s:
+              raise SystemExit("WarmUp database open marker not found")
+
+          helper = r'''
+              const auto rebuild_incompatible_cache = [&]() {
+                  Storage::DataBase::Instance().Close();
+                  if (EmulatorSettings.IsPipelineCacheArchived()) {
+                      LOG_WARNING(Render, "Cannot auto-rebuild archived pipeline cache");
+                      return false;
+                  }
+
+                  const auto& serial = Common::ElfInfo::Instance().GameSerial();
+                  const auto cache_path =
+                      Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / serial;
+                  std::error_code ec;
+                  std::filesystem::remove_all(cache_path, ec);
+                  if (ec) {
+                      LOG_WARNING(Render, "Failed to reset incompatible {} cache: {}",
+                                  serial, ec.message());
+                      return false;
+                  }
+
+                  Storage::DataBase::Instance().Open();
+                  Storage::DataBase::Instance().FinishPreload();
+                  std::vector<u8> fresh_profile(sizeof(profile));
+                  std::memcpy(fresh_profile.data(), &profile, sizeof(profile));
+                  Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                                     std::move(fresh_profile));
+                  LOG_INFO(Render, "Rebuilt incompatible pipeline cache for {}", serial);
+                  return true;
+              };
+          '''
+          if 'rebuild_incompatible_cache' not in s:
+              s = s.replace(marker, marker + helper, 1)
+
+          size_pat = re.compile(
+              r'''    if \(profile_data\.size\(\) != sizeof\(Shader::Profile\)\) \{.*?'''
+              r'''        Storage::DataBase::Instance\(\)\.Close\(\);\s*'''
+              r'''        return;\s*    \}''',
+              re.S)
+          size_repl = r'''    if (profile_data.size() != sizeof(Shader::Profile)) {
+              LOG_WARNING(Render,
+                          "Pipeline cache profile has unexpected size ({} != {}). Rebuilding it",
+                          profile_data.size(), sizeof(Shader::Profile));
+              rebuild_incompatible_cache();
+              return;
+          }'''
+          s, n1 = size_pat.subn(size_repl, s, count=1)
+
+          profile_pat = re.compile(
+              r'''    if \(cached_profile != profile\) \{.*?'''
+              r'''        Storage::DataBase::Instance\(\)\.Close\(\);\s*'''
+              r'''        return;\s*    \}''',
+              re.S)
+          profile_repl = r'''    if (cached_profile != profile) {
+              LOG_WARNING(Render,
+                          "Pipeline cache isn't compatible with current system. Rebuilding it");
+              rebuild_incompatible_cache();
+              return;
+          }'''
+          s, n2 = profile_pat.subn(profile_repl, s, count=1)
+
+          if n1 != 1 or n2 != 1:
+              raise SystemExit(f"Cache patch mismatch: size={n1}, profile={n2}")
+
+          p.write_text(s, encoding="utf-8")
+          print("Generic inFAMOUS cache self-heal applied")
+          '@ | python -
+
+      - name: Patch inFAMOUS sparse residency prefetch
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          p = Path("source/src/video_core/buffer_cache/buffer_cache.cpp")
+          s = p.read_text(encoding="utf-8")
+
+          old = '''void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+              if (!resident_bits.empty()) {
+          '''
+          new = '''void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+              // inFAMOUS streams adjacent city sectors while the camera/player moves. Reserving
+              // sparse backing only for the exact request causes repeated vkAllocateMemory +
+              // sparse-bind/page-table work on the GPU command thread. Prefetch a 4 MiB window
+              // inside the same arena so nearby sector loads hit already-resident blocks.
+              constexpr u64 ResidencyPrefetchBytes = 4ULL * 1024ULL * 1024ULL;
+              const u64 prefetch_blocks = std::max<u64>(1, ResidencyPrefetchBytes >> block_shift);
+              const u64 arena_first = arena->cpu_addr >> block_shift;
+              const u64 arena_last = (arena->cpu_addr + arena->size_bytes - 1) >> block_shift;
+              const u64 rel_first = first_block - arena_first;
+              const u64 rel_last = last_block - arena_first;
+              first_block = arena_first + (rel_first / prefetch_blocks) * prefetch_blocks;
+              const u64 rel_last_exclusive =
+                  ((rel_last + 1 + prefetch_blocks - 1) / prefetch_blocks) * prefetch_blocks;
+              last_block = std::min(arena_last, arena_first + rel_last_exclusive - 1);
+
+              if (!resident_bits.empty()) {
+          '''
+          if old not in s:
+              raise SystemExit("EnsureResident anchor not found")
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+          print("4 MiB sparse residency prefetch applied")
+          '@ | python -
+
+      - name: Cache compiler output
+        uses: hendrikmuhs/ccache-action@v1.2.21
+        with:
+          append-timestamp: false
+          key: infamous-dual-60fps-v1-windows
+
+      - name: Configure
+        shell: pwsh
+        run: >-
+          cmake --fresh -G Ninja
+          -S "${{ github.workspace }}/source"
+          -B "${{ github.workspace }}/build-infamous"
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON
+          -DCMAKE_C_COMPILER=clang-cl
+          -DCMAKE_CXX_COMPILER=clang-cl
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build shadPS4 inFAMOUS
+        shell: pwsh
+        run: >-
+          cmake --build "${{ github.workspace }}/build-infamous"
+          --config "${{ env.BUILD_TYPE }}"
+          --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "${{ github.workspace }}/artifact" | Out-Null
+          Copy-Item "${{ github.workspace }}/build-infamous/shadPS4.exe" "${{ github.workspace }}/artifact/shadPS4.exe"
+          Copy-Item "${{ github.workspace }}/EXODUS_COMMIT.txt" "${{ github.workspace }}/artifact/EXODUS_COMMIT.txt"
+
+      - name: Upload Windows test build
+        uses: actions/upload-artifact@v7
+        with:
+          name: shadPS4-infamous-dual-60fps-v1-windows-x64
+          path: ${{ github.workspace }}/artifact/*
+          if-no-files-found: error
+          retention-days: 14
