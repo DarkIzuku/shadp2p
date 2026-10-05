@@ -1,23 +1,23 @@
 # SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-name: inFAMOUS Dual 60FPS v1 - Windows x64
+name: inFAMOUS First Light Async v2 - Windows x64
 
 on:
   push:
-    branches: [infamous-dual-60fps-v1]
+    branches: [infamous-first-light-async-v2]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: infamous-dual-60fps-v1-windows-${{ github.ref }}
+  group: infamous-first-light-async-v2-windows-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   BUILD_TYPE: Release
-  EXODUS_REF: GR2fork-EXODUS
+  EXODUS_REF: 4ee4e92d0a72ff87f308ec432f696bb05d632348
 
 jobs:
   build-windows:
@@ -155,11 +155,371 @@ jobs:
           print("4 MiB sparse residency prefetch applied")
           '@ | python -
 
+      - name: Patch First Light async pipeline creation
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import re
+
+          h = Path("source/src/video_core/renderer_vulkan/vk_pipeline_cache.h")
+          s = h.read_text(encoding="utf-8")
+
+          s = s.replace(
+              "#include <array>\n#include <memory>\n#include <variant>",
+              "#include <array>\n#include <condition_variable>\n#include <deque>\n#include <memory>\n#include <mutex>\n#include <thread>\n#include <variant>")
+
+          meth = """private:
+              bool RefreshGraphicsKey();
+          """
+          meth_new = """private:
+              void AsyncCompileLoop(std::stop_token stoken);
+              void DrainAsyncPipelines();
+              bool RefreshGraphicsKey();
+          """
+          if meth not in s:
+              raise SystemExit("PipelineCache private method anchor not found")
+          s = s.replace(meth, meth_new, 1)
+
+          fields = """    tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
+              tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
+              tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
+          """
+          fields_new = """    tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
+              tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
+              tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
+
+              struct AsyncGraphicsJob {
+                  GraphicsPipelineKey key{};
+                  std::array<const Shader::Info*, MaxShaderStages> infos{};
+                  std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+                  Shader::Gcn::FetchShaderData fetch{};
+                  bool has_fetch{};
+                  std::array<vk::ShaderModule, MaxShaderStages> modules{};
+                  u64 hash{};
+              };
+              struct AsyncComputeJob {
+                  ComputePipelineKey key{};
+                  const Shader::Info* info{};
+                  vk::ShaderModule module{};
+              };
+              struct AsyncGraphicsDone {
+                  GraphicsPipelineKey key{};
+                  std::unique_ptr<GraphicsPipeline> pipeline{};
+                  u64 hash{};
+                  GraphicsPipeline::SerializationSupport sdata{};
+                  std::array<vk::ShaderModule, MaxShaderStages> modules{};
+              };
+              struct AsyncComputeDone {
+                  ComputePipelineKey key{};
+                  std::unique_ptr<ComputePipeline> pipeline{};
+                  ComputePipeline::SerializationSupport sdata{};
+                  vk::ShaderModule module{};
+              };
+              using AsyncJob = std::variant<AsyncGraphicsJob, AsyncComputeJob>;
+              using AsyncDone = std::variant<AsyncGraphicsDone, AsyncComputeDone>;
+              std::mutex async_mutex_;
+              std::condition_variable_any async_cv_;
+              std::deque<AsyncJob> async_jobs_;
+              std::deque<AsyncDone> async_done_;
+              std::array<std::jthread, 2> async_workers_{};
+              tsl::robin_map<GraphicsPipelineKey, bool> pending_graphics_;
+              tsl::robin_map<ComputePipelineKey, bool> pending_compute_;
+              bool async_pipeline_compile_{};
+          """
+          if fields not in s:
+              raise SystemExit("PipelineCache field anchor not found")
+          s = s.replace(fields, fields_new, 1)
+          h.write_text(s, encoding="utf-8")
+
+          p = Path("source/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp")
+          s = p.read_text(encoding="utf-8")
+          if '#include "common/elf_info.h"' not in s:
+              s = s.replace('#include "common/hash.h"',
+                            '#include "common/elf_info.h"\n#include "common/hash.h"')
+          if '#include "common/thread.h"' not in s:
+              s = s.replace('#include "common/path_util.h"',
+                            '#include "common/path_util.h"\n#include "common/thread.h"')
+
+          ctor_tail = """    pipeline_cache = std::move(cache);
+          }
+
+          PipelineCache::~PipelineCache() = default;
+          """
+          ctor_new = """    pipeline_cache = std::move(cache);
+
+              if (Common::ElfInfo::Instance().GameSerial() == "CUSA00575") {
+                  async_pipeline_compile_ = true;
+                  for (auto& worker : async_workers_) {
+                      worker = std::jthread([this](std::stop_token stoken) {
+                          AsyncCompileLoop(stoken);
+                      });
+                  }
+                  LOG_INFO(Render_Vulkan,
+                           "First Light async pipeline compiler enabled with {} workers",
+                           async_workers_.size());
+              }
+          }
+
+          void PipelineCache::AsyncCompileLoop(std::stop_token stoken) {
+              Common::SetCurrentThreadName("shadPS4:PipelineCompiler");
+              while (!stoken.stop_requested()) {
+                  AsyncJob job;
+                  {
+                      std::unique_lock lock{async_mutex_};
+                      async_cv_.wait(lock, [&] {
+                          return stoken.stop_requested() || !async_jobs_.empty();
+                      });
+                      if (stoken.stop_requested()) {
+                          break;
+                      }
+                      job = std::move(async_jobs_.front());
+                      async_jobs_.pop_front();
+                  }
+
+                  AsyncDone done = std::visit(
+                      [this](auto&& item) -> AsyncDone {
+                          using T = std::decay_t<decltype(item)>;
+                          if constexpr (std::is_same_v<T, AsyncGraphicsJob>) {
+                              GraphicsPipeline::SerializationSupport sdata{};
+                              auto pipeline = std::make_unique<GraphicsPipeline>(
+                                  instance, scheduler, desc_heap, nullptr, profile, item.key,
+                                  vk::PipelineCache{}, item.infos, item.runtime_infos,
+                                  item.has_fetch ? &item.fetch : nullptr, item.modules, sdata, false);
+                              return AsyncGraphicsDone{item.key, std::move(pipeline), item.hash,
+                                                       std::move(sdata), item.modules};
+                          } else {
+                              ComputePipeline::SerializationSupport sdata{};
+                              auto pipeline = std::make_unique<ComputePipeline>(
+                                  instance, scheduler, desc_heap, nullptr, profile,
+                                  vk::PipelineCache{}, item.key, *item.info, item.module, sdata,
+                                  false);
+                              return AsyncComputeDone{item.key, std::move(pipeline),
+                                                      std::move(sdata), item.module};
+                          }
+                      },
+                      std::move(job));
+
+                  {
+                      std::scoped_lock lock{async_mutex_};
+                      async_done_.emplace_back(std::move(done));
+                  }
+              }
+          }
+
+          void PipelineCache::DrainAsyncPipelines() {
+              if (!async_pipeline_compile_) {
+                  return;
+              }
+
+              std::deque<AsyncDone> done;
+              {
+                  std::scoped_lock lock{async_mutex_};
+                  done.swap(async_done_);
+              }
+
+              for (auto& entry : done) {
+                  std::visit(
+                      [this](auto&& item) {
+                          using T = std::decay_t<decltype(item)>;
+                          if constexpr (std::is_same_v<T, AsyncGraphicsDone>) {
+                              pending_graphics_.erase(item.key);
+                              auto [it, inserted] = graphics_pipelines.try_emplace(item.key);
+                              if (!inserted) {
+                                  return;
+                              }
+                              it.value() = std::move(item.pipeline);
+                              RegisterPipelineData(item.key, item.hash, item.sdata);
+                              ++num_new_pipelines;
+
+                              constexpr auto full_mask =
+                                  vk::ColorComponentFlagBits::eR |
+                                  vk::ColorComponentFlagBits::eG |
+                                  vk::ColorComponentFlagBits::eB |
+                                  vk::ColorComponentFlagBits::eA;
+                              for (u32 cb = 0; cb < item.key.num_color_attachments; ++cb) {
+                                  if (item.key.write_masks[cb] != full_mask) {
+                                      ++nonfull_mask_pipelines;
+                                      break;
+                                  }
+                              }
+                              if (EmulatorSettings.IsShaderCollect()) {
+                                  for (auto module : item.modules) {
+                                      if (module) {
+                                          module_related_pipelines[module].emplace_back(item.key);
+                                      }
+                                  }
+                              }
+                          } else {
+                              pending_compute_.erase(item.key);
+                              auto [it, inserted] = compute_pipelines.try_emplace(item.key);
+                              if (!inserted) {
+                                  return;
+                              }
+                              it.value() = std::move(item.pipeline);
+                              RegisterPipelineData(item.key, item.sdata);
+                              ++num_new_pipelines;
+                              if (EmulatorSettings.IsShaderCollect() && item.module) {
+                                  module_related_pipelines[item.module].emplace_back(item.key);
+                              }
+                          }
+                      },
+                      std::move(entry));
+              }
+          }
+
+          PipelineCache::~PipelineCache() {
+              for (auto& worker : async_workers_) {
+                  if (worker.joinable()) {
+                      worker.request_stop();
+                  }
+              }
+              async_cv_.notify_all();
+          }
+          """
+          if ctor_tail not in s:
+              raise SystemExit("PipelineCache constructor tail anchor not found")
+          s = s.replace(ctor_tail, ctor_new, 1)
+
+          gfx_start = s.index("const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(")
+          gfx_end = s.index("\n// The stamp covers every register", gfx_start)
+          gfx = s[gfx_start:gfx_end]
+          gfx = gfx.replace(
+              "    ++graphics_lookups;\n",
+              "    DrainAsyncPipelines();\n    ++graphics_lookups;\n",
+              1)
+
+          pat = re.compile(
+              r'''    const auto \[it, is_new\] = graphics_pipelines\.try_emplace\(graphics_key\);'''
+              r'''.*?'''
+              r'''    \}\n    // memcpy keeps the padding bytes deterministic for the memcmp-based compare\.''',
+              re.S)
+          repl = r'''    auto it = graphics_pipelines.find(graphics_key);
+              if (it == graphics_pipelines.end()) {
+                  const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
+
+                  const Shader::Gcn::FetchShaderData* fetch_shader =
+                      fetch_shader_ref ? &fetch_shader_ref.Get() : nullptr;
+                  Shader::Gcn::FetchShaderData live_fetch{};
+                  if (!fetch_shader) {
+                      const auto* vs_info = infos[static_cast<u32>(Shader::SwStage::Vertex)];
+                      if (vs_info && vs_info->has_fetch_shader) {
+                          if (Shader::Gcn::ParseFetchShader(*vs_info, live_fetch)) {
+                              fetch_shader = &live_fetch;
+                          }
+                      }
+                  }
+
+                  if (async_pipeline_compile_) {
+                      if (!pending_graphics_.contains(graphics_key)) {
+                          AsyncGraphicsJob job{};
+                          job.key = graphics_key;
+                          job.infos = infos;
+                          job.runtime_infos = runtime_infos;
+                          if (fetch_shader) {
+                              job.fetch = *fetch_shader;
+                              job.has_fetch = true;
+                          }
+                          job.modules = modules;
+                          job.hash = pipeline_hash;
+                          pending_graphics_.try_emplace(graphics_key, true);
+                          {
+                              std::scoped_lock lock{async_mutex_};
+                              async_jobs_.emplace_back(std::move(job));
+                          }
+                          async_cv_.notify_one();
+                          LOG_INFO(Render_Vulkan,
+                                   "Queued graphics pipeline {:#x} for async compilation",
+                                   pipeline_hash);
+                      }
+                      last_graphics_pipeline = nullptr;
+                      key_is_last = false;
+                      return nullptr;
+                  }
+
+                  LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+                  GraphicsPipeline::SerializationSupport sdata{};
+                  if (pre_compile_hook_) {
+                      pre_compile_hook_(pre_compile_user_);
+                  }
+                  auto [inserted_it, inserted] = graphics_pipelines.try_emplace(graphics_key);
+                  ASSERT(inserted);
+                  inserted_it.value() = std::make_unique<GraphicsPipeline>(
+                      instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile,
+                      graphics_key, *pipeline_cache, infos, runtime_infos, fetch_shader, modules,
+                      sdata, false);
+                  RegisterPipelineData(graphics_key, pipeline_hash, sdata);
+                  ++num_new_pipelines;
+                  it = inserted_it;
+              }
+              // memcpy keeps the padding bytes deterministic for the memcmp-based compare.'''
+          gfx2, n = pat.subn(repl, gfx, count=1)
+          if n != 1:
+              raise SystemExit(f"Graphics async patch count={n}")
+          s = s[:gfx_start] + gfx2 + s[gfx_end:]
+
+          comp_start = s.index("const ComputePipeline* PipelineCache::GetComputePipeline()")
+          comp_end = s.index("\nbool PipelineCache::RefreshGraphicsKey()", comp_start)
+          comp = s[comp_start:comp_end]
+          comp_new = r'''const ComputePipeline* PipelineCache::GetComputePipeline() {
+              DrainAsyncPipelines();
+              lookup_pipe_gen_ =
+                  Skipcache::Framework::Instance().Gens().pipe_gen.load(std::memory_order_acquire);
+              if (!RefreshComputeKey()) {
+                  return nullptr;
+              }
+
+              auto it = compute_pipelines.find(compute_key);
+              if (it != compute_pipelines.end()) {
+                  return it->second.get();
+              }
+
+              const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
+              if (async_pipeline_compile_) {
+                  if (!pending_compute_.contains(compute_key)) {
+                      AsyncComputeJob job{};
+                      job.key = compute_key;
+                      job.info = infos[0];
+                      job.module = modules[0];
+                      pending_compute_.try_emplace(compute_key, true);
+                      {
+                          std::scoped_lock lock{async_mutex_};
+                          async_jobs_.emplace_back(std::move(job));
+                      }
+                      async_cv_.notify_one();
+                      LOG_INFO(Render_Vulkan,
+                               "Queued compute pipeline {:#x} for async compilation",
+                               pipeline_hash);
+                  }
+                  return nullptr;
+              }
+
+              LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+              ComputePipeline::SerializationSupport sdata{};
+              if (pre_compile_hook_) {
+                  pre_compile_hook_(pre_compile_user_);
+              }
+              auto [inserted_it, inserted] = compute_pipelines.try_emplace(compute_key);
+              ASSERT(inserted);
+              inserted_it.value() = std::make_unique<ComputePipeline>(
+                  instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile,
+                  *pipeline_cache, compute_key, *infos[0], modules[0], sdata, false);
+              RegisterPipelineData(compute_key, sdata);
+              ++num_new_pipelines;
+              return inserted_it->second.get();
+          }
+          '''
+          s = s[:comp_start] + comp_new + s[comp_end:]
+
+          p.write_text(s, encoding="utf-8")
+          print("First Light async graphics/compute pipeline creation enabled")
+          '@ | python -
+
       - name: Cache compiler output
         uses: hendrikmuhs/ccache-action@v1.2.21
         with:
           append-timestamp: false
-          key: infamous-dual-60fps-v1-windows
+          key: infamous-first-light-async-v2-windows
 
       - name: Configure
         shell: pwsh
@@ -191,7 +551,7 @@ jobs:
       - name: Upload Windows test build
         uses: actions/upload-artifact@v7
         with:
-          name: shadPS4-infamous-dual-60fps-v1-windows-x64
+          name: shadPS4-infamous-first-light-async-v2-windows-x64
           path: ${{ github.workspace }}/artifact/*
           if-no-files-found: error
           retention-days: 14
