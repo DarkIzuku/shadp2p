@@ -1,18 +1,18 @@
 # SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-name: inFAMOUS First Light EXODUS v6 - Windows x64
+name: inFAMOUS First Light EXODUS v7 - Windows x64
 
 on:
   push:
-    branches: [infamous-first-light-exodus-v6]
+    branches: [infamous-first-light-exodus-v7]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: infamous-first-light-exodus-v6-windows-${{ github.ref }}
+  group: infamous-first-light-exodus-v7-windows-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -37,6 +37,7 @@ jobs:
         run: |
           @'
           from pathlib import Path
+          import re
 
           p = Path("source/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp")
           s = p.read_text(encoding="utf-8")
@@ -45,25 +46,15 @@ jobs:
               s = s.replace('#include "common/serdes.h"',
                             '#include "common/path_util.h"\n#include "common/serdes.h"')
 
-          old = '''    if (profile_data.size() != sizeof(Shader::Profile)) {
-              LOG_WARNING(Render,
-                          "Pipeline cache profile has unexpected size ({} != {}). Ignoring the cache",
-                          profile_data.size(), sizeof(Shader::Profile));
-              Storage::DataBase::Instance().Close();
-              return;
-          }
+          pattern = re.compile(
+              r'''    if \(profile_data\.size\(\) != sizeof\(Shader::Profile\)\) \{.*?'''
+              r'''    Shader::Profile cached_profile\{\};.*?'''
+              r'''    if \(cached_profile != profile\) \{.*?'''
+              r'''        return;\n    \}\n''',
+              re.S,
+          )
 
-          Shader::Profile cached_profile{};
-          std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
-          if (cached_profile != profile) {
-              LOG_WARNING(Render,
-                          "Pipeline cache isn't compatible with current system. Ignoring the cache");
-              Storage::DataBase::Instance().Close();
-              return;
-          }
-          '''
-
-          new = '''    const auto reset_incompatible_cache = [&]() {
+          replacement = r'''    const auto reset_incompatible_cache = [&]() {
               Storage::DataBase::Instance().Close();
               if (EmulatorSettings.IsPipelineCacheArchived()) {
                   return false;
@@ -85,7 +76,8 @@ jobs:
               std::memcpy(fresh_profile.data(), &profile, sizeof(profile));
               Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
                                                  std::move(fresh_profile));
-              LOG_INFO(Render, "Reset incompatible First Light pipeline cache and created a fresh profile");
+              LOG_INFO(Render,
+                       "Reset incompatible First Light pipeline cache and created a fresh profile");
               return true;
           };
 
@@ -107,16 +99,19 @@ jobs:
           }
           '''
 
-          if old not in s:
-              raise SystemExit("Expected WarmUp compatibility block not found")
-          p.write_text(s.replace(old, new), encoding="utf-8")
+          s, count = pattern.subn(replacement, s, count=1)
+          if count != 1:
+              raise SystemExit(f"WarmUp compatibility patch count was {count}, expected 1")
+
+          p.write_text(s, encoding="utf-8")
+          print("First Light cache self-heal patch applied")
           '@ | python -
 
       - name: Cache compiler output
         uses: hendrikmuhs/ccache-action@v1.2.21
         with:
           append-timestamp: false
-          key: infamous-first-light-exodus-v6-windows
+          key: infamous-first-light-exodus-v7-windows
 
       - name: Configure
         shell: pwsh
@@ -148,7 +143,7 @@ jobs:
       - name: Upload Windows test build
         uses: actions/upload-artifact@v7
         with:
-          name: shadPS4-infamous-first-light-exodus-v6-windows-x64
+          name: shadPS4-infamous-first-light-exodus-v7-windows-x64
           path: ${{ github.workspace }}/artifact/*
           if-no-files-found: error
           retention-days: 14
